@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --all-targets --locked
+
+  portable:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build canonical portable artifact
+        run: .\scripts\build-portable.cmd
+      - name: Verify portable contract
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $name = "codex-proxy-guard-windows-x86_64.exe"
+          $root = "dist\portable"
+          $exe = Join-Path $root $name
+          $shaFile = "$exe.sha256"
+          $infoFile = Join-Path $root "build-info.json"
+          foreach ($path in @($exe, $shaFile, $infoFile)) {
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+              throw "Missing portable artifact: $path"
+            }
+          }
+          $files = @(Get-ChildItem -LiteralPath $root -File)
+          if ($files.Count -ne 3) {
+            throw "Portable artifact must contain exactly three files; found $($files.Count)"
+          }
+          $actual = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          $expectedLine = (Get-Content -LiteralPath $shaFile -Raw).Trim()
+          if ($expectedLine -ne "$actual  $name") { throw "SHA-256 file mismatch" }
+          $info = Get-Content -LiteralPath $infoFile -Raw | ConvertFrom-Json
+          $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+          $package = @($metadata.packages | Where-Object name -eq "codex-proxy-guard")
+          if ($package.Count -ne 1) { throw "Package metadata mismatch" }
+          $authenticodeStatus = $null
+          try {
+            $authenticodeStatus = [string](Get-AuthenticodeSignature -LiteralPath $exe).Status
+          } catch {
+            Write-Warning "Authenticode status is unavailable in this runner."
+          }
+          if (
+            $info.package -ne "codex-proxy-guard" -or
+            $info.version -ne $package[0].version -or
+            $info.binary -ne $name -or
+            $info.sha256 -ne $actual -or
+            ($null -ne $authenticodeStatus -and
+             $info.authenticode_status -ne "Unavailable" -and
+             $info.authenticode_status -ne $authenticodeStatus)
+          ) { throw "build-info.json mismatch" }
+          $smoke = & $exe --version
+          if ($LASTEXITCODE -ne 0 -or ($smoke | Out-String) -notmatch [Regex]::Escape($package[0].version)) {
+            throw "Portable smoke test failed"
+          }
+          $help = & $exe launch --help
+          if ($LASTEXITCODE -ne 0 -or ($help | Out-String) -notmatch "--json") {
+            throw "Portable launch help smoke test failed"
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: codex-proxy-guard-windows-x86_64
+          path: dist/portable
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install cargo-audit --locked
+      - run: cargo audit

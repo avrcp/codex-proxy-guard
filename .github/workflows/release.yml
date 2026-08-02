@@ -1,0 +1,47 @@
+name: Windows release artifact
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --all-targets --locked
+      - name: Build canonical portable artifact
+        run: .\scripts\build-portable.cmd
+      - name: Smoke launcher CLI contract
+        shell: pwsh
+        run: |
+          $exe = ".\dist\portable\codex-proxy-guard-windows-x86_64.exe"
+          $help = & $exe launch --help
+          if (
+            $LASTEXITCODE -ne 0 -or
+            ($help | Out-String) -notmatch "--json"
+          ) {
+            throw "Portable launch help smoke test failed"
+          }
+      - name: Generate SBOM
+        shell: pwsh
+        run: |
+          cargo install cargo-cyclonedx --version 0.5.9 --locked
+          cargo cyclonedx --format json
+          Get-ChildItem -Recurse -Filter *.cdx.json | ForEach-Object {
+            $null = Get-Content -LiteralPath $_.FullName -Raw | ConvertFrom-Json
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: codex-proxy-guard-windows-x86_64
+          path: dist/portable
+      - uses: actions/upload-artifact@v4
+        with:
+          name: codex-proxy-guard-sbom
+          path: "**/*.cdx.json"
