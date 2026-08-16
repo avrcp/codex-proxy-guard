@@ -13,7 +13,7 @@ use commands::{
     cmd_subscription_list, cmd_subscription_sync,
 };
 use dispatcher::launch_pipeline;
-use proxy_guard_core::{AppState, GuardConfig, ProxyMode, redact_text};
+use proxy_guard_core::{AppState, GuardConfig, redact_text};
 use tokio_util::sync::CancellationToken;
 
 #[tokio::main]
@@ -30,11 +30,11 @@ async fn main() -> anyhow::Result<()> {
             force,
             proxy_host,
             proxy_port,
-            managed,
-        }) => init_config(&config_path, force, proxy_host, proxy_port, managed),
+        }) => init_config(&config_path, force, proxy_host, proxy_port),
         Some(Command::Launch { json }) => {
             let (config, _) = GuardConfig::load_or_create(&config_path)
                 .with_context(|| format!("load configuration {}", config_path.display()))?;
+            ensure_one_shot_launch_supported(&config)?;
             let (_, receipt) = launch_pipeline(&config, None, &CancellationToken::new())
                 .await
                 .map_err(|error| anyhow::anyhow!(redact_text(&error)))?;
@@ -59,7 +59,7 @@ async fn main() -> anyhow::Result<()> {
             }
         },
         Some(Command::NodeList { region }) => cmd_node_list(region.map(map_region)),
-        Some(Command::Benchmark { force: _, json }) => {
+        Some(Command::Benchmark { json }) => {
             let config = load_config(&config_path)?;
             cmd_benchmark(&config, json).await
         }
@@ -111,7 +111,6 @@ fn init_config(
     force: bool,
     proxy_host: Option<String>,
     proxy_port: Option<u16>,
-    managed: bool,
 ) -> anyhow::Result<()> {
     if path.exists() && !force {
         bail!(
@@ -126,16 +125,18 @@ fn init_config(
     if let Some(port) = proxy_port {
         config.proxy.port = port;
     }
-    if managed {
-        config.proxy.mode = ProxyMode::Managed;
-    }
     config
         .save(path)
         .with_context(|| format!("write configuration {}", path.display()))?;
     println!("Created {}", path.display());
-    if managed {
-        println!("Managed Mode enabled. Add a subscription with:");
-        println!("  codex-proxy-guard subscription add --name \"Airport\" --url <https-url>");
+    Ok(())
+}
+
+fn ensure_one_shot_launch_supported(config: &GuardConfig) -> anyhow::Result<()> {
+    if config.is_managed() {
+        bail!(
+            "Managed Mode requires the interactive Guard runtime; start codex-proxy-guard without the launch subcommand"
+        );
     }
     Ok(())
 }
@@ -170,5 +171,33 @@ mod tests {
     fn region_mapping_is_deterministic() {
         assert_eq!(map_region(RegionArg::JP), proxy_guard_core::CodexRegion::JP);
         assert_eq!(map_region(RegionArg::US), proxy_guard_core::CodexRegion::US);
+    }
+
+    #[test]
+    fn one_shot_launch_rejects_managed_mode() {
+        let mut config = GuardConfig::default();
+        config.proxy.mode = proxy_guard_core::ProxyMode::Managed;
+        config.managed.subscription_id = proxy_guard_core::SubscriptionId::new().to_string();
+
+        let error = ensure_one_shot_launch_supported(&config).expect_err("managed launch");
+        assert!(error.to_string().contains("interactive Guard runtime"));
+    }
+
+    #[test]
+    fn init_config_writes_a_reloadable_external_configuration() {
+        let path = std::env::temp_dir().join(format!(
+            "codex-proxy-guard-init-config-{}-{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        init_config(&path, false, Some("127.0.0.1".into()), Some(7890)).expect("init config");
+        let (config, created) = GuardConfig::load_or_create(&path).expect("reload config");
+        assert!(!created);
+        assert!(!config.is_managed());
+        assert_eq!(config.proxy.port, 7890);
+        let _ = std::fs::remove_file(path);
     }
 }

@@ -79,7 +79,10 @@ pub async fn run(mut state: AppState) -> anyhow::Result<()> {
             }
         }
     }
-    cancellation.cancel();
+    dispatcher
+        .shutdown()
+        .await
+        .map_err(|error| anyhow::anyhow!("stop managed proxy during shutdown: {error}"))?;
     Ok(())
 }
 

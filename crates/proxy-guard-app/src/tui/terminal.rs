@@ -24,11 +24,9 @@ impl TerminalManager {
             AlternateScreen::Auto => stdout.is_terminal(),
         };
         enable_raw_mode()?;
-        if alternate_screen {
-            if let Err(error) = execute!(stdout, EnterAlternateScreen) {
-                let _ = disable_raw_mode();
-                return Err(error);
-            }
+        if alternate_screen && let Err(error) = execute!(stdout, EnterAlternateScreen) {
+            let _ = disable_raw_mode();
+            return Err(error);
         }
         let terminal = Terminal::new(CrosstermBackend::new(stdout))?;
         Ok(Self {

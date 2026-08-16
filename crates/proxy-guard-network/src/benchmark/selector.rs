@@ -18,7 +18,13 @@ impl NodeSelector {
                 .iter()
                 .filter(|report| report.verdict.is_healthy())
                 .filter(|report| report.verified_region == region)
-                .max_by_key(|report| report.score)
+                .max_by(|left, right| {
+                    left.score
+                        .cmp(&right.score)
+                        .then_with(|| right.median_header_ms.cmp(&left.median_header_ms))
+                        .then_with(|| right.p95_header_ms.cmp(&left.p95_header_ms))
+                        .then_with(|| right.node_id.cmp(&left.node_id))
+                })
             {
                 let name = names
                     .get(&report.node_id)
@@ -148,5 +154,37 @@ mod tests {
         let selection: NodeSelection = NodeSelector::select_best(&reports, &names).unwrap();
         assert_eq!(selection.node_id, jp_b);
         assert_eq!(selection.name, "JP B");
+    }
+
+    #[test]
+    fn equal_scores_have_a_stable_latency_then_id_tie_break() {
+        let first = NodeId::new();
+        let second = NodeId::new();
+        let mut slower = report(first, CodexRegion::JP, 80, true);
+        slower.median_header_ms = 120;
+        let mut faster = report(second, CodexRegion::JP, 80, true);
+        faster.median_header_ms = 90;
+
+        for reports in [
+            vec![slower.clone(), faster.clone()],
+            vec![faster.clone(), slower.clone()],
+        ] {
+            assert_eq!(
+                NodeSelector::select_best(&reports, &names())
+                    .expect("selection")
+                    .node_id,
+                second
+            );
+        }
+
+        let tied_a = report(first, CodexRegion::JP, 80, true);
+        let tied_b = report(second, CodexRegion::JP, 80, true);
+        let expected = first.min(second);
+        assert_eq!(
+            NodeSelector::select_best(&[tied_a, tied_b], &names())
+                .expect("selection")
+                .node_id,
+            expected
+        );
     }
 }

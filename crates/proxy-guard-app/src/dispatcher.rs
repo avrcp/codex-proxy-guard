@@ -42,10 +42,6 @@ impl EffectDispatcher {
     pub fn dispatch(&self, effect: AppEffect, state: &AppState) {
         if matches!(effect, AppEffect::Shutdown) {
             self.cancellation.cancel();
-            let sidecar = Arc::clone(&self.sidecar);
-            tokio::spawn(async move {
-                let _ = stop_managed_proxy(&sidecar).await;
-            });
             return;
         }
         let tx = self.tx.clone();
@@ -131,6 +127,12 @@ impl EffectDispatcher {
             let _ = tx.send(result).await;
         });
     }
+
+    pub async fn shutdown(&self) -> Result<(), String> {
+        self.cancellation.cancel();
+        self.benchmark_cancel.lock().await.cancel();
+        stop_managed_proxy(&self.sidecar).await
+    }
 }
 
 async fn load_managed_view(
@@ -201,6 +203,7 @@ async fn managed_launch(
 ) -> Result<ManagedLaunchReceipt, String> {
     let config = config.clone();
     let config_for_blocking = config.clone();
+    let verification_cancellation = cancellation.clone();
     let (process, endpoint, selection) = tokio::task::spawn_blocking(move || {
         let store = node_store().map_err(|error| error.to_string())?;
         let node = store
@@ -211,10 +214,10 @@ async fn managed_launch(
         let selection = service
             .node_selection(&node, Utc::now())
             .map_err(|error| error.to_string())?;
-        let (process, endpoint) = service
-            .start_sidecar(&node)
+        let verified = service
+            .start_verified_sidecar(&node, &verification_cancellation)
             .map_err(|error| error.to_string())?;
-        Ok::<_, String>((process, endpoint, selection))
+        Ok::<_, String>((verified.process, verified.endpoint, selection))
     })
     .await
     .map_err(|error| format!("sidecar start task failed: {error}"))??;
@@ -289,8 +292,8 @@ async fn launch_pipeline_with_proxy(
 }
 
 async fn stop_managed_proxy(sidecar: &Arc<Mutex<Option<ManagedSidecar>>>) -> Result<(), String> {
-    let mut guard = sidecar.lock().await;
-    let Some(managed) = guard.take() else {
+    let managed = sidecar.lock().await.take();
+    let Some(managed) = managed else {
         return Ok(());
     };
     tokio::task::spawn_blocking(move || managed.process.terminate())

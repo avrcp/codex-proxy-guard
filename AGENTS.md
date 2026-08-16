@@ -40,9 +40,11 @@ Manager under `CodexProxyGuard.Subscription` and are never serialized, logged, o
 displayed. Only JP/SG/US nodes are imported, and a node whose real exit country does not
 match its hint can never become the winner. JP is hard-preferred over SG, then US.
 
-Do not add network health probes, Node Readiness, Usage/account telemetry, Codex
-app-server or private IPC, v2rayN management, diagnostics/history persistence, or
-process termination. The product owns only proxy-environment injection into a newly
+Do not add continuous runtime health monitoring, private OpenAI API probes,
+Usage/account telemetry, automatic in-session node switching, Codex app-server or
+private IPC, v2rayN management, diagnostics/history persistence, or Desktop process
+termination. The bounded pre-launch Managed Mode HTTPS/Geo benchmark and quick recheck
+are explicitly allowed. The product owns only proxy-environment injection into a newly
 launched Desktop process tree.
 
 ## Completion commands

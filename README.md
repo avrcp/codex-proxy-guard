@@ -43,7 +43,7 @@ Guard 只设置新进程树的代理环境，不是流量强制隧道：它不�
 
 ## 快速开始
 
-要求 Windows 10/11 与 Rust 1.85 或更新版本。
+要求 Windows 10/11 与 Rust 1.88 或更新版本。
 
 ```powershell
 cargo build --release -p codex-proxy-guard
@@ -124,6 +124,8 @@ alternate_screen = "auto"
 启动的 ephemeral loopback 端点；此时 `managed.subscription_id` 必须指向一个已添加的
 订阅。`managed.sing_box_path` 留空时自动发现
 `%APPDATA%\codex-proxy-guard\runtime\sing-box\current\sing-box.exe`。
+Guard 不联网下载 sing-box；请从官方发行包取得 `sing-box.exe`，放入上述路径，或将其绝对
+路径写入 `managed.sing_box_path`。
 
 代理软件不限于 v2rayN。只要它提供本机 HTTP/Mixed 入站端口，就将实际的 host 和 port
 写入 `[proxy]`；SOCKS-only 端口不适用。例如 Clash、sing-box 或其他代理监听在
@@ -145,8 +147,8 @@ codex-proxy-guard init-config --force --proxy-host 127.0.0.1 --proxy-port 7890
 codex-proxy-guard subscription add --name "Airport" --url "https://..."
 codex-proxy-guard subscription list
 codex-proxy-guard subscription sync "Airport"
-codex-proxy-guard node list                 # 或 --region JP|SG|US
-codex-proxy-guard benchmark                 # 或 --force / --json
+codex-proxy-guard node-list                 # 或 --region JP|SG|US
+codex-proxy-guard benchmark                 # 完整重测并刷新缓存；可加 --json
 codex-proxy-guard best-node
 codex-proxy-guard subscription delete "Airport" --yes
 ```
@@ -156,7 +158,9 @@ codex-proxy-guard subscription delete "Airport" --yes
 即只要有 Healthy JP 就一定选 JP。
 
 把 `proxy.mode = "managed"` 写入配置后，直接运行 `codex-proxy-guard` 即可看到 Managed
-TUI（`S` 同步、`B` benchmark、`Enter` 启动）。若无 Healthy 节点则不启动 Desktop。
+TUI（`S` 同步、`B` benchmark、`Enter` 启动）。Managed Mode 不支持一次性 `launch`
+子命令，因为 Guard 必须持续持有 sidecar。启动 Desktop 前，Guard 会用最终交付的同一个
+sidecar 再次校验真实出口国和 ChatGPT HTTPS 路径；若无 Healthy 节点或复验失败则不启动。
 
 ## 网络边界与手工验证
 

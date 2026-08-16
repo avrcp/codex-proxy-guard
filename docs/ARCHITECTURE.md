@@ -18,8 +18,9 @@ External:
 
 Managed:
   校验配置 → 读订阅 → 读 benchmark cache
-       → 选 fresh Healthy (JP > SG > US) → quick recheck winner
-       → 启动持久 sing-box → 127.0.0.1:<ephemeral>
+       → 选 fresh Healthy (JP > SG > US)
+       → 启动 sing-box → ready → Geo + ChatGPT HEAD 复验
+       → 保留同一个已验证 sidecar → 127.0.0.1:<ephemeral>
        → 发现 Desktop → 启动锁 → 注入代理 → spawn → Guard 持有 sidecar handle
 ```
 
@@ -55,9 +56,9 @@ NodeBenchmarkService
    ↓ Quick Scan（并发 ≤3：check → launch → ready → Geo → 1×HEAD）
    ↓ Deep Scan（串行：Geo#1 → 5×HEAD → Geo#2；JP Top6/SG Top3/US Top3）
    ↓ BenchmarkReport（硬门禁 + score，fingerprint 绑定）
-BenchmarkStore（TTL + fingerprint 失效）
+BenchmarkStore（TTL + fingerprint + expected region 失效；损坏缓存按 miss 重算）
    ↓ NodeSelector（JP > SG > US，字典序）
-   ↓ 持久 sing-box sidecar → 127.0.0.1:<ephemeral> → Desktop 环境注入
+   ↓ 同一个 sidecar 做启动前 Geo/HEAD 复验 → Desktop 环境注入
 ```
 
 ## 配置与 TUI
@@ -89,5 +90,5 @@ Managed Mode 的端点是 Guard 刚启动的 sidecar loopback 端点。
 ## Managed sidecar 生命周期
 
 Guard 拥有 sing-box 进程树（Windows 上通过 Job Object 保证回收），但不拥有 Desktop。
-按 `Q` 退出时先回收 sidecar，Desktop 保持打开。sidecar 意外退出时 TUI 显示
+按 `Q` 退出时显式等待 sidecar 回收，Desktop 保持打开。sidecar 意外退出时 TUI 显示
 `ManagedProxyLost`，不自动热切节点；同一 Desktop Session 内不切换节点。

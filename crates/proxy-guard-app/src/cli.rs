@@ -36,9 +36,6 @@ pub enum Command {
         /// Local HTTP/Mixed proxy port to write to the configuration file.
         #[arg(long, value_name = "PORT")]
         proxy_port: Option<u16>,
-        /// Enable Managed Mode (subscription-driven JP/SG/US nodes).
-        #[arg(long)]
-        managed: bool,
     },
     /// Print the resolved configuration path.
     ConfigPath,
@@ -55,9 +52,6 @@ pub enum Command {
     },
     /// Benchmark JP/SG/US nodes and cache the winner.
     Benchmark {
-        /// Force a full rescan (an explicit benchmark always rescans).
-        #[arg(long)]
-        force: bool,
         /// Print the summary as JSON.
         #[arg(long)]
         json: bool,
@@ -150,5 +144,7 @@ mod tests {
     fn command_surface_rejects_unknown_commands() {
         assert!(Cli::try_parse_from(["cpg", "usage"]).is_err());
         assert!(Cli::try_parse_from(["cpg", "node-test"]).is_err());
+        assert!(Cli::try_parse_from(["cpg", "init-config", "--managed"]).is_err());
+        assert!(Cli::try_parse_from(["cpg", "benchmark", "--force"]).is_err());
     }
 }

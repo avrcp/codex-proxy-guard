@@ -186,7 +186,7 @@ fn draw_managed_content(lines: &mut Vec<Line<'static>>, state: &AppState) {
                 Style::default(),
             ));
             lines.push(key_value(
-                "P95",
+                "P95/5",
                 format!("{} ms", selection.p95_ms),
                 Style::default(),
             ));

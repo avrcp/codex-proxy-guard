@@ -180,7 +180,7 @@ pub fn cmd_best_node(config: &GuardConfig) -> anyhow::Result<()> {
     println!("Score: {}", selection.score);
     println!("Success: {}%", selection.success_percent);
     println!("Median: {} ms", selection.median_ms);
-    println!("P95: {} ms", selection.p95_ms);
+    println!("P95 (5 samples): {} ms", selection.p95_ms);
     println!(
         "Exit: {}",
         if selection.exit_stable {

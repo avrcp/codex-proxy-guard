@@ -2,9 +2,10 @@ use std::collections::{HashMap, HashSet};
 
 use chrono::Utc;
 use proxy_guard_core::{
-    ManagedNode, NodeId, SingBoxOutbound, SubscriptionId, SubscriptionNodeBinding,
-    SubscriptionNodeState, SubscriptionPreview, SubscriptionProtocol, SubscriptionProtocolCounts,
-    SubscriptionSource, SubscriptionSyncStatus, SubscriptionSyncSummary,
+    ManagedNode, ManagedNodeState, NodeId, SingBoxOutbound, SubscriptionId,
+    SubscriptionNodeBinding, SubscriptionNodeState, SubscriptionPreview, SubscriptionProtocol,
+    SubscriptionProtocolCounts, SubscriptionSource, SubscriptionSyncStatus,
+    SubscriptionSyncSummary,
 };
 
 use super::{HttpsSubscriptionFetcher, NodeCandidate, SubscriptionFetcher, SubscriptionParser};
@@ -153,18 +154,12 @@ impl<S: SecretStore, F: SubscriptionFetcher> SubscriptionService<S, F> {
             .iter()
             .map(|node| (node.node.name.to_lowercase(), node.node.id))
             .collect::<HashMap<_, _>>();
-        // Stale detection is based on true removal from the subscription, so the
-        // full remote-key set is tracked regardless of region filtering.
-        let seen_keys = parsed
-            .candidates
-            .iter()
-            .map(|candidate| candidate.remote_key.clone())
-            .collect::<HashSet<_>>();
-
         let mut ignored_region = 0;
+        let mut updated = 0;
         let mut replacements = Vec::new();
         let mut creations = Vec::new();
         let mut bindings = Vec::new();
+        let mut eligible_keys = HashSet::new();
         let protocols = count_protocols(&parsed.candidates);
 
         for candidate in parsed.candidates {
@@ -173,6 +168,7 @@ impl<S: SecretStore, F: SubscriptionFetcher> SubscriptionService<S, F> {
                 continue;
             };
             let remote_key = candidate.remote_key.clone();
+            eligible_keys.insert(remote_key.clone());
             let outbound = SingBoxOutbound::new(candidate.outbound).map_err(NetworkError::from)?;
             if let Some(binding) = existing_bindings.get(&remote_key) {
                 let previous = self.nodes.get(binding.node_id)?;
@@ -185,6 +181,7 @@ impl<S: SecretStore, F: SubscriptionFetcher> SubscriptionService<S, F> {
                 node.updated_at = Utc::now();
                 node.validate().map_err(NetworkError::from)?;
                 replacements.push((previous, node));
+                updated += 1;
                 bindings.push(SubscriptionNodeBinding {
                     subscription_id: stored.source.id,
                     remote_key,
@@ -209,11 +206,20 @@ impl<S: SecretStore, F: SubscriptionFetcher> SubscriptionService<S, F> {
         }
 
         for previous in &stored.bindings {
-            if !seen_keys.contains(&previous.remote_key) {
-                let mut stale = previous.clone();
-                stale.state = SubscriptionNodeState::Stale;
-                bindings.push(stale);
+            if eligible_keys.contains(&previous.remote_key) {
+                continue;
             }
+            let previous_node = self.nodes.get(previous.node_id)?;
+            if previous_node.node.state != ManagedNodeState::Stale {
+                let mut stale_node = previous_node.node.clone();
+                stale_node.state = ManagedNodeState::Stale;
+                stale_node.updated_at = Utc::now();
+                stale_node.validate().map_err(NetworkError::from)?;
+                replacements.push((previous_node, stale_node));
+            }
+            let mut stale = previous.clone();
+            stale.state = SubscriptionNodeState::Stale;
+            bindings.push(stale);
         }
         let stale = bindings
             .iter()
@@ -222,7 +228,7 @@ impl<S: SecretStore, F: SubscriptionFetcher> SubscriptionService<S, F> {
         let summary = SubscriptionSyncSummary {
             fetched: parsed.fetched,
             imported: creations.len(),
-            updated: replacements.len(),
+            updated,
             stale,
             unsupported: parsed.unsupported,
             ignored_region,
@@ -296,10 +302,11 @@ fn rollback_nodes(nodes: &NodeStore, replaced: &[ManagedNode], created: &[NodeId
 mod tests {
     use std::{
         collections::HashMap,
+        fs,
         sync::{Arc, Mutex},
     };
 
-    use proxy_guard_core::{CodexRegion, SubscriptionId};
+    use proxy_guard_core::{CodexRegion, ManagedNodeState, SubscriptionId, SubscriptionNodeState};
     use tempfile::tempdir;
 
     use super::SubscriptionService;
@@ -399,6 +406,115 @@ mod tests {
             .find(|binding| binding.state == proxy_guard_core::SubscriptionNodeState::Active)
             .expect("active");
         assert_eq!(active.node_id, before[0].node_id);
+    }
+
+    #[test]
+    fn sync_stales_a_node_that_loses_its_region_hint() {
+        let temporary = tempdir().expect("temporary directory");
+        let paths = ManagedPaths::from_root(temporary.path().join("data"));
+        let body = Arc::new(Mutex::new(b"socks://one.example:1080#JP One".to_vec()));
+        let service = SubscriptionService::open(
+            &paths,
+            MemorySecrets::default(),
+            MemoryFetcher(body.clone()),
+        )
+        .expect("service");
+        service
+            .add("Airport", "https://example.com/sub?token=secret")
+            .expect("add");
+        service.sync("Airport").expect("initial sync");
+        let node_id = service.list().expect("list")[0].bindings[0].node_id;
+
+        *body.lock().expect("lock") = b"socks://one.example:1080#Premium One".to_vec();
+        let summary = service.sync("Airport").expect("sync");
+
+        assert_eq!(summary.imported, 0);
+        assert_eq!(summary.updated, 0);
+        assert_eq!(summary.stale, 1);
+        assert_eq!(summary.ignored_region, 1);
+        let stored = service.list().expect("list").remove(0);
+        assert_eq!(stored.bindings.len(), 1);
+        assert_eq!(stored.bindings[0].node_id, node_id);
+        assert_eq!(stored.bindings[0].state, SubscriptionNodeState::Stale);
+        let node = crate::NodeStore::open(&paths)
+            .expect("nodes")
+            .get(node_id)
+            .expect("node");
+        assert_eq!(node.node.state, ManagedNodeState::Stale);
+    }
+
+    #[test]
+    fn sync_reactivates_a_stale_node_when_its_region_becomes_eligible() {
+        let temporary = tempdir().expect("temporary directory");
+        let paths = ManagedPaths::from_root(temporary.path().join("data"));
+        let body = Arc::new(Mutex::new(b"socks://one.example:1080#JP One".to_vec()));
+        let service = SubscriptionService::open(
+            &paths,
+            MemorySecrets::default(),
+            MemoryFetcher(body.clone()),
+        )
+        .expect("service");
+        service
+            .add("Airport", "https://example.com/sub?token=secret")
+            .expect("add");
+        service.sync("Airport").expect("initial sync");
+        let node_id = service.list().expect("list")[0].bindings[0].node_id;
+
+        *body.lock().expect("lock") = b"socks://one.example:1080#Premium One".to_vec();
+        service.sync("Airport").expect("stale sync");
+        *body.lock().expect("lock") = b"socks://one.example:1080#Singapore One".to_vec();
+        let summary = service.sync("Airport").expect("reactivate sync");
+
+        assert_eq!(summary.imported, 0);
+        assert_eq!(summary.updated, 1);
+        assert_eq!(summary.stale, 0);
+        let stored = service.list().expect("list").remove(0);
+        assert_eq!(stored.bindings.len(), 1);
+        assert_eq!(stored.bindings[0].node_id, node_id);
+        assert_eq!(stored.bindings[0].state, SubscriptionNodeState::Active);
+        let node = crate::NodeStore::open(&paths)
+            .expect("nodes")
+            .get(node_id)
+            .expect("node");
+        assert_eq!(node.node.region_hint, CodexRegion::SG);
+        assert_eq!(node.node.state, ManagedNodeState::Active);
+    }
+
+    #[test]
+    fn failed_sync_rolls_back_stale_node_and_binding_changes() {
+        let temporary = tempdir().expect("temporary directory");
+        let paths = ManagedPaths::from_root(temporary.path().join("data"));
+        let body = Arc::new(Mutex::new(b"socks://one.example:1080#JP One".to_vec()));
+        let service = SubscriptionService::open(
+            &paths,
+            MemorySecrets::default(),
+            MemoryFetcher(body.clone()),
+        )
+        .expect("service");
+        service
+            .add("Airport", "https://example.com/sub?token=secret")
+            .expect("add");
+        service.sync("Airport").expect("initial sync");
+        let before = service.list().expect("list").remove(0);
+        let node_id = before.bindings[0].node_id;
+        fs::write(
+            before.subscription_dir.join("subscription.json.tmp"),
+            b"interrupted",
+        )
+        .expect("stage failed metadata update");
+        *body.lock().expect("lock") = b"socks://one.example:1080#Premium One".to_vec();
+
+        service
+            .sync("Airport")
+            .expect_err("metadata update must fail");
+
+        let after = service.list().expect("list").remove(0);
+        assert_eq!(after.bindings, before.bindings);
+        let node = crate::NodeStore::open(&paths)
+            .expect("nodes")
+            .get(node_id)
+            .expect("node");
+        assert_eq!(node.node.state, ManagedNodeState::Active);
     }
 
     #[test]

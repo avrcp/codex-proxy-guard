@@ -1187,18 +1187,16 @@ codex-proxy-guard subscription delete "My Airport" --yes
 查看导入后的三地区节点：
 
 ```powershell
-codex-proxy-guard node list
-codex-proxy-guard node list --region JP
-codex-proxy-guard node list --region SG
-codex-proxy-guard node list --region US
+codex-proxy-guard node-list
+codex-proxy-guard node-list --region JP
+codex-proxy-guard node-list --region SG
+codex-proxy-guard node-list --region US
 ```
 
 Benchmark：
 
 ```powershell
 codex-proxy-guard benchmark
-codex-proxy-guard benchmark --region JP
-codex-proxy-guard benchmark --force
 codex-proxy-guard benchmark --json
 ```
 
@@ -1216,7 +1214,7 @@ Region: JP
 Score: 93
 Success: 100%
 Median: 84 ms
-P95: 121 ms
+P95 (5 samples): 121 ms
 Exit: stable
 ```
 
@@ -1466,7 +1464,7 @@ shutdown sidecar
 
 ```text
 subscription CLI
-node list CLI
+node-list CLI
 benchmark CLI
 best-node CLI
 TUI managed status
@@ -1600,7 +1598,7 @@ Store 里只有 JP / SG / US
 ## Test B：真实 benchmark
 
 ```powershell
-codex-proxy-guard benchmark --force
+codex-proxy-guard benchmark
 ```
 
 确认：

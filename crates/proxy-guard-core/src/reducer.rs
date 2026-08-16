@@ -315,6 +315,8 @@ fn reduce_result(state: &mut AppState, result: TaskResult) -> Vec<AppEffect> {
                 }
                 Err(message) => {
                     let message = redact_text(&message);
+                    state.managed.selected = None;
+                    state.managed.proxy_endpoint = None;
                     state.status_message = "Managed launch was blocked".into();
                     state.error_message = Some(message);
                 }
@@ -446,6 +448,24 @@ mod tests {
         );
         assert_eq!(state.managed.regions, summary.regions);
         assert!(state.managed.selected.is_some());
+    }
+
+    #[test]
+    fn failed_managed_launch_clears_the_cached_ui_selection() {
+        let mut state = managed_state();
+        state.managed.selected = Some(selection());
+        reduce(&mut state, AppAction::Intent(UserIntent::Launch));
+
+        reduce(
+            &mut state,
+            AppAction::TaskComplete(Box::new(TaskResult::ManagedLaunchCompleted(Err(
+                "launch-time verification failed".into(),
+            )))),
+        );
+
+        assert!(state.managed.selected.is_none());
+        assert!(state.managed.proxy_endpoint.is_none());
+        assert_eq!(state.status_message, "Managed launch was blocked");
     }
 
     #[test]

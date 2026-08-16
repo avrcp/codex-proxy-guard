@@ -9,8 +9,9 @@ use std::{
 
 use chrono::Utc;
 use proxy_guard_core::{
-    BenchmarkReport, BenchmarkRunSummary, CodexRegion, ManagedNode, ManagedNodeState, NodeId,
-    NodeSelection, QuickVerdict, RegionBenchmarkCounts, SubscriptionId,
+    BenchmarkReport, BenchmarkRunSummary, CodexRegion, ExitObservation, ManagedNode,
+    ManagedNodeState, NodeId, NodeSelection, PathSample, QuickVerdict, RegionBenchmarkCounts,
+    SubscriptionId,
 };
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
@@ -46,6 +47,15 @@ pub struct NodeBenchmarkService {
     probe: Arc<dyn CodexPathProbe>,
     benchmarks: BenchmarkStore,
     nodes: NodeStore,
+}
+
+/// A launch-time verified sidecar whose exact process is retained for Desktop use.
+#[derive(Debug)]
+pub struct VerifiedSidecar {
+    pub process: SingBoxProcess,
+    pub endpoint: LoopbackProxyEndpoint,
+    pub exit: ExitObservation,
+    pub sample: PathSample,
 }
 
 impl NodeBenchmarkService {
@@ -182,11 +192,22 @@ impl NodeBenchmarkService {
             );
         }
 
+        let deep_ids = deep_nodes
+            .iter()
+            .map(|(node, _)| node.id)
+            .collect::<std::collections::HashSet<_>>();
+        for node in &nodes {
+            if !deep_ids.contains(&node.id) {
+                self.benchmarks.delete(node.id)?;
+            }
+        }
+
         let names = names_by_id(&nodes);
         for (node, _) in &deep_nodes {
             if cancellation.is_cancelled() {
                 return Err(cancelled());
             }
+            self.benchmarks.delete(node.id)?;
             let service = self.clone();
             let node = node.clone();
             let input = tokio::task::spawn_blocking(move || service.deep_scan_node(&node))
@@ -241,6 +262,78 @@ impl NodeBenchmarkService {
         Ok((process, endpoint))
     }
 
+    /// Start one sidecar, verify its live exit and ChatGPT path, and retain that
+    /// exact process for Desktop use.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the node lacks a fresh healthy report, startup is
+    /// cancelled, the live country differs from the hint, the HTTPS path fails,
+    /// or the sidecar exits during verification. Node failures invalidate cache.
+    pub fn start_verified_sidecar(
+        &self,
+        node: &ManagedNode,
+        cancellation: &CancellationToken,
+    ) -> Result<VerifiedSidecar, NetworkError> {
+        self.require_fresh_healthy_report(node, Utc::now())?;
+        if cancellation.is_cancelled() {
+            return Err(cancelled());
+        }
+
+        let (mut process, endpoint) = match self.prepare_and_launch(node) {
+            Ok(sidecar) => sidecar,
+            Err(error) => return self.reject_verified_launch(node.id, error),
+        };
+        if !wait_ready_cancellable(endpoint, SIDECAR_READY_TIMEOUT, cancellation) {
+            if cancellation.is_cancelled() {
+                return Err(cancelled());
+            }
+            return self.reject_verified_launch(
+                node.id,
+                NetworkError::SingBox("sidecar mixed endpoint did not become ready".into()),
+            );
+        }
+        if cancellation.is_cancelled() {
+            return Err(cancelled());
+        }
+
+        let exit = match self.resolver.resolve_live(endpoint) {
+            Ok(exit) if exit.country == node.region_hint => exit,
+            Ok(_) => {
+                return self.reject_verified_launch(
+                    node.id,
+                    NetworkError::Benchmark(
+                        "launch-time exit country did not match the node region hint".into(),
+                    ),
+                );
+            }
+            Err(error) => return self.reject_verified_launch(node.id, error),
+        };
+        if cancellation.is_cancelled() {
+            return Err(cancelled());
+        }
+        let sample = match self.probe.probe(endpoint) {
+            Ok(sample) => sample,
+            Err(error) => return self.reject_verified_launch(node.id, error),
+        };
+        if cancellation.is_cancelled() {
+            return Err(cancelled());
+        }
+        if process.try_wait()?.is_some() {
+            return self.reject_verified_launch(
+                node.id,
+                NetworkError::SingBox("sidecar exited during launch-time verification".into()),
+            );
+        }
+
+        Ok(VerifiedSidecar {
+            process,
+            endpoint,
+            exit,
+            sample,
+        })
+    }
+
     /// One quick recheck of a cached winner: config + launch + geo + a single probe.
     ///
     /// # Errors
@@ -250,8 +343,7 @@ impl NodeBenchmarkService {
         self.quick_scan_node(node).0
     }
 
-    /// Build the display selection for one node from its fresh cached report,
-    /// falling back to a zero-score selection when no fresh report exists.
+    /// Build the display selection for one node from a fresh healthy cached report.
     ///
     /// # Errors
     ///
@@ -262,19 +354,16 @@ impl NodeBenchmarkService {
         now: chrono::DateTime<Utc>,
     ) -> Result<NodeSelection, NetworkError> {
         let fingerprint = node_fingerprint(node.outbound.document());
-        if let Some(report) = self.benchmarks.get_fresh(node.id, &fingerprint, now)? {
-            return Ok(NodeSelection::from_report(&report, &node.name));
-        }
-        Ok(NodeSelection {
-            node_id: node.id,
-            name: node.name.clone(),
-            region: node.region_hint,
-            score: 0,
-            success_percent: 0,
-            median_ms: 0,
-            p95_ms: 0,
-            exit_stable: true,
-        })
+        let report = self
+            .benchmarks
+            .get_fresh(node.id, &fingerprint, node.region_hint, now)?
+            .filter(|report| report.verdict.is_healthy())
+            .ok_or_else(|| {
+                NetworkError::Benchmark(
+                    "node has no fresh healthy benchmark report; run benchmark again".into(),
+                )
+            })?;
+        Ok(NodeSelection::from_report(&report, &node.name))
     }
 
     async fn quick_scan_all(
@@ -389,6 +478,31 @@ impl NodeBenchmarkService {
         Ok((process, endpoint))
     }
 
+    fn require_fresh_healthy_report(
+        &self,
+        node: &ManagedNode,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<BenchmarkReport, NetworkError> {
+        let fingerprint = node_fingerprint(node.outbound.document());
+        self.benchmarks
+            .get_fresh(node.id, &fingerprint, node.region_hint, now)?
+            .filter(|report| report.verdict.is_healthy())
+            .ok_or_else(|| {
+                NetworkError::Benchmark(
+                    "node has no fresh healthy benchmark report; run benchmark again".into(),
+                )
+            })
+    }
+
+    fn reject_verified_launch<T>(
+        &self,
+        node_id: NodeId,
+        error: NetworkError,
+    ) -> Result<T, NetworkError> {
+        let _ = self.benchmarks.delete(node_id);
+        Err(error)
+    }
+
     fn fresh_reports(
         &self,
         nodes: &[ManagedNode],
@@ -397,7 +511,10 @@ impl NodeBenchmarkService {
         let mut reports = HashMap::new();
         for node in nodes {
             let fingerprint = node_fingerprint(node.outbound.document());
-            if let Some(report) = self.benchmarks.get_fresh(node.id, &fingerprint, now)? {
+            if let Some(report) =
+                self.benchmarks
+                    .get_fresh(node.id, &fingerprint, node.region_hint, now)?
+            {
                 reports.insert(node.id, report);
             }
         }
@@ -452,6 +569,26 @@ fn names_by_id(nodes: &[ManagedNode]) -> HashMap<NodeId, String> {
 fn wait_ready(endpoint: LoopbackProxyEndpoint, timeout: Duration) -> bool {
     let started = Instant::now();
     loop {
+        if TcpStream::connect(endpoint.socket_addr()).is_ok() {
+            return true;
+        }
+        if started.elapsed() >= timeout {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn wait_ready_cancellable(
+    endpoint: LoopbackProxyEndpoint,
+    timeout: Duration,
+    cancellation: &CancellationToken,
+) -> bool {
+    let started = Instant::now();
+    loop {
+        if cancellation.is_cancelled() {
+            return false;
+        }
         if TcpStream::connect(endpoint.socket_addr()).is_ok() {
             return true;
         }

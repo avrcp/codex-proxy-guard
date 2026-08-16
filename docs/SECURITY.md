@@ -32,6 +32,8 @@ benchmark，但交付物仍然是 loopback HTTP proxy：
 - sing-box 只使用 `127.0.0.1:<ephemeral>` mixed inbound，`set_system_proxy=false`，
   启动前必须 `sing-box check` 通过；Guard 持有 process handle，Drop/退出回收整棵
   进程树；
+- Desktop 启动前必须由最终交付的同一个 sidecar 再次完成 Geo 与 ChatGPT HEAD 复验；
+  复验失败会清除该节点缓存并阻止启动，不会改走直连；
 - 不读取 ChatGPT/Codex token、cookie 或认证文件，不调用私有 API，不用真实 prompt
   测速。
 
@@ -50,8 +52,9 @@ Managed Mode 的订阅元数据与节点文档位于 `%APPDATA%/codex-proxy-guar
 External Mode 下 Guard 不访问配置的代理端口，也不访问 OpenAI 域名。代理失效时
 Desktop 仍会启动，随后由应用自身报告网络错误。
 
-Managed Mode 下的 benchmark 只针对 `https://chatgpt.com/` 做受控、低频、限时的
-HEAD 与 Geo 查询，用于在 JP/SG/US 之间选节点，不做账号/服务资格判断。
+Managed Mode 下的 benchmark 与启动前复验只针对 `https://chatgpt.com/` 做受控、低频、
+限时的 HEAD 与 Geo 查询，用于在 JP/SG/US 之间选节点并确认最终 sidecar，不做账号/服务
+资格判断，也不增加第三方通用连通性探针。
 
 `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` 仅传递给新启动的进程树。它们不构成 VPN、
 透明代理或防泄漏控制：Guard 不接管 DNS、UDP、系统服务或应用后续以其他路径建立的连接。

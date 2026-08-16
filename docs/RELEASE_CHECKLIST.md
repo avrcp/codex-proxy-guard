@@ -22,7 +22,11 @@
 - [ ] TUI 与 `launch --json` 均显示产品类型、包名、版本、架构和发现来源，不输出安装路径或认证信息。
 - [ ] 已运行的 Desktop 阻止再次启动；并发 Guard 启动锁有效。
 - [ ] Guard 退出不终止 Desktop。
-- [ ] 不存在网络探测、Usage、app-server、诊断持久化、进程终止或全流量代理入口。
+- [ ] Managed stale binding 与 `ManagedNodeState` 一致，已移除/失去地区 hint 的节点不参与选择。
+- [ ] Benchmark cache 校验 fingerprint、expected region 与 TTL；损坏缓存按 miss 重算且写入可恢复。
+- [ ] Managed 启动用同一个 sidecar 完成 Geo/ChatGPT HEAD 复验；失败时不启动 Desktop。
+- [ ] Managed one-shot `launch` 被拒绝，TUI 退出会等待自有 sidecar 回收。
+- [ ] 不存在持续网络监控、Usage、app-server、诊断持久化、Desktop 终止或全流量代理入口。
 - [ ] README、架构、安全与排障文档与实现一致。
 
 ## Windows 手工验收
@@ -32,6 +36,7 @@
 - [ ] 代理未运行时，Guard 仍只执行环境注入与 Desktop 启动。
 - [ ] 通过代理手工验证登录、Chat 流式输出、Work、Codex、文件上传和内置浏览器；失败时记录应用错误，Guard 不新增探测。
 - [ ] 在代理或安全网关环境中确认 HTTPS 与 WebSocket Upgrade 可用；ChatGPT Voice 不作为 HTTP 代理覆盖保证。
+- [ ] 使用官方 sing-box 本地文件验证默认 runtime 路径与显式 `managed.sing_box_path`。
 - [ ] 如实记录 Authenticode 状态。
 
 ## GitHub Release

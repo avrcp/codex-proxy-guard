@@ -32,6 +32,8 @@ pub struct ReqwestCodexPathProbe;
 impl CodexPathProbe for ReqwestCodexPathProbe {
     fn probe(&self, proxy: LoopbackProxyEndpoint) -> Result<PathSample, NetworkError> {
         let client = Client::builder()
+            .https_only(true)
+            .no_proxy()
             .redirect(Policy::none())
             .connect_timeout(CODEX_PATH_TIMEOUT.min(Duration::from_secs(5)))
             .timeout(CODEX_PATH_TIMEOUT)

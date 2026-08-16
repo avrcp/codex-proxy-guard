@@ -43,7 +43,7 @@ Guard 中按 `R` 刷新并重新启动。Guard 不提供强制终止。
 
 ## Desktop 启动后无法联网
 
-Guard 不检测代理可用性。请在代理软件中确认：
+External Mode 不检测代理可用性。请在代理软件中确认：
 
 1. HTTP/Mixed 端口与配置一致；
 2. 代理软件正在运行；
@@ -51,7 +51,8 @@ Guard 不检测代理可用性。请在代理软件中确认：
 
 若能登录但对话卡住或流式输出中断，还应确认代理、防火墙或安全网关允许 HTTPS 与 WebSocket
 Upgrade，且不会改写 TLS 或过早关闭长连接。ChatGPT 使用 `wss://ws.chatgpt.com`，Codex
-使用 `wss://chatgpt.com/`。Guard 不会为这些情况发起探测。
+使用 `wss://chatgpt.com/`。Managed Mode 只在启动前做一次有界的 Geo/ChatGPT HEAD
+复验；不会持续监控 WebSocket、登录或业务功能。
 
 ChatGPT Voice 可能优先使用 UDP，因此 HTTP/Mixed 代理环境不保证覆盖它。然后完全退出
 ChatGPT Desktop，再通过 Guard 重新启动。
@@ -71,3 +72,17 @@ codex-proxy-guard init-config --force --proxy-host 127.0.0.1 --proxy-port 7890
 ## Guard 退出后 Desktop 仍在运行
 
 这是预期行为。Guard 只负责启动时注入环境，不托管 Desktop 生命周期。
+
+## Managed Mode 找不到 sing-box
+
+Guard 不会自动下载第三方运行时。请从 sing-box 官方发行包取得 `sing-box.exe`，放到
+`%APPDATA%\codex-proxy-guard\runtime\sing-box\current\sing-box.exe`，或在配置中设置其
+绝对路径：
+
+```toml
+[managed]
+sing_box_path = "D:\\Tools\\sing-box\\sing-box.exe"
+```
+
+Managed Mode 必须直接运行 `codex-proxy-guard` 进入 TUI；一次性 `launch` 子命令不会启动
+Managed sidecar。
