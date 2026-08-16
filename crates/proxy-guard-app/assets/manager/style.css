@@ -135,8 +135,20 @@ button.ghost {
 }
 button.danger { color: var(--red); }
 
-.bench-actions { display: flex; gap: 10px; margin-bottom: 16px; }
+.bench-actions { display: flex; gap: 10px; margin-bottom: 8px; }
+.bench-hint { color: var(--muted); font-size: 13px; margin: 0 0 14px; }
 .region-tabs { display: flex; gap: 6px; margin-bottom: 12px; }
+
+/* While a sync or benchmark runs, mutating actions are locked. */
+body.op-busy .list button,
+body.op-busy #bench-auto,
+body.op-busy #bench-all,
+body.op-busy #add-sub-btn {
+  pointer-events: none;
+  opacity: 0.45;
+}
+
+.item.placeholder { border-style: dashed; }
 
 .statusbar {
   position: fixed;

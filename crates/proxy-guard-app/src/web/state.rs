@@ -4,6 +4,7 @@ use chrono::{DateTime, Utc};
 use proxy_guard_core::{
     BenchmarkRunSummary, GuardConfig, NodeSelection, SubscriptionId, TaskResult,
 };
+use proxy_guard_network::BenchmarkProgress;
 use tokio::sync::{Mutex, Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
 
@@ -40,6 +41,9 @@ pub struct ManagerState {
     pub operation: Arc<Mutex<ManagerOperation>>,
     /// Serializes Web mutations and benchmarks; busy requests get 409, not a queue.
     pub operation_permit: Arc<Semaphore>,
+    /// Aggregate progress of the running benchmark; counts only, never node data.
+    /// Written from blocking scan threads, read by the operation endpoint.
+    pub progress: Arc<std::sync::Mutex<Option<BenchmarkProgress>>>,
     pub manual_selection: Arc<Mutex<Option<NodeSelection>>>,
     pub last_benchmark: Arc<Mutex<Option<BenchmarkRunSummary>>>,
 }
@@ -64,6 +68,7 @@ impl ManagerState {
             last_activity: Arc::new(Mutex::new(Instant::now())),
             operation: Arc::new(Mutex::new(ManagerOperation::Idle)),
             operation_permit: Arc::new(Semaphore::new(1)),
+            progress: Arc::new(std::sync::Mutex::new(None)),
             manual_selection: Arc::new(Mutex::new(None)),
             last_benchmark: Arc::new(Mutex::new(None)),
         }

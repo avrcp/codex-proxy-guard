@@ -86,9 +86,20 @@ codex-proxy-guard init-config --force --proxy-host 127.0.0.1 --proxy-port 7890
 - 若 Manager 打开期间按 `Launch`/`S`/`B`/`C` 被拒绝并提示 `MANAGER_ACTIVE`，先按 `M`
   关闭 Manager，再使用运行时按键。
 
+## 浏览器管理界面 Benchmark 无结果或提示 AUTO_SCOPE_EMPTY
+
+Benchmark 全量运行可能持续数分钟，状态栏会显示 `Benchmarking · quick scan 12/48` 这类
+聚合进度；深扫通过的节点会逐个出现在列表中。点击 `Benchmark Auto` 提示
+`AUTO_SCOPE_EMPTY` 表示所有有节点的区域都已有 fresh healthy 报告，无需重跑；需要刷新
+数据时点击 `Benchmark All`。
+
 ## Managed Mode 找不到 sing-box
 
-Guard 不会自动下载第三方运行时。请从 sing-box 官方发行包取得 `sing-box.exe`，放到
+Guard 不会自动下载第三方运行时。订阅、节点与 benchmark 报告等只读视图不要求安装
+sing-box；只有 benchmark 与启动会真正需要它，缺失时会在操作开始前立即失败，错误信息
+会指明期望的可执行文件位置。
+
+请从 sing-box 官方发行包取得 `sing-box.exe`，放到
 `%APPDATA%\codex-proxy-guard\runtime\sing-box\current\sing-box.exe`，或在配置中设置其
 绝对路径：
 

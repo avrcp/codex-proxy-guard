@@ -72,7 +72,12 @@ Desktop
   用默认浏览器打开 `/#token=<secret>`；`O` 重开标签页，`M` 关闭。
 - `shutdown()` 顺序：cancel benchmark → 停止 Manager server → 停止 managed sidecar。
 - Manager 只做低频 HTTP JSON + 轮询（无 WebSocket/SSE）；benchmark 与 sync 共用
-  `Semaphore(1)`，忙时返回 `409 OPERATION_BUSY` 而不排队。
+  `Semaphore(1)`，忙时返回 `409 OPERATION_BUSY` 而不排队。浏览器端用单一轮询循环
+  （忙时 800 ms、空闲 2 s）加 keyed 列表渲染：数据未变化的行不重写 DOM。
+- Web benchmark 的 scope 有真实语义：`all` 全量刷新；`auto` 只跑"有 active 节点但缺
+  fresh healthy 报告"的区域（全健康时返回 `409 AUTO_SCOPE_EMPTY`）；也接受单个区域
+  （JP/SG/US）。运行中的 benchmark 通过 `/operation` 暴露仅计数的聚合进度
+  （quick/deep × done/total），不含任何节点身份数据。
 - Web 激活订阅时：克隆 config → `proxy.mode = managed` → 写入 `managed.subscription_id`
   → validate → save → 发送 `ManagerConfigUpdated`，reducer 立即替换 `state.config`；
   Manager 关闭后再触发 `RefreshLocalState`，避免使用旧的内存配置。
@@ -125,6 +130,10 @@ PowerShell 查询当前 ChatGPT Desktop 与 ChatGPT Classic 的已知 APPX 包�
 Managed Mode 的端点是 Guard 刚启动的 sidecar loopback 端点。
 
 ## Managed sidecar 生命周期
+
+sing-box 可执行文件按惰性可用性解析：订阅/节点/报告等只读视图不要求 runtime 已安装；
+benchmark 与 sidecar 启动在启动前统一做 `ensure_available` 快速失败，错误信息指明期望
+路径或 `[managed] sing_box_path`。
 
 Guard 拥有 sing-box 进程树（Windows 上通过 Job Object 保证回收），但不拥有 Desktop。
 按 `Q` 退出时显式等待 sidecar 回收，Desktop 保持打开。sidecar 意外退出时 TUI 显示

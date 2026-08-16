@@ -27,6 +27,16 @@ pub struct OperationDto {
     pub started_at: Option<DateTime<Utc>>,
     pub message: Option<String>,
     pub last_benchmark: Option<BenchmarkRunSummary>,
+    /// Aggregate progress while `state == "benchmarking"`; counts only.
+    pub progress: Option<ProgressDto>,
+}
+
+/// Counts-only benchmark progress; never node identities or endpoints.
+#[derive(Debug, Serialize)]
+pub struct ProgressDto {
+    pub phase: &'static str,
+    pub done: usize,
+    pub total: usize,
 }
 
 #[derive(Debug, Serialize)]

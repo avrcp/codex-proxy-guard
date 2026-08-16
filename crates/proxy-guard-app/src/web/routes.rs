@@ -13,7 +13,7 @@ use proxy_guard_core::{
     BenchmarkRunSummary, CodexRegion, ManagedNodeState, NodeId, ProxyMode, SubscriptionId,
     SubscriptionSyncSummary, TaskResult,
 };
-use proxy_guard_network::SubscriptionUpdate;
+use proxy_guard_network::{BenchmarkPhase, BenchmarkProgressSink, SubscriptionUpdate};
 use serde::Deserialize;
 use tokio::sync::OwnedSemaphorePermit;
 
@@ -69,6 +69,18 @@ async fn get_state(
 async fn get_operation(State(state): State<Arc<ManagerState>>) -> Json<dto::OperationDto> {
     let operation = state.operation.lock().await.clone();
     let last_benchmark = state.last_benchmark.lock().await.clone();
+    let progress = state
+        .progress
+        .lock()
+        .expect("progress mutex")
+        .map(|progress| dto::ProgressDto {
+            phase: match progress.phase {
+                BenchmarkPhase::QuickScan => "quick_scan",
+                BenchmarkPhase::DeepScan => "deep_scan",
+            },
+            done: progress.done,
+            total: progress.total,
+        });
     let (key, subscription_id, started_at, message) = match operation {
         ManagerOperation::Idle => ("idle", None, None, None),
         ManagerOperation::Syncing { subscription_id } => {
@@ -85,6 +97,7 @@ async fn get_operation(State(state): State<Arc<ManagerState>>) -> Json<dto::Oper
         started_at,
         message,
         last_benchmark,
+        progress,
     })
 }
 
@@ -366,35 +379,83 @@ fn default_scope() -> String {
     "auto".into()
 }
 
+/// The benchmark scope requested by the Web UI.
+enum BenchmarkScope {
+    /// Every region, refreshing existing healthy reports.
+    All,
+    /// Only regions that have active nodes but no fresh healthy report.
+    Auto,
+    /// One explicit region.
+    Region(CodexRegion),
+}
+
+fn parse_scope(raw: &str) -> Option<BenchmarkScope> {
+    match raw {
+        "all" => Some(BenchmarkScope::All),
+        "auto" => Some(BenchmarkScope::Auto),
+        region => CodexRegion::from_country_code(region).map(BenchmarkScope::Region),
+    }
+}
+
 async fn start_benchmark(
     State(state): State<Arc<ManagerState>>,
     Json(body): Json<BenchmarkRequest>,
 ) -> Result<StatusCode, AppError> {
-    if !matches!(body.scope.as_str(), "auto" | "all" | "JP" | "SG" | "US") {
+    let Some(scope) = parse_scope(&body.scope) else {
         return Err(AppError::BadRequest(format!(
             "unsupported benchmark scope {:?}",
             body.scope
         )));
-    }
+    };
     let permit = state
         .operation_permit
         .clone()
         .try_acquire_owned()
         .map_err(|_| AppError::OperationBusy)?;
+    let availability_config = state.config.lock().await.clone();
+    blocking(move || crate::managed_services::ensure_sing_box_runtime(&availability_config))
+        .await
+        .map_err(|error| AppError::Conflict(format!("SING_BOX_UNAVAILABLE: {error}")))?;
+    let regions = match scope {
+        BenchmarkScope::All => None,
+        BenchmarkScope::Region(region) => Some(vec![region]),
+        BenchmarkScope::Auto => {
+            let config = state.config.lock().await.clone();
+            let regions =
+                blocking(move || crate::managed_services::auto_benchmark_regions(&config)).await?;
+            if regions.is_empty() {
+                return Err(AppError::Conflict(
+                    "AUTO_SCOPE_EMPTY: every region with active nodes already has a fresh healthy benchmark; use Benchmark All to refresh".into(),
+                ));
+            }
+            Some(regions)
+        }
+    };
+    *state.progress.lock().expect("progress mutex") = None;
     *state.operation.lock().await = ManagerOperation::Benchmarking {
         started_at: Utc::now(),
     };
     let task_state = state.clone();
     tokio::spawn(async move {
-        run_benchmark(&task_state, permit).await;
+        run_benchmark(&task_state, permit, regions).await;
     });
     Ok(StatusCode::ACCEPTED)
 }
 
-async fn run_benchmark(state: &Arc<ManagerState>, permit: OwnedSemaphorePermit) {
+async fn run_benchmark(
+    state: &Arc<ManagerState>,
+    permit: OwnedSemaphorePermit,
+    regions: Option<Vec<CodexRegion>>,
+) {
     let config = state.config.lock().await.clone();
     let subscription_id = crate::managed_services::configured_subscription(&config);
     let cancellation = state.shutdown.child_token();
+    let progress_sink: BenchmarkProgressSink = {
+        let state = Arc::clone(state);
+        Arc::new(move |update| {
+            *state.progress.lock().expect("progress mutex") = Some(update);
+        })
+    };
     let service = match blocking(move || crate::managed_services::benchmark_service(&config)).await
     {
         Ok(service) => service,
@@ -406,17 +467,25 @@ async fn run_benchmark(state: &Arc<ManagerState>, permit: OwnedSemaphorePermit) 
             return;
         }
     };
-    let summary: Option<BenchmarkRunSummary> =
-        match service.run(subscription_id, &cancellation).await {
-            Ok(summary) => Some(summary),
-            Err(error) => {
-                *state.operation.lock().await = ManagerOperation::Failed {
-                    message: error.to_string(),
-                };
-                drop(permit);
-                return;
-            }
-        };
+    let summary: Option<BenchmarkRunSummary> = match service
+        .run_scoped(
+            subscription_id,
+            regions.as_deref(),
+            &cancellation,
+            &progress_sink,
+        )
+        .await
+    {
+        Ok(summary) => Some(summary),
+        Err(error) => {
+            *state.operation.lock().await = ManagerOperation::Failed {
+                message: error.to_string(),
+            };
+            drop(permit);
+            return;
+        }
+    };
+    *state.progress.lock().expect("progress mutex") = None;
     let summary = summary.expect("summary present on success");
     *state.last_benchmark.lock().await = Some(summary.clone());
     *state.operation.lock().await = ManagerOperation::Idle;

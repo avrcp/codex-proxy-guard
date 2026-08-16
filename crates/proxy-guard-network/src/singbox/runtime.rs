@@ -55,6 +55,15 @@ impl SingBoxRuntime {
         &self.installation
     }
 
+    /// Fail fast when the pinned executable is not installed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed sing-box error naming the expected executable location.
+    pub fn ensure_available(&self) -> Result<(), NetworkError> {
+        self.installation.ensure_available()
+    }
+
     /// Execute `sing-box check -c <managed-config>` with a hard timeout.
     ///
     /// # Errors
@@ -97,8 +106,10 @@ impl SingBoxRuntime {
     ///
     /// # Errors
     ///
-    /// Returns a validation, spawn, status-observation, or early-exit error.
+    /// Returns an availability, validation, spawn, status-observation, or
+    /// early-exit error.
     pub fn launch(&self, config: PreparedSingBoxConfig) -> Result<SingBoxProcess, NetworkError> {
+        self.ensure_available()?;
         self.validate(&config)?;
         self.launch_validated(config)
     }

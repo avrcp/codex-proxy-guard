@@ -2,7 +2,7 @@ use std::{sync::Arc, time::Duration};
 
 use anyhow::Context;
 use chrono::Utc;
-use proxy_guard_core::{GuardConfig, ManagedView, SubscriptionId};
+use proxy_guard_core::{CodexRegion, GuardConfig, ManagedView, SubscriptionId};
 use proxy_guard_network::{
     HttpsSubscriptionFetcher, KeyringSecretStore, ManagedPaths, NodeBenchmarkService, NodeStore,
     ReqwestCodexPathProbe, SingBoxInstallation, SingBoxLocator, SubscriptionService,
@@ -38,6 +38,44 @@ fn sing_box_installation(config: &GuardConfig) -> anyhow::Result<SingBoxInstalla
     let explicit = (!config.managed.sing_box_path.as_os_str().is_empty())
         .then_some(config.managed.sing_box_path.as_path());
     SingBoxLocator::resolve(&paths, explicit).context("resolve sing-box runtime")
+}
+
+/// Verify the configured sing-box runtime is installed for benchmark or launch.
+///
+/// Read-only views resolve the runtime lazily; this is the shared pre-flight
+/// for operations that actually start a sidecar.
+///
+/// # Errors
+///
+/// Returns an error naming the expected executable location when the runtime
+/// is not installed.
+pub fn ensure_sing_box_runtime(config: &GuardConfig) -> anyhow::Result<()> {
+    Ok(sing_box_installation(config)?.ensure_available()?)
+}
+
+/// Regions that still need a benchmark for AUTO selection: they have active
+/// nodes but no fresh healthy report, ordered JP > SG > US. Empty when every
+/// region with nodes is already healthy.
+///
+/// # Errors
+///
+/// Returns a context error when the benchmark snapshot cannot be read.
+pub fn auto_benchmark_regions(config: &GuardConfig) -> anyhow::Result<Vec<CodexRegion>> {
+    let subscription_id = configured_subscription(config);
+    let (counts, _) = benchmark_service(config)?
+        .snapshot(subscription_id, Utc::now())
+        .context("read benchmark snapshot")?;
+    let per_region = [
+        (counts.jp_active, counts.jp_healthy),
+        (counts.sg_active, counts.sg_healthy),
+        (counts.us_active, counts.us_healthy),
+    ];
+    Ok(CodexRegion::PREFERENCE
+        .into_iter()
+        .zip(per_region)
+        .filter(|&(_, (active, healthy))| active > 0 && healthy == 0)
+        .map(|(region, _)| region)
+        .collect())
 }
 
 /// Open the benchmark service bound to the configured sing-box installation.

@@ -16,8 +16,9 @@ pub mod storage;
 pub mod subscription;
 
 pub use benchmark::{
-    CodexPathProbe, NodeBenchmarkService, NodeSelector, NodeStatusView, ReqwestCodexPathProbe,
-    VerifiedSidecar, build_report, node_fingerprint,
+    BenchmarkPhase, BenchmarkProgress, BenchmarkProgressSink, CodexPathProbe, NodeBenchmarkService,
+    NodeSelector, NodeStatusView, ReqwestCodexPathProbe, VerifiedSidecar, build_report,
+    node_fingerprint,
 };
 pub use error::NetworkError;
 pub use geo::{

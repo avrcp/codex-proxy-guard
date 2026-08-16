@@ -13,6 +13,7 @@ use proxy_guard_core::{
     ManagedNodeState, NodeId, NodeSelection, PathSample, QuickVerdict, RegionBenchmarkCounts,
     SubscriptionId,
 };
+use serde::Serialize;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -36,6 +37,43 @@ fn deep_limit(region: CodexRegion) -> usize {
         CodexRegion::JP => 6,
         CodexRegion::SG => 3,
         CodexRegion::US => 3,
+    }
+}
+
+/// Aggregate progress of one bounded benchmark run. Counts only; it never
+/// carries node identities, endpoints, or subscription data.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct BenchmarkProgress {
+    pub phase: BenchmarkPhase,
+    pub done: usize,
+    pub total: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BenchmarkPhase {
+    QuickScan,
+    DeepScan,
+}
+
+/// Receives aggregate progress updates while a benchmark runs.
+pub type BenchmarkProgressSink = Arc<dyn Fn(BenchmarkProgress) + Send + Sync>;
+
+fn no_progress() -> BenchmarkProgressSink {
+    Arc::new(|_| {})
+}
+
+/// Keep only the active nodes whose region is in scope; `None` keeps all.
+fn scoped_active_nodes(
+    nodes: Vec<ManagedNode>,
+    regions: Option<&[CodexRegion]>,
+) -> Vec<ManagedNode> {
+    match regions {
+        None => nodes,
+        Some(regions) => nodes
+            .into_iter()
+            .filter(|node| regions.contains(&node.region_hint))
+            .collect(),
     }
 }
 
@@ -161,21 +199,40 @@ impl NodeBenchmarkService {
     ///
     /// # Errors
     ///
-    /// Returns a cancellation or storage error. Individual node failures are
-    /// reflected in the summary, not returned as an overall error.
+    /// Returns an availability, cancellation, or storage error. Individual node
+    /// failures are reflected in the summary, not returned as an overall error.
     pub async fn run(
         &self,
         subscription_id: Option<SubscriptionId>,
         cancellation: &CancellationToken,
     ) -> Result<BenchmarkRunSummary, NetworkError> {
-        let nodes = self.active_nodes(subscription_id)?;
+        self.run_scoped(subscription_id, None, cancellation, &no_progress())
+            .await
+    }
+
+    /// Like [`run`](Self::run), optionally restricted to a subset of regions
+    /// and reporting aggregate progress while it advances.
+    ///
+    /// # Errors
+    ///
+    /// Returns an availability, cancellation, or storage error. Individual node
+    /// failures are reflected in the summary, not returned as an overall error.
+    pub async fn run_scoped(
+        &self,
+        subscription_id: Option<SubscriptionId>,
+        regions: Option<&[CodexRegion]>,
+        cancellation: &CancellationToken,
+        progress: &BenchmarkProgressSink,
+    ) -> Result<BenchmarkRunSummary, NetworkError> {
+        self.runtime.ensure_available()?;
+        let nodes = scoped_active_nodes(self.active_nodes(subscription_id)?, regions);
         if nodes.is_empty() {
             return Err(NetworkError::Benchmark(
                 "no active JP/SG/US nodes to benchmark; sync a subscription first".into(),
             ));
         }
 
-        let quick = self.quick_scan_all(&nodes, cancellation).await?;
+        let quick = self.quick_scan_all(&nodes, cancellation, progress).await?;
 
         let mut deep_nodes = Vec::new();
         let mut candidates = nodes
@@ -210,7 +267,8 @@ impl NodeBenchmarkService {
         }
 
         let names = names_by_id(&nodes);
-        for (node, _) in &deep_nodes {
+        let deep_total = deep_nodes.len();
+        for (index, (node, _)) in deep_nodes.iter().enumerate() {
             if cancellation.is_cancelled() {
                 return Err(cancelled());
             }
@@ -224,6 +282,11 @@ impl NodeBenchmarkService {
                 let report = build_report(input);
                 self.benchmarks.save(&report)?;
             }
+            progress(BenchmarkProgress {
+                phase: BenchmarkPhase::DeepScan,
+                done: index + 1,
+                total: deep_total,
+            });
         }
 
         let quick_rejected = quick
@@ -442,6 +505,7 @@ impl NodeBenchmarkService {
         &self,
         nodes: &[ManagedNode],
         cancellation: &CancellationToken,
+        progress: &BenchmarkProgressSink,
     ) -> Result<HashMap<NodeId, (QuickVerdict, u64)>, NetworkError> {
         let semaphore = Arc::new(Semaphore::new(QUICK_SCAN_CONCURRENCY));
         let mut set = JoinSet::new();
@@ -460,7 +524,8 @@ impl NodeBenchmarkService {
                 (node.id, service.quick_scan_node(&node))
             });
         }
-        let mut results = HashMap::with_capacity(nodes.len());
+        let total = nodes.len();
+        let mut results = HashMap::with_capacity(total);
         while let Some(result) = set.join_next().await {
             if cancellation.is_cancelled() {
                 set.abort_all();
@@ -469,6 +534,11 @@ impl NodeBenchmarkService {
             let (id, outcome) = result
                 .map_err(|source| NetworkError::Benchmark(format!("quick scan task: {source}")))?;
             results.insert(id, outcome);
+            progress(BenchmarkProgress {
+                phase: BenchmarkPhase::QuickScan,
+                done: results.len(),
+                total,
+            });
         }
         Ok(results)
     }
@@ -703,6 +773,7 @@ mod tests {
 
     use super::NodeBenchmarkService;
     use super::node_fingerprint;
+    use super::scoped_active_nodes;
     use crate::{ManagedPaths, ReqwestCodexPathProbe, SingBoxInstallation};
 
     const KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -755,6 +826,60 @@ mod tests {
             verdict: BenchmarkVerdict::Healthy,
             measured_at: chrono::Utc::now(),
         }
+    }
+
+    #[test]
+    fn scoped_active_nodes_filters_only_the_requested_regions() {
+        let subscription = SubscriptionId::new();
+        let jp = node("JP Tokyo", subscription);
+        let mut sg = node("SG Marina", subscription);
+        sg.region_hint = proxy_guard_core::CodexRegion::SG;
+        let nodes = vec![jp.clone(), sg.clone()];
+
+        assert_eq!(
+            scoped_active_nodes(nodes.clone(), None),
+            vec![jp.clone(), sg.clone()],
+            "no scope keeps every region"
+        );
+        assert_eq!(
+            scoped_active_nodes(nodes.clone(), Some(&[proxy_guard_core::CodexRegion::SG])),
+            vec![sg.clone()],
+            "scope keeps only matching regions"
+        );
+        assert!(
+            scoped_active_nodes(nodes, Some(&[])).is_empty(),
+            "empty scope keeps nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_fails_fast_when_the_runtime_is_not_installed() {
+        let temporary = tempdir().expect("temporary directory");
+        let paths = ManagedPaths::from_root(temporary.path().join("data"));
+        paths.ensure_layout().expect("layout");
+        let installation = crate::SingBoxLocator::resolve(&paths, None).expect("candidate");
+        let service = NodeBenchmarkService::new(
+            &paths,
+            installation,
+            std::time::Duration::from_secs(3600),
+            Arc::new(ReqwestCodexPathProbe),
+        )
+        .expect("service");
+        let subscription = SubscriptionId::new();
+        service
+            .nodes
+            .create(node("JP Tokyo", subscription))
+            .expect("create node");
+
+        let error = service
+            .run(
+                Some(subscription),
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .expect_err("runtime must gate the benchmark");
+
+        assert!(error.to_string().contains("sing-box"));
     }
 
     #[test]
