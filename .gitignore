@@ -1,0 +1,54 @@
+# Rust build outputs
+/target/
+
+# Portable build artifacts (EXE, SHA, build-info.json, etc.)
+/dist/
+
+# CodeGraph local indexes
+.codegraph/
+
+# Temporary scratch docs
+docs/tmp/
+
+# Windows / OS generated files
+# (All project EXEs live under /target or /dist; do not add binary fixtures without updating this.)
+*.pdb
+*.exe
+*.zip
+*.sha256
+*.cdx.json
+*.log
+*.tmp
+.env
+.env.*
+config.local.toml
+/config.toml
+*.secret
+*.secrets
+*.pem
+*.key
+*.pfx
+diagnostics/
+logs/
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.DS_Store
+.Spotlight-V100
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.history/
+
+# Rust tooling artifacts
+.rs.bk
+Cargo.toml.bak
+
+# Common local IDE/build metadata
+.vs/
+*.suo
+*.user

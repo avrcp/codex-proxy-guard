@@ -1,0 +1,18 @@
+[package]
+name = "proxy-guard-windows"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+proxy-guard-core = { path = "../proxy-guard-core" }
+serde.workspace = true
+serde_json.workspace = true
+sysinfo.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+
+[[bin]]
+name = "child-env-probe"
+path = "src/bin/child-env-probe.rs"
