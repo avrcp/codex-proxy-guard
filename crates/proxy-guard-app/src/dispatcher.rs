@@ -12,11 +12,18 @@ use proxy_guard_windows::{
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
-use crate::commands::{benchmark_service, node_store, subscription_service};
+use crate::managed_services::{benchmark_service, node_store};
+use crate::web::{ManagerServer, manager_info, reopen_browser};
 
 struct ManagedSidecar {
     process: SingBoxProcess,
     endpoint: LoopbackProxyEndpoint,
+}
+
+/// One running Local Web Manager owned by the dispatcher.
+struct ManagerHandle {
+    open_url: String,
+    shutdown: CancellationToken,
 }
 
 #[derive(Clone)]
@@ -26,6 +33,7 @@ pub struct EffectDispatcher {
     benchmark_cancel: Arc<Mutex<CancellationToken>>,
     cached_app: Arc<Mutex<Option<DesktopAppInfo>>>,
     sidecar: Arc<Mutex<Option<ManagedSidecar>>>,
+    manager: Arc<Mutex<Option<ManagerHandle>>>,
 }
 
 impl EffectDispatcher {
@@ -36,6 +44,7 @@ impl EffectDispatcher {
             cancellation,
             cached_app: Arc::new(Mutex::new(None)),
             sidecar: Arc::new(Mutex::new(None)),
+            manager: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -51,6 +60,7 @@ impl EffectDispatcher {
         let config_path = state.config_path.clone();
         let cached_app = Arc::clone(&self.cached_app);
         let sidecar = Arc::clone(&self.sidecar);
+        let manager = Arc::clone(&self.manager);
         tokio::spawn(async move {
             let result = match effect {
                 AppEffect::RefreshLocalState => {
@@ -89,7 +99,7 @@ impl EffectDispatcher {
                 }
                 AppEffect::SyncSubscription(id) => {
                     let result = tokio::task::spawn_blocking(move || {
-                        subscription_service()
+                        crate::managed_services::subscription_service()
                             .map_err(|error| error.to_string())
                             .and_then(|service| {
                                 service
@@ -122,6 +132,18 @@ impl EffectDispatcher {
                     let result = stop_managed_proxy(&sidecar).await;
                     TaskResult::ManagedProxyStopped(result)
                 }
+                AppEffect::OpenManager => {
+                    run_manager(config, config_path, tx.clone(), cancellation, manager).await;
+                    return;
+                }
+                AppEffect::ReopenManager => {
+                    reopen_manager(manager).await;
+                    return;
+                }
+                AppEffect::CloseManager => {
+                    close_manager(manager, tx.clone()).await;
+                    return;
+                }
                 AppEffect::Shutdown => return,
             };
             let _ = tx.send(result).await;
@@ -135,41 +157,78 @@ impl EffectDispatcher {
     }
 }
 
+/// Bind the loopback manager, open the browser, then own the server until it is
+/// closed or Guard shuts down. Reports open/close back to the TUI event loop.
+async fn run_manager(
+    config: GuardConfig,
+    config_path: std::path::PathBuf,
+    tx: mpsc::Sender<TaskResult>,
+    parent_cancellation: CancellationToken,
+    manager: Arc<Mutex<Option<ManagerHandle>>>,
+) {
+    let server =
+        match ManagerServer::start(config, config_path, tx.clone(), &parent_cancellation).await {
+            Ok(server) => server,
+            Err(error) => {
+                let _ = tx.send(TaskResult::ManagerOpened(Err(error))).await;
+                return;
+            }
+        };
+    if let Err(error) = server.open_browser() {
+        server.shutdown.cancel();
+        let _ = server.task.await;
+        let _ = tx.send(TaskResult::ManagerOpened(Err(error))).await;
+        return;
+    }
+    let display_url = server.display_url.clone();
+    let open_url = server.open_url.clone();
+    let shutdown = server.shutdown.clone();
+    let task = server.task;
+    *manager.lock().await = Some(ManagerHandle {
+        open_url,
+        shutdown: shutdown.clone(),
+    });
+    let _ = tx
+        .send(TaskResult::ManagerOpened(Ok(manager_info(&display_url))))
+        .await;
+    shutdown.cancelled().await;
+    let _ = task.await;
+    manager.lock().await.take();
+    let _ = tx.send(TaskResult::ManagerClosed).await;
+}
+
+async fn reopen_manager(manager: Arc<Mutex<Option<ManagerHandle>>>) {
+    let open_url = manager
+        .lock()
+        .await
+        .as_ref()
+        .map(|handle| handle.open_url.clone());
+    let Some(open_url) = open_url else {
+        return;
+    };
+    let _ = reopen_browser(&open_url);
+}
+
+async fn close_manager(manager: Arc<Mutex<Option<ManagerHandle>>>, tx: mpsc::Sender<TaskResult>) {
+    let Some(handle) = manager.lock().await.take() else {
+        let _ = tx.send(TaskResult::ManagerClosed).await;
+        return;
+    };
+    handle.shutdown.cancel();
+}
+
 async fn load_managed_view(
     config: &GuardConfig,
     sidecar: &Arc<Mutex<Option<ManagedSidecar>>>,
 ) -> Result<ManagedView, String> {
-    if !config.is_managed() {
-        return Ok(ManagedView::default());
-    }
-    let subscription_id = config
-        .managed
-        .subscription_id
-        .parse::<SubscriptionId>()
-        .ok();
-    let subscription_name = subscription_service()
-        .map_err(|error| error.to_string())?
-        .list()
-        .map_err(|error| error.to_string())?
-        .into_iter()
-        .find(|stored| Some(stored.source.id) == subscription_id)
-        .map(|stored| stored.source.name);
-    let (regions, selected) = benchmark_service(config)
-        .map_err(|error| error.to_string())?
-        .snapshot(subscription_id, Utc::now())
-        .map_err(|error| error.to_string())?;
-    let proxy_endpoint = sidecar
+    let mut view =
+        crate::managed_services::load_managed_view(config).map_err(|error| error.to_string())?;
+    view.proxy_endpoint = sidecar
         .lock()
         .await
         .as_ref()
         .map(|sidecar| sidecar.endpoint.proxy_url());
-    Ok(ManagedView {
-        subscription_name,
-        regions,
-        selected,
-        proxy_endpoint,
-        proxy_lost: false,
-    })
+    Ok(view)
 }
 
 async fn run_benchmark(

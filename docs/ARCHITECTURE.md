@@ -33,7 +33,10 @@ Managed:
   secret 边界、sing-box 发现/配置/运行、出口 Geo 验证、两阶段 benchmark、cache 与
   JP/SG/US selection。
 - `proxy-guard-windows`：APPX 发现、Desktop 根进程检测、启动锁、环境注入与进程启动。
-- `codex-proxy-guard`：CLI、单屏 TUI、effect dispatch 与 External/Managed 启动编排。
+- `codex-proxy-guard`：CLI、单屏 TUI、effect dispatch、External/Managed 启动编排，以及
+  按需启动的 Local Web Manager 适配器。它拥有两个平面：运行时平面
+  （TUI → EffectDispatcher → verified sidecar → Desktop）与管理平面
+  （浏览器 → loopback Axum manager → 共享 network services）。
 
 所有会改变外部状态的操作都遵循：
 
@@ -42,6 +45,39 @@ Action → candidate reduce → authorize → commit → dispatch → TaskResult
 ```
 
 任意时刻只允许一个前台操作。Benchmark 可被 CancelBenchmark effect 取消。
+
+## Local Web Manager（双平面）
+
+Web Manager 是 `codex-proxy-guard` 的第三个 presentation adapter，与 CLI、TUI 并列，
+不是常驻 daemon，也不属于 `proxy-guard-network`。
+
+```text
+RUNTIME PLANE                 MANAGEMENT PLANE
+    TUI                           Default Browser
+     │                                 │
+     ▼                         127.0.0.1:<ephemeral>
+EffectDispatcher                       ▼
+     │                             Axum Local Manager
+     ▼                                 │
+verified sidecar                 ManagedOperations
+     │                          (subscription/node/benchmark)
+     ▼
+Desktop
+```
+
+- `managed_services.rs` 提供 CLI/TUI/Web 共用的 service factory（`subscription_service`、
+  `benchmark_service`、`node_store`、`load_managed_view`）；Web 路由不自行构造 service。
+- Dispatcher 持有唯一的 `ManagerHandle`。`M` 打开时先满足互斥门（无 foreground、
+  Desktop 未运行、无 managed sidecar），再绑定 `127.0.0.1:0`、生成 256-bit 会话 token、
+  用默认浏览器打开 `/#token=<secret>`；`O` 重开标签页，`M` 关闭。
+- `shutdown()` 顺序：cancel benchmark → 停止 Manager server → 停止 managed sidecar。
+- Manager 只做低频 HTTP JSON + 轮询（无 WebSocket/SSE）；benchmark 与 sync 共用
+  `Semaphore(1)`，忙时返回 `409 OPERATION_BUSY` 而不排队。
+- Web 激活订阅时：克隆 config → `proxy.mode = managed` → 写入 `managed.subscription_id`
+  → validate → save → 发送 `ManagerConfigUpdated`，reducer 立即替换 `state.config`；
+  Manager 关闭后再触发 `RefreshLocalState`，避免使用旧的内存配置。
+- 手选节点（`healthy_selection_for` 通过后才允许）只存于本会话；启动解析
+  `manual → auto (JP > SG > US)`，最终都必须经过 `start_verified_sidecar` 复验。
 
 ## Managed Mode 数据流
 
@@ -69,7 +105,8 @@ BenchmarkStore（TTL + fingerprint + expected region 失效；损坏缓存按 mi
 
 Managed Mode 下 TUI 保持单屏，显示订阅名、各区域 active/healthy 计数与选中节点。按 `S`
 同步订阅，`B` 跑 benchmark，`Enter` 启动。TUI 不输入订阅 URL；订阅通过 CLI
-`subscription add` 配置。
+`subscription add` 或浏览器管理界面（`M`）配置。TUI 只负责"看状态 + Launch + Manage"；
+订阅/节点/benchmark/下一启动选节点的低频表单化操作交给浏览器。
 
 ## 启动互斥
 

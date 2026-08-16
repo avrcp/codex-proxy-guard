@@ -16,8 +16,8 @@ pub mod storage;
 pub mod subscription;
 
 pub use benchmark::{
-    CodexPathProbe, NodeBenchmarkService, NodeSelector, ReqwestCodexPathProbe, VerifiedSidecar,
-    build_report, node_fingerprint,
+    CodexPathProbe, NodeBenchmarkService, NodeSelector, NodeStatusView, ReqwestCodexPathProbe,
+    VerifiedSidecar, build_report, node_fingerprint,
 };
 pub use error::NetworkError;
 pub use geo::{
@@ -33,4 +33,5 @@ pub use singbox::{
 pub use storage::{BenchmarkStore, NodeStore, StoredNode, StoredSubscription, SubscriptionStore};
 pub use subscription::{
     HttpsSubscriptionFetcher, SubscriptionFetcher, SubscriptionParser, SubscriptionService,
+    SubscriptionUpdate,
 };

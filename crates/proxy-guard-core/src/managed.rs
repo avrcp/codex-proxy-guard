@@ -594,6 +594,10 @@ pub struct BenchmarkRunSummary {
     pub healthy: usize,
     pub regions: RegionBenchmarkCounts,
     pub selected: Option<NodeSelection>,
+    /// IDs of every node carrying a fresh healthy report after this run. Used to
+    /// invalidate a session-only manual override that no longer survived the run.
+    #[serde(default)]
+    pub healthy_ids: Vec<NodeId>,
 }
 
 /// Receipt for a Managed Mode launch through the Guard-owned sing-box sidecar.

@@ -23,7 +23,7 @@ fn reduce_intent(state: &mut AppState, intent: UserIntent) -> Vec<AppEffect> {
         return Vec::new();
     }
     if intent == UserIntent::EditProxy {
-        if state.foreground.is_none() {
+        if state.foreground.is_none() && !state.manager.active {
             state.proxy_editor = Some(ProxyEditor {
                 host: state.config.proxy.host.clone(),
                 port: state.config.proxy.port.to_string(),
@@ -83,10 +83,40 @@ fn reduce_intent(state: &mut AppState, intent: UserIntent) -> Vec<AppEffect> {
             | UserIntent::SyncSubscription
             | UserIntent::BenchmarkNodes
             | UserIntent::CancelBenchmark
+            | UserIntent::ToggleManager
+            | UserIntent::ReopenManager
             | UserIntent::ToggleHelp
             | UserIntent::Dismiss
             | UserIntent::Quit
             | UserIntent::EditProxy => {}
+        }
+        return Vec::new();
+    }
+    if intent == UserIntent::ToggleManager {
+        if state.manager.active {
+            state.manager.active = false;
+            state.manager.display_url = None;
+            state.status_message = "Closing the browser manager…".into();
+            return vec![AppEffect::CloseManager];
+        }
+        if state.foreground.is_none()
+            && !matches!(state.desktop_process, DesktopProcessState::Running { .. })
+            && state.managed.proxy_endpoint.is_none()
+        {
+            state.manager.active = true;
+            state.status_message = "Opening the browser manager…".into();
+            return vec![AppEffect::OpenManager];
+        }
+        state.status_message = "Close Desktop and wait for the current operation first".into();
+        state.error_message = Some(
+            "MANAGER_BUSY: quit the running Desktop or finish the operation, then open the Manager"
+                .into(),
+        );
+        return Vec::new();
+    }
+    if intent == UserIntent::ReopenManager {
+        if state.manager.active {
+            return vec![AppEffect::ReopenManager];
         }
         return Vec::new();
     }
@@ -108,6 +138,12 @@ fn reduce_intent(state: &mut AppState, intent: UserIntent) -> Vec<AppEffect> {
     }
     if state.foreground.is_some() {
         state.status_message = "An operation is already in progress".into();
+        return Vec::new();
+    }
+    if state.manager.active {
+        state.status_message = "Close the browser manager before using runtime controls".into();
+        state.error_message =
+            Some("MANAGER_ACTIVE: close the Local Web Manager, then retry".into());
         return Vec::new();
     }
 
@@ -138,6 +174,8 @@ fn reduce_intent(state: &mut AppState, intent: UserIntent) -> Vec<AppEffect> {
         | UserIntent::SaveProxy
         | UserIntent::CancelProxyEdit
         | UserIntent::CancelBenchmark
+        | UserIntent::ToggleManager
+        | UserIntent::ReopenManager
         | UserIntent::ToggleHelp
         | UserIntent::Dismiss
         | UserIntent::Quit => unreachable!(),
@@ -146,9 +184,18 @@ fn reduce_intent(state: &mut AppState, intent: UserIntent) -> Vec<AppEffect> {
 
 fn reduce_launch(state: &mut AppState) -> Vec<AppEffect> {
     if state.config.is_managed() {
-        if let Some(selection) = &state.managed.selected {
+        let selection = state
+            .managed
+            .manual_selection
+            .as_ref()
+            .or(state.managed.selected.as_ref());
+        if let Some(selection) = selection {
             state.foreground = Some(ForegroundOperation::ManagedLaunch);
-            state.status_message = "Launching Desktop through the managed proxy…".into();
+            state.status_message = if state.managed.manual_selection.is_some() {
+                "Launching Desktop through the manually selected node…".into()
+            } else {
+                "Launching Desktop through the managed proxy…".into()
+            };
             return vec![AppEffect::LaunchManaged(selection.node_id)];
         }
         state.status_message = "No healthy managed node is selected".into();
@@ -206,7 +253,8 @@ fn reduce_result(state: &mut AppState, result: TaskResult) -> Vec<AppEffect> {
                     state.status_message = "Desktop executable was not found".into();
                 }
             }
-            if let Ok(view) = managed {
+            if let Ok(mut view) = managed {
+                view.manual_selection = state.managed.manual_selection.clone();
                 state.managed = view;
             }
         }
@@ -277,6 +325,11 @@ fn reduce_result(state: &mut AppState, result: TaskResult) -> Vec<AppEffect> {
                     state.managed.regions = summary.regions;
                     state.managed.selected = summary.selected.clone();
                     state.managed.proxy_lost = false;
+                    if let Some(manual) = &state.managed.manual_selection
+                        && !summary.healthy_ids.contains(&manual.node_id)
+                    {
+                        state.managed.manual_selection = None;
+                    }
                     state.status_message = match &summary.selected {
                         Some(selection) => format!(
                             "Selected {} ({}) score {}",
@@ -334,6 +387,68 @@ fn reduce_result(state: &mut AppState, result: TaskResult) -> Vec<AppEffect> {
                 state.error_message = Some(redact_text(&reason));
             }
         }
+        TaskResult::ManagerOpened(result) => match result {
+            Ok(info) => {
+                state.manager.active = true;
+                state.manager.display_url = Some(info.display_url.clone());
+                state.error_message = None;
+                state.status_message = format!("Browser Manager open at {}", info.display_url);
+            }
+            Err(message) => {
+                state.manager.active = false;
+                state.manager.display_url = None;
+                state.status_message = "Browser Manager could not be opened".into();
+                state.error_message = Some(redact_text(&message));
+            }
+        },
+        TaskResult::ManagerClosed => {
+            state.manager.active = false;
+            state.manager.display_url = None;
+            state.foreground = None;
+            state.status_message = "Browser Manager closed".into();
+            return vec![AppEffect::RefreshLocalState];
+        }
+        TaskResult::ManagerConfigUpdated(result) => match result {
+            Ok(config) => {
+                let subscription_changed =
+                    state.config.managed.subscription_id != config.managed.subscription_id;
+                state.config = config;
+                if subscription_changed {
+                    state.managed.manual_selection = None;
+                }
+                state.status_message = "Configuration updated by the Browser Manager".into();
+            }
+            Err(message) => {
+                state.status_message = "Browser Manager configuration update failed".into();
+                state.error_message = Some(redact_text(&message));
+            }
+        },
+        TaskResult::ManagerManagedViewUpdated(result) => match result {
+            Ok(mut view) => {
+                view.manual_selection = state.managed.manual_selection.clone();
+                state.managed = view;
+            }
+            Err(message) => {
+                state.status_message = "Browser Manager state refresh failed".into();
+                state.error_message = Some(redact_text(&message));
+            }
+        },
+        TaskResult::ManagerSelectionChanged(result) => match result {
+            Ok(selection) => {
+                state.managed.manual_selection = selection.clone();
+                state.status_message = match selection {
+                    Some(selection) => format!(
+                        "Manual override {} ({}) set for next launch",
+                        selection.name, selection.region
+                    ),
+                    None => "Manual override cleared; using AUTO JP > SG > US".into(),
+                };
+            }
+            Err(message) => {
+                state.status_message = "Manual selection was not accepted".into();
+                state.error_message = Some(redact_text(&message));
+            }
+        },
     }
     Vec::new()
 }
@@ -436,6 +551,7 @@ mod tests {
                 us_healthy: 1,
             },
             selected: Some(selection()),
+            healthy_ids: Vec::new(),
         };
         assert!(
             reduce(
@@ -540,5 +656,157 @@ mod tests {
         );
         assert_eq!(state.config.proxy.port, 7890);
         assert!(state.proxy_editor.is_none());
+    }
+
+    #[test]
+    fn toggle_manager_opens_only_when_the_runtime_is_idle() {
+        let mut state = managed_state();
+        assert_eq!(
+            reduce(&mut state, AppAction::Intent(UserIntent::ToggleManager)),
+            vec![AppEffect::OpenManager]
+        );
+        assert!(state.manager.active);
+
+        reduce(
+            &mut state,
+            AppAction::TaskComplete(Box::new(TaskResult::ManagerOpened(Ok(
+                crate::ManagerInfo {
+                    display_url: "http://127.0.0.1:43210".into(),
+                },
+            )))),
+        );
+        assert_eq!(
+            state.manager.display_url.as_deref(),
+            Some("http://127.0.0.1:43210")
+        );
+    }
+
+    #[test]
+    fn manager_is_rejected_while_desktop_or_an_operation_runs() {
+        let mut running = managed_state();
+        running.desktop_process = DesktopProcessState::Running { pid: 9 };
+        assert!(reduce(&mut running, AppAction::Intent(UserIntent::ToggleManager)).is_empty());
+        assert!(!running.manager.active);
+        assert!(
+            running
+                .error_message
+                .as_deref()
+                .is_some_and(|message| message.contains("MANAGER_BUSY"))
+        );
+
+        let mut operating = managed_state();
+        reduce(
+            &mut operating,
+            AppAction::Intent(UserIntent::BenchmarkNodes),
+        );
+        assert!(reduce(&mut operating, AppAction::Intent(UserIntent::ToggleManager)).is_empty());
+        assert!(!operating.manager.active);
+    }
+
+    #[test]
+    fn manager_active_locks_runtime_mutations() {
+        let mut state = managed_state();
+        reduce(&mut state, AppAction::Intent(UserIntent::ToggleManager));
+        state.managed.selected = Some(selection());
+
+        for intent in [
+            UserIntent::Launch,
+            UserIntent::SyncSubscription,
+            UserIntent::BenchmarkNodes,
+            UserIntent::EditProxy,
+        ] {
+            let mut candidate = state.clone();
+            let effects = reduce(&mut candidate, AppAction::Intent(intent.clone()));
+            assert!(effects.is_empty(), "no effect for {intent:?}");
+            assert!(candidate.foreground.is_none());
+        }
+    }
+
+    #[test]
+    fn toggle_manager_while_active_closes_it() {
+        let mut state = managed_state();
+        reduce(&mut state, AppAction::Intent(UserIntent::ToggleManager));
+        assert_eq!(
+            reduce(&mut state, AppAction::Intent(UserIntent::ToggleManager)),
+            vec![AppEffect::CloseManager]
+        );
+        assert!(!state.manager.active);
+    }
+
+    #[test]
+    fn manager_close_refreshes_local_state() {
+        let mut state = managed_state();
+        state.manager.active = true;
+        let effects = reduce(
+            &mut state,
+            AppAction::TaskComplete(Box::new(TaskResult::ManagerClosed)),
+        );
+        assert_eq!(effects, vec![AppEffect::RefreshLocalState]);
+        assert!(!state.manager.active);
+    }
+
+    #[test]
+    fn config_update_clears_manual_override_on_subscription_change() {
+        let mut state = managed_state();
+        state.managed.manual_selection = Some(selection());
+        let mut updated = state.config.clone();
+        updated.managed.subscription_id = "22222222-2222-2222-2222-222222222222".into();
+        reduce(
+            &mut state,
+            AppAction::TaskComplete(Box::new(TaskResult::ManagerConfigUpdated(Ok(
+                updated.clone()
+            )))),
+        );
+        assert_eq!(
+            state.config.managed.subscription_id,
+            updated.managed.subscription_id
+        );
+        assert!(state.managed.manual_selection.is_none());
+    }
+
+    #[test]
+    fn manual_selection_syncs_into_managed_view_and_launch_prefers_it() {
+        let mut state = managed_state();
+        let manual = selection();
+        reduce(
+            &mut state,
+            AppAction::TaskComplete(Box::new(TaskResult::ManagerSelectionChanged(Ok(Some(
+                manual.clone(),
+            ))))),
+        );
+        assert_eq!(state.managed.manual_selection, Some(manual.clone()));
+        assert_eq!(
+            reduce(&mut state, AppAction::Intent(UserIntent::Launch)),
+            vec![AppEffect::LaunchManaged(manual.node_id)]
+        );
+    }
+
+    #[test]
+    fn fresh_benchmark_invalidates_a_rejected_manual_override() {
+        let mut state = managed_state();
+        let manual = selection();
+        state.managed.manual_selection = Some(manual.clone());
+        reduce(&mut state, AppAction::Intent(UserIntent::BenchmarkNodes));
+        let summary = crate::BenchmarkRunSummary {
+            scanned: 3,
+            quick_rejected: 1,
+            deep_scanned: 2,
+            healthy: 1,
+            regions: RegionBenchmarkCounts {
+                jp_active: 3,
+                jp_healthy: 1,
+                sg_active: 0,
+                sg_healthy: 0,
+                us_active: 0,
+                us_healthy: 0,
+            },
+            selected: Some(selection()),
+            healthy_ids: vec![crate::NodeId::new()],
+        };
+        reduce(
+            &mut state,
+            AppAction::TaskComplete(Box::new(TaskResult::BenchmarkCompleted(Ok(summary)))),
+        );
+        assert!(state.managed.manual_selection.is_none());
     }
 }

@@ -47,6 +47,31 @@ benchmark，但交付物仍然是 loopback HTTP proxy：
 Managed Mode 的订阅元数据与节点文档位于 `%APPDATA%/codex-proxy-guard/managed/`，
 只通过 ID 派生目录读写，canonicalize 后不得逃逸到 managed 根之外；订阅 URL 永远不落盘。
 
+## Local Web Manager
+
+按需启动的管理平面是显式允许的 loopback-only 配置面，它不是运行时：
+
+- 只 `TcpListener::bind("127.0.0.1", 0)`，禁用 `0.0.0.0`/`[::]`/`localhost`/固定端口；
+  端口由 OS 分配，随 Guard 退出停止，无常驻后台服务；
+- 每次启动生成至少 256-bit 的 OS CSPRNG token（Base64URL no-pad），只保存在 Guard 内存
+  与当前浏览器标签页的 JS 内存；禁止写入 `localStorage`、`sessionStorage`、IndexedDB、
+  cookie、`config.toml`、日志或 JSON cache；
+- 所有 `/api/v1/*` 都要求 `X-Codex-Guard-Manager: <token>`，并校验
+  `Host == 127.0.0.1:<port>`；非 GET 请求必须携带同源
+  `Origin == http://127.0.0.1:<port>`；不提供 CORS，不允许
+  `Access-Control-Allow-Origin: *`；
+- 所有响应带 `Cache-Control: no-store`、`X-Content-Type-Options: nosniff`、
+  `Referrer-Policy: no-referrer`、`Cross-Origin-Resource-Policy: same-origin`；HTML 使用
+  严格 CSP（`default-src 'self'`，无 CDN/Google Fonts/远程图标/遥测）；
+- 前端资源用 `include_str!` 编译进 EXE，不引入 `tower-http::ServeDir`，不生成 wwwroot，
+  不加载远程脚本；
+- Web 不提供 Desktop launch API；不返回已保存订阅 URL、raw outbound、VLESS UUID、
+  Trojan/SS 密码、Reality 字段或 `remote_key`；错误内容先 `redact_text()` 再展示；
+- 手选节点只接受满足 `healthy_selection_for` 全部门禁的节点（Active + 属于激活订阅 +
+  新鲜 benchmark + Healthy + verified region == hint），且仅对当前进程会话有效；
+- Manager 打开期间 TUI 锁定 Launch/Sync/Benchmark/EditProxy；15 分钟无操作自动关闭，
+  浏览器无法打开时立即停止并返回 TUI 错误，不带 token 的完整 URL 永不写入持久日志。
+
 ## 不做网络判断
 
 External Mode 下 Guard 不访问配置的代理端口，也不访问 OpenAI 域名。代理失效时

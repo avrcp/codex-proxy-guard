@@ -56,9 +56,11 @@ cargo build --release -p codex-proxy-guard
 | 按键 | 行为 |
 | --- | --- |
 | `Enter` / `L` | 通过配置的代理启动 Desktop |
+| `M` | 打开/关闭浏览器管理界面（Local Web Manager） |
+| `O` | 重新打开浏览器管理界面标签页 |
 | `R` | 刷新 Desktop 发现与运行状态 |
-| `S` | 同步已保存的订阅（Managed Mode） |
-| `B` | Benchmark JP/SG/US 节点（Managed Mode） |
+| `S` | 同步已保存的订阅（Managed Mode，Web 稳定后为调试后备） |
+| `B` | Benchmark JP/SG/US 节点（Managed Mode，Web 稳定后为调试后备） |
 | `?` | 查看帮助 |
 | `Q` / `Ctrl-C` | 退出 Guard，不终止 Desktop |
 
@@ -161,6 +163,31 @@ codex-proxy-guard subscription delete "Airport" --yes
 TUI（`S` 同步、`B` benchmark、`Enter` 启动）。Managed Mode 不支持一次性 `launch`
 子命令，因为 Guard 必须持续持有 sidecar。启动 Desktop 前，Guard 会用最终交付的同一个
 sidecar 再次校验真实出口国和 ChatGPT HTTPS 路径；若无 Healthy 节点或复验失败则不启动。
+
+## Browser Manager（Local Web Manager）
+
+按 `M` 会打开默认浏览器中的管理界面（仅 `127.0.0.1` 的临时端口，随 Guard 关闭而停止），
+用于所有低频、表单化、列表化的 Managed Network 配置与诊断：
+
+- **Subscriptions**：inspect / add / sync / activate / edit / delete 订阅，只显示元数据，
+  已保存的 URL 永不回显；
+- **Nodes**：JP / SG / US 分页查看节点与 benchmark 状态（healthy / rejected / not-tested /
+  stale），并从 Healthy 节点中选择 "Use for next launch"；
+- **Benchmark**：从浏览器启动 `Auto` / `All` benchmark，后台执行、页面轮询状态与报告；
+- **Overview**：Managed Mode 状态、各区域计数与下一启动将使用的节点（AUTO 或 MANUAL）。
+
+安全约束：
+
+- 只绑定 `127.0.0.1:<ephemeral>`，不开放 LAN，不监听固定端口，不常驻后台；
+- 每次启动生成独立的 256-bit 能力 token（仅存于 Guard 内存与当前浏览器标签页的 JS 内存，
+  不落盘、不写日志、不进 `localStorage`/cookie）；API 全部要求
+  `X-Codex-Guard-Manager` 头，并校验 Host 与 mutation 的 Origin；
+- Web 不启动 Desktop，不拥有 managed sidecar，没有 Desktop launch API；启动仍回到 TUI 按
+  `Enter`/`L`，继续走 `start_verified_sidecar` 的真实 Geo/路径复验；
+- 手选节点仅对当前 Guard 进程有效（session-only），Guard 重启回到 AUTO `JP > SG > US`；
+  激活/切换订阅、节点过期、fingerprint 变化或新 benchmark 拒绝该节点时自动清除手选；
+- Manager 打开期间 TUI 锁定 Launch / Sync / Benchmark / EditProxy，避免与 Web 并发变更；
+  15 分钟无操作自动关闭（benchmark 运行时不超时），关闭后 TUI 重新加载配置与状态。
 
 ## 网络边界与手工验证
 

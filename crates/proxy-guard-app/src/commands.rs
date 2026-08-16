@@ -1,59 +1,12 @@
-use std::{io::Write, sync::Arc, time::Duration};
+use std::io::Write;
 
 use anyhow::{Context, bail};
-use proxy_guard_core::{GuardConfig, SubscriptionId};
-use proxy_guard_network::{
-    HttpsSubscriptionFetcher, KeyringSecretStore, ManagedPaths, NodeBenchmarkService, NodeStore,
-    ReqwestCodexPathProbe, SingBoxInstallation, SingBoxLocator, SubscriptionService,
+use proxy_guard_core::GuardConfig;
+use proxy_guard_network::NodeStore;
+
+use crate::managed_services::{
+    benchmark_service, configured_subscription, managed_paths, subscription_service,
 };
-
-pub fn managed_paths() -> anyhow::Result<ManagedPaths> {
-    let paths = ManagedPaths::discover().context("resolve managed data directory")?;
-    paths
-        .ensure_layout()
-        .context("create managed data directory")?;
-    Ok(paths)
-}
-
-pub fn subscription_service()
--> anyhow::Result<SubscriptionService<KeyringSecretStore, HttpsSubscriptionFetcher>> {
-    let paths = managed_paths()?;
-    SubscriptionService::open(&paths, KeyringSecretStore, HttpsSubscriptionFetcher::new()?)
-        .context("open subscription service")
-}
-
-fn sing_box_installation(config: &GuardConfig) -> anyhow::Result<SingBoxInstallation> {
-    let paths = managed_paths()?;
-    let explicit = (!config.managed.sing_box_path.as_os_str().is_empty())
-        .then_some(config.managed.sing_box_path.as_path());
-    SingBoxLocator::resolve(&paths, explicit).context("resolve sing-box runtime")
-}
-
-pub fn benchmark_service(config: &GuardConfig) -> anyhow::Result<NodeBenchmarkService> {
-    let paths = managed_paths()?;
-    let installation = sing_box_installation(config)?;
-    let cache_ttl = Duration::from_secs(u64::from(config.managed.benchmark_cache_hours) * 3600);
-    NodeBenchmarkService::new(
-        &paths,
-        installation,
-        cache_ttl,
-        Arc::new(ReqwestCodexPathProbe),
-    )
-    .context("open benchmark service")
-}
-
-pub fn node_store() -> anyhow::Result<NodeStore> {
-    let paths = managed_paths()?;
-    NodeStore::open(&paths).context("open node store")
-}
-
-fn configured_subscription(config: &GuardConfig) -> Option<SubscriptionId> {
-    config
-        .managed
-        .subscription_id
-        .parse::<SubscriptionId>()
-        .ok()
-}
 
 pub fn cmd_subscription_add(name: &str, url: &str) -> anyhow::Result<()> {
     let service = subscription_service()?;

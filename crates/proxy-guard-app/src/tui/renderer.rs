@@ -52,6 +52,8 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         Span::styled("CONFIGURE", theme::accent())
     } else if state.error_message.is_some() {
         Span::styled("BLOCKED", theme::error())
+    } else if state.manager.active {
+        Span::styled("MANAGER", theme::accent())
     } else if state.managed.proxy_lost {
         Span::styled("PROXY LOST", theme::error())
     } else if matches!(state.desktop_process, DesktopProcessState::Running { .. }) {
@@ -94,6 +96,8 @@ fn draw_content(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
             "Press C to configure and replace it, or Enter/Esc to dismiss.",
             theme::muted(),
         ));
+    } else if state.manager.active {
+        draw_manager_content(&mut lines, state);
     } else if state.config.is_managed() {
         draw_managed_content(&mut lines, state);
     } else {
@@ -137,6 +141,38 @@ fn draw_content(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         ));
     }
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
+}
+
+fn draw_manager_content(lines: &mut Vec<Line<'static>>, state: &AppState) {
+    lines.push(Line::styled("BROWSER MANAGER", theme::title()));
+    lines.push(key_value(
+        "Address",
+        state
+            .manager
+            .display_url
+            .clone()
+            .unwrap_or_else(|| "opening…".into()),
+        theme::accent(),
+    ));
+    lines.push(key_value(
+        "Scope",
+        "Subscriptions · Nodes · Benchmark · selection".into(),
+        Style::default(),
+    ));
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "The Manager runs only on 127.0.0.1 with a per-session token.",
+        theme::muted(),
+    ));
+    lines.push(Line::styled(
+        "Runtime controls are locked while it is open.",
+        theme::muted(),
+    ));
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "Press O to reopen the browser tab, M to close the Manager.",
+        theme::accent(),
+    ));
 }
 
 fn draw_managed_content(lines: &mut Vec<Line<'static>>, state: &AppState) {
@@ -343,6 +379,14 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect) {
             Span::raw("Benchmark JP/SG/US nodes (Managed Mode)"),
         ]),
         Line::from(vec![
+            Span::styled("M          ", theme::accent()),
+            Span::raw("Open / close the Browser Manager (loopback Web UI)"),
+        ]),
+        Line::from(vec![
+            Span::styled("O          ", theme::accent()),
+            Span::raw("Reopen the Browser Manager tab"),
+        ]),
+        Line::from(vec![
             Span::styled("?          ", theme::accent()),
             Span::raw("Close this help"),
         ]),
@@ -359,10 +403,12 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         "Ctrl-U  Clear     Tab / Up/Down  Field     Enter  Save     Esc  Cancel"
     } else if state.show_help {
         "? / Esc  Back     Q  Quit"
+    } else if state.manager.active {
+        "M  Close Manager     O  Reopen     R  Refresh     ?  Help     Q  Quit"
     } else if state.config.is_managed() {
-        "Enter  Launch     B  Benchmark     S  Sync     R  Refresh     ?  Help     Q  Quit"
+        "M  Manage     Enter  Launch     B  Benchmark     S  Sync     R  Refresh     ?  Help     Q  Quit"
     } else {
-        "Enter  Launch     R  Refresh     ?  Help     Q  Quit"
+        "M  Manage     Enter  Launch     R  Refresh     ?  Help     Q  Quit"
     };
     frame.render_widget(
         Paragraph::new(vec![

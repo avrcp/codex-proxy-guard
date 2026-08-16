@@ -13,6 +13,14 @@ use crate::region::RegionHintClassifier;
 use crate::storage::{NodeStore, StoredSubscription, SubscriptionStore};
 use crate::{ManagedPaths, NetworkError, SecretStore};
 
+/// Optional fields that may be changed on an existing subscription.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SubscriptionUpdate {
+    pub name: Option<String>,
+    pub url: Option<String>,
+    pub enabled: Option<bool>,
+}
+
 pub struct SubscriptionService<S, F> {
     subscriptions: SubscriptionStore,
     nodes: NodeStore,
@@ -113,6 +121,46 @@ impl<S: SecretStore, F: SubscriptionFetcher> SubscriptionService<S, F> {
             return Err(error);
         }
         Ok(stored.source.id)
+    }
+
+    /// Apply optional name/URL/enabled changes to one subscription.
+    ///
+    /// A URL change validates the new HTTPS URL, swaps the stored credential, and
+    /// restores the old credential if the metadata update fails. The raw URL is
+    /// never returned to the caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation, credential, not-found, or storage error.
+    pub fn update(
+        &self,
+        reference: &str,
+        update: &SubscriptionUpdate,
+    ) -> Result<StoredSubscription, NetworkError> {
+        let stored = self.subscriptions.find(reference)?;
+        let mut source = stored.source.clone();
+        if let Some(name) = &update.name {
+            source.name = SubscriptionSource::normalize_name(name)?;
+        }
+        if let Some(enabled) = update.enabled {
+            source.enabled = enabled;
+        }
+        if let Some(url) = &update.url {
+            HttpsSubscriptionFetcher::validate_url(url)?;
+            let previous = self.secrets.get_subscription_url(source.id)?;
+            self.secrets.set_subscription_url(source.id, url)?;
+            return match self
+                .subscriptions
+                .replace(source.clone(), stored.bindings.clone())
+            {
+                Ok(updated) => Ok(updated),
+                Err(error) => {
+                    let _ = self.secrets.set_subscription_url(source.id, &previous);
+                    Err(error)
+                }
+            };
+        }
+        self.subscriptions.replace(source, stored.bindings.clone())
     }
 
     /// Fetch, fully validate, and transactionally reconcile one subscription.
@@ -309,7 +357,7 @@ mod tests {
     use proxy_guard_core::{CodexRegion, ManagedNodeState, SubscriptionId, SubscriptionNodeState};
     use tempfile::tempdir;
 
-    use super::SubscriptionService;
+    use super::{SubscriptionService, SubscriptionUpdate};
     use crate::{ManagedPaths, NetworkError, SecretStore, SubscriptionFetcher};
 
     #[derive(Clone, Default)]
@@ -572,6 +620,102 @@ mod tests {
                 .list()
                 .expect("node list")
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn update_changes_name_and_enabled_without_a_url() {
+        let temporary = tempdir().expect("temporary directory");
+        let paths = ManagedPaths::from_root(temporary.path().join("data"));
+        let service = SubscriptionService::open(
+            &paths,
+            MemorySecrets::default(),
+            MemoryFetcher(Arc::new(Mutex::new(Vec::new()))),
+        )
+        .expect("service");
+        service
+            .add("Airport", "https://example.com/sub?token=secret")
+            .expect("add");
+
+        let updated = service
+            .update(
+                "Airport",
+                &SubscriptionUpdate {
+                    name: Some("Airport Two".into()),
+                    enabled: Some(false),
+                    ..SubscriptionUpdate::default()
+                },
+            )
+            .expect("update");
+        assert_eq!(updated.source.name, "Airport Two");
+        assert!(!updated.source.enabled);
+        let url = service
+            .secrets
+            .get_subscription_url(updated.source.id)
+            .expect("secret");
+        assert_eq!(url, "https://example.com/sub?token=secret");
+    }
+
+    #[test]
+    fn update_rejects_invalid_url_and_restores_previous_credential() {
+        let temporary = tempdir().expect("temporary directory");
+        let paths = ManagedPaths::from_root(temporary.path().join("data"));
+        let secrets = MemorySecrets::default();
+        let service = SubscriptionService::open(
+            &paths,
+            secrets.clone(),
+            MemoryFetcher(Arc::new(Mutex::new(Vec::new()))),
+        )
+        .expect("service");
+        service
+            .add("Airport", "https://example.com/sub?token=secret")
+            .expect("add");
+        let id = service.list().expect("list")[0].source.id;
+
+        service
+            .update(
+                "Airport",
+                &SubscriptionUpdate {
+                    url: Some("http://plain.example/sub".into()),
+                    ..SubscriptionUpdate::default()
+                },
+            )
+            .expect_err("http must fail");
+        assert_eq!(
+            secrets.get_subscription_url(id).expect("secret"),
+            "https://example.com/sub?token=secret"
+        );
+    }
+
+    #[test]
+    fn update_replaces_the_url_and_keeps_metadata_consistent() {
+        let temporary = tempdir().expect("temporary directory");
+        let paths = ManagedPaths::from_root(temporary.path().join("data"));
+        let secrets = MemorySecrets::default();
+        let service = SubscriptionService::open(
+            &paths,
+            secrets.clone(),
+            MemoryFetcher(Arc::new(Mutex::new(Vec::new()))),
+        )
+        .expect("service");
+        service
+            .add("Airport", "https://example.com/sub?token=secret")
+            .expect("add");
+        let id = service.list().expect("list")[0].source.id;
+
+        let updated = service
+            .update(
+                "Airport",
+                &SubscriptionUpdate {
+                    url: Some("https://example.net/sub?key=new".into()),
+                    ..SubscriptionUpdate::default()
+                },
+            )
+            .expect("update");
+        assert_eq!(updated.source.id, id);
+        assert_eq!(
+            secrets.get_subscription_url(id).expect("secret"),
+            "https://example.net/sub?key=new"
         );
     }
 

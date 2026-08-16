@@ -1,6 +1,7 @@
 use crate::{
     BenchmarkRunSummary, DesktopAppInfo, DesktopProcessState, GuardConfig, LaunchReceipt,
-    ManagedLaunchReceipt, ManagedView, NodeId, ProxyField, SubscriptionId, SubscriptionSyncSummary,
+    ManagedLaunchReceipt, ManagedView, ManagerInfo, NodeId, NodeSelection, ProxyField,
+    SubscriptionId, SubscriptionSyncSummary,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -15,6 +16,8 @@ pub enum UserIntent {
     SyncSubscription,
     BenchmarkNodes,
     CancelBenchmark,
+    ToggleManager,
+    ReopenManager,
     ToggleHelp,
     Dismiss,
     Quit,
@@ -36,6 +39,9 @@ pub enum AppEffect {
     CancelBenchmark,
     LaunchManaged(NodeId),
     StopManagedProxy,
+    OpenManager,
+    ReopenManager,
+    CloseManager,
     Shutdown,
 }
 
@@ -53,6 +59,11 @@ pub enum TaskResult {
     ManagedLaunchCompleted(Result<ManagedLaunchReceipt, String>),
     ManagedProxyStopped(Result<(), String>),
     ManagedProxyLost(String),
+    ManagerOpened(Result<ManagerInfo, String>),
+    ManagerClosed,
+    ManagerConfigUpdated(Result<GuardConfig, String>),
+    ManagerManagedViewUpdated(Result<ManagedView, String>),
+    ManagerSelectionChanged(Result<Option<NodeSelection>, String>),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -87,6 +98,7 @@ impl Capabilities {
             AppEffect::SyncSubscription(_) => self.manage_subscription,
             AppEffect::BenchmarkNodes => self.benchmark_network,
             AppEffect::LaunchManaged(_) | AppEffect::StopManagedProxy => self.manage_sidecar,
+            AppEffect::OpenManager | AppEffect::ReopenManager | AppEffect::CloseManager => true,
             AppEffect::Shutdown => self.quit,
         };
         allowed

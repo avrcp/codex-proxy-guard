@@ -27,6 +27,19 @@
 - [ ] Managed 启动用同一个 sidecar 完成 Geo/ChatGPT HEAD 复验；失败时不启动 Desktop。
 - [ ] Managed one-shot `launch` 被拒绝，TUI 退出会等待自有 sidecar 回收。
 - [ ] 不存在持续网络监控、Usage、app-server、诊断持久化、Desktop 终止或全流量代理入口。
+
+## Local Web Manager 门禁
+
+- [ ] `M` 打开默认浏览器，仅绑定 `127.0.0.1:<ephemeral>`，无 LAN/固定端口/常驻服务。
+- [ ] 每次启动生成独立 256-bit token；token 不出现在状态/订阅/节点 DTO、错误、日志或任何持久存储。
+- [ ] API 无 token → 401，错误 token → 401，正确 token → 200；非 GET 校验 Origin，Host 必须为本机端口。
+- [ ] 所有响应含 `no-store`/`nosniff`/`no-referrer`/`same-origin` 与 HTML CSP；资源编译进 EXE，无远程前端。
+- [ ] Web 无 Desktop launch API，不拥有 managed sidecar，不返回已保存 URL 或 raw outbound。
+- [ ] subscription inspect/add/edit/sync/activate/delete 可用；删除激活中的订阅返回 409。
+- [ ] 节点 JP/SG/US 过滤与 healthy/rejected/not-tested/stale 状态正确；AUTO 仍为 JP > SG > US。
+- [ ] benchmark 从浏览器后台执行、HTTP 快速返回、页面轮询；忙时 `409 OPERATION_BUSY` 不排队。
+- [ ] 手选仅限 Fresh+Healthy 且属于激活订阅的节点，仅对当前进程会话有效；激活切换/新 benchmark 清除手选。
+- [ ] Manager 打开时锁定 TUI 运行时变更；关闭后 TUI 重新加载配置与状态；Guard 退出停止 Manager。
 - [ ] README、架构、安全与排障文档与实现一致。
 
 ## Windows 手工验收
@@ -38,6 +51,10 @@
 - [ ] 在代理或安全网关环境中确认 HTTPS 与 WebSocket Upgrade 可用；ChatGPT Voice 不作为 HTTP 代理覆盖保证。
 - [ ] 使用官方 sing-box 本地文件验证默认 runtime 路径与显式 `managed.sing_box_path`。
 - [ ] 如实记录 Authenticode 状态。
+- [ ] Windows 手工 smoke：TUI `M` → 浏览器打开 → Add Airport → Inspect → Sync → 仅 JP/SG/US 可见
+      → Benchmark → Healthy JP 为 AUTO winner → 手选另一个 Healthy JP → 关闭 Manager
+      → TUI 显示 MANUAL → `Enter` 启动 → 所选节点仍通过 `start_verified_sidecar` → 退出后
+      Manager 与 managed sidecar 均停止。
 
 ## GitHub Release
 

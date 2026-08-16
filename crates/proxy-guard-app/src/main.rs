@@ -1,7 +1,9 @@
 mod cli;
 mod commands;
 mod dispatcher;
+mod managed_services;
 mod tui;
+mod web;
 
 use std::path::Path;
 

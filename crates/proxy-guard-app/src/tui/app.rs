@@ -106,6 +106,15 @@ fn handle_key(
             KeyCode::Esc | KeyCode::Enter | KeyCode::Char('?') => Some(UserIntent::Dismiss),
             _ => None,
         }
+    } else if state.manager.active {
+        match key.code {
+            KeyCode::Char('m' | 'M') => Some(UserIntent::ToggleManager),
+            KeyCode::Char('o' | 'O') => Some(UserIntent::ReopenManager),
+            KeyCode::Char('r' | 'R') => Some(UserIntent::Refresh),
+            KeyCode::Char('?') => Some(UserIntent::ToggleHelp),
+            KeyCode::Esc => Some(UserIntent::Dismiss),
+            _ => None,
+        }
     } else {
         match key.code {
             KeyCode::Enter | KeyCode::Char('l' | 'L') => Some(UserIntent::Launch),
@@ -113,6 +122,7 @@ fn handle_key(
             KeyCode::Char('c' | 'C') => Some(UserIntent::EditProxy),
             KeyCode::Char('s' | 'S') => Some(UserIntent::SyncSubscription),
             KeyCode::Char('b' | 'B') => Some(UserIntent::BenchmarkNodes),
+            KeyCode::Char('m' | 'M') => Some(UserIntent::ToggleManager),
             KeyCode::Char('?') => Some(UserIntent::ToggleHelp),
             KeyCode::Esc => Some(UserIntent::Dismiss),
             _ => None,

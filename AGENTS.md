@@ -20,11 +20,19 @@ stale or unhealthy index.
   verification, the two-stage benchmark, benchmark cache, and JP > SG > US selection.
 - `proxy-guard-windows`: bounded APPX discovery, Desktop-root detection, cross-process
   startup locking, environment injection, and process launch.
-- `codex-proxy-guard`: minimal CLI, single-screen TUI, dispatch, and launch orchestration.
+- `codex-proxy-guard`: minimal CLI, single-screen TUI, dispatch, launch orchestration,
+  and the on-demand Local Web Manager adapter. It owns only the runtime plane
+  (TUI -> EffectDispatcher -> verified sidecar -> Desktop) plus the management plane
+  (browser -> loopback Axum manager -> shared network services).
 
 Preserve the state boundary `Action -> candidate reduce -> authorize -> commit ->
 dispatch -> TaskResult`. Only one foreground operation may be active. Guard shutdown
 must not terminate Desktop.
+
+The Local Web Manager is a management plane, not a runtime: it never starts Desktop,
+never owns the long-lived managed sidecar, and holds no always-on daemon. It reuses the
+same `managed_services` service factories as the CLI and TUI; the Web never duplicates
+subscription/region/geo/benchmark/sing-box logic.
 
 ## Security invariants
 
@@ -39,6 +47,11 @@ only `HTTP_PROXY`/`HTTPS_PROXY`. Subscription URLs live only in Windows Credenti
 Manager under `CodexProxyGuard.Subscription` and are never serialized, logged, or
 displayed. Only JP/SG/US nodes are imported, and a node whose real exit country does not
 match its hint can never become the winner. JP is hard-preferred over SG, then US.
+
+Local Web Manager is an explicitly allowed on-demand loopback-only configuration surface.
+It must bind 127.0.0.1 only, use an ephemeral port and an in-memory per-session
+capability token, never expose subscription credentials/raw outbounds, never launch
+Desktop, never own the long-lived managed sidecar, and stop with Guard shutdown.
 
 Do not add continuous runtime health monitoring, private OpenAI API probes,
 Usage/account telemetry, automatic in-session node switching, Codex app-server or

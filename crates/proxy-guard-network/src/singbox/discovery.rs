@@ -36,6 +36,17 @@ impl SingBoxInstallation {
         self.source
     }
 
+    /// Build a read-only installation for store-level tests that never launches a
+    /// sidecar.
+    #[cfg(test)]
+    pub(crate) fn for_tests() -> Self {
+        Self {
+            executable: PathBuf::from("sing-box"),
+            source: SingBoxInstallationSource::ManagedCurrent,
+            command_prefix: Vec::new(),
+        }
+    }
+
     pub(crate) fn arguments(&self, command: &str, config: &Path) -> Vec<OsString> {
         let mut arguments = self.command_prefix.clone();
         arguments.extend([

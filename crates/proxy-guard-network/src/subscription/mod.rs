@@ -7,4 +7,4 @@ pub use fetcher::{
     SubscriptionFetcher,
 };
 pub use parser::{NodeCandidate, ParsedSubscription, SubscriptionFormat, SubscriptionParser};
-pub use service::SubscriptionService;
+pub use service::{SubscriptionService, SubscriptionUpdate};

@@ -148,6 +148,23 @@ pub struct ManagedView {
     pub selected: Option<NodeSelection>,
     pub proxy_endpoint: Option<String>,
     pub proxy_lost: bool,
+    /// Session-only manual override chosen from the Local Web Manager. Cleared on
+    /// Guard restart, active-subscription change, or a fresh benchmark that no
+    /// longer reports the node healthy.
+    pub manual_selection: Option<NodeSelection>,
+}
+
+/// TUI-facing view of the on-demand Local Web Manager.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ManagerView {
+    pub active: bool,
+    pub display_url: Option<String>,
+}
+
+/// Result of a successful manager start, safe to display and store in TUI state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ManagerInfo {
+    pub display_url: String,
 }
 
 #[derive(Clone, Debug)]
@@ -158,6 +175,7 @@ pub struct AppState {
     pub desktop_process: DesktopProcessState,
     pub launch: LaunchState,
     pub managed: ManagedView,
+    pub manager: ManagerView,
     pub foreground: Option<ForegroundOperation>,
     pub status_message: String,
     pub error_message: Option<String>,
@@ -175,6 +193,7 @@ impl AppState {
             desktop_process: DesktopProcessState::Unknown,
             launch: LaunchState::Idle,
             managed: ManagedView::default(),
+            manager: ManagerView::default(),
             foreground: None,
             status_message: "Ready to launch through the configured proxy".into(),
             error_message: None,

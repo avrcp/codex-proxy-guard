@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Codex Proxy Guard · Manager</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-title">CODEX PROXY GUARD</span>
+      <span class="brand-sub">Browser Manager</span>
+    </div>
+    <nav class="tabs">
+      <button class="tab" data-page="overview" id="tab-overview">Overview</button>
+      <button class="tab" data-page="subscriptions" id="tab-subscriptions">Subscriptions</button>
+      <button class="tab" data-page="nodes" id="tab-nodes">Nodes</button>
+    </nav>
+    <button class="close-btn" id="close-manager">Close Manager</button>
+  </header>
+
+  <main id="page-overview" class="page">
+    <section class="card">
+      <h2>Managed Mode</h2>
+      <dl class="kv">
+        <dt>Mode</dt><dd id="ov-mode">—</dd>
+        <dt>Subscription</dt><dd id="ov-subscription">—</dd>
+      </dl>
+      <h3>Regions</h3>
+      <div id="ov-regions" class="region-grid"></div>
+    </section>
+    <section class="card">
+      <h2>Selected for next launch</h2>
+      <div id="ov-selection" class="selection-box"></div>
+    </section>
+  </main>
+
+  <main id="page-subscriptions" class="page hidden">
+    <section class="card">
+      <h2>Subscriptions</h2>
+      <div id="sub-list" class="list"></div>
+      <button class="primary" id="add-sub-btn">+ Add Subscription</button>
+    </section>
+  </main>
+
+  <main id="page-nodes" class="page hidden">
+    <section class="card">
+      <h2>Nodes &amp; Benchmark</h2>
+      <div class="bench-actions">
+        <button class="primary" id="bench-auto">Benchmark Auto</button>
+        <button class="ghost" id="bench-all">Benchmark All</button>
+      </div>
+      <div class="region-tabs" id="node-region-tabs">
+        <button class="region-tab active" data-region="JP">JP</button>
+        <button class="region-tab" data-region="SG">SG</button>
+        <button class="region-tab" data-region="US">US</button>
+      </div>
+      <div id="node-list" class="list"></div>
+    </section>
+    <section class="card">
+      <h2>Benchmark Reports</h2>
+      <div id="report-list" class="list"></div>
+    </section>
+  </main>
+
+  <footer class="statusbar" id="statusbar">Loading…</footer>
+
+  <dialog id="add-sub-dialog" class="dialog">
+    <form method="dialog" id="add-sub-form">
+      <h2>Add Subscription</h2>
+      <label>Name
+        <input type="text" id="sub-name" maxlength="128" autocomplete="off" required>
+      </label>
+      <label>Subscription URL
+        <input type="password" id="sub-url" autocomplete="off" required>
+      </label>
+      <div id="inspect-result" class="inspect-result"></div>
+      <div class="dialog-actions">
+        <button type="button" id="inspect-btn" class="ghost">Test Subscription</button>
+        <button type="submit" id="save-sync-btn" class="primary">Save &amp; Sync</button>
+      </div>
+      <button type="button" id="save-sync-activate-btn" class="primary">Save, Sync &amp; Activate</button>
+      <button type="button" id="cancel-add-btn" class="ghost">Cancel</button>
+    </form>
+  </dialog>
+
+  <dialog id="edit-sub-dialog" class="dialog">
+    <form method="dialog" id="edit-sub-form">
+      <h2>Edit Subscription</h2>
+      <label>Name
+        <input type="text" id="edit-name" maxlength="128" autocomplete="off">
+      </label>
+      <label>Replace URL (optional)
+        <input type="password" id="edit-url" autocomplete="off" placeholder="Only replaces the stored URL">
+      </label>
+      <label class="toggle">
+        <input type="checkbox" id="edit-enabled"> Enabled
+      </label>
+      <div class="dialog-actions">
+        <button type="submit" class="primary">Save</button>
+        <button type="button" id="edit-cancel-btn" class="ghost">Cancel</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="/app.js"></script>
+</body>
+</html>

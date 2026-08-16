@@ -73,6 +73,19 @@ codex-proxy-guard init-config --force --proxy-host 127.0.0.1 --proxy-port 7890
 
 这是预期行为。Guard 只负责启动时注入环境，不托管 Desktop 生命周期。
 
+## 浏览器管理界面没有打开或刷新后失效
+
+按 `M` 依赖默认浏览器。若默认浏览器无法自动打开，Manager 会立即停止并在 TUI 显示错误；
+重新按 `M` 再试，或使用 Windows 默认应用设置把浏览器设为可用应用。
+
+- 刷新/重开标签页后显示 "Missing manager token"：token 只存在于该标签页内存，刷新即失效，
+  这是预期设计。在 TUI 中按 `O` 重新打开带新 token 的标签页；
+- 页面提示 "Manager token rejected"：会话 token 已失效（Manager 被关闭或超时）。回到 TUI
+  按 `M` 关闭再打开，或按 `O` 重开；
+- 15 分钟没有任何操作时 Manager 会自动关闭并解锁 TUI（benchmark 运行时不会超时）；
+- 若 Manager 打开期间按 `Launch`/`S`/`B`/`C` 被拒绝并提示 `MANAGER_ACTIVE`，先按 `M`
+  关闭 Manager，再使用运行时按键。
+
 ## Managed Mode 找不到 sing-box
 
 Guard 不会自动下载第三方运行时。请从 sing-box 官方发行包取得 `sing-box.exe`，放到

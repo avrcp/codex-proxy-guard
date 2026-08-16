@@ -58,6 +58,13 @@ pub struct VerifiedSidecar {
     pub sample: PathSample,
 }
 
+/// One node and its current fingerprint-bound benchmark report, when present.
+#[derive(Clone, Debug)]
+pub struct NodeStatusView {
+    pub node: ManagedNode,
+    pub report: Option<BenchmarkReport>,
+}
+
 impl NodeBenchmarkService {
     /// Build the service from a discovered sing-box installation.
     ///
@@ -230,6 +237,7 @@ impl NodeBenchmarkService {
             .into_values()
             .filter(|report| report.verdict.is_healthy())
             .collect();
+        let healthy_ids = healthy.iter().map(|report| report.node_id).collect();
         let selected = NodeSelector::select_best(&healthy, &names);
 
         Ok(BenchmarkRunSummary {
@@ -239,6 +247,7 @@ impl NodeBenchmarkService {
             healthy: regions.jp_healthy + regions.sg_healthy + regions.us_healthy,
             regions,
             selected,
+            healthy_ids,
         })
     }
 
@@ -364,6 +373,69 @@ impl NodeBenchmarkService {
                 )
             })?;
         Ok(NodeSelection::from_report(&report, &node.name))
+    }
+
+    /// Return every node of one subscription (active and stale) with its current
+    /// fresh, fingerprint-bound report. Used for read-only Web display; never a
+    /// selection gate.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the node store or cache cannot be read.
+    pub fn node_status(
+        &self,
+        subscription_id: Option<SubscriptionId>,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<Vec<NodeStatusView>, NetworkError> {
+        let nodes = self
+            .nodes
+            .list()?
+            .into_iter()
+            .map(|stored| stored.node)
+            .filter(|node| subscription_id.is_none_or(|id| node.subscription_id == id))
+            .collect::<Vec<_>>();
+        let reports = self.fresh_reports(&nodes, now)?;
+        Ok(nodes
+            .into_iter()
+            .map(|node| NodeStatusView {
+                report: reports.get(&node.id).cloned(),
+                node,
+            })
+            .collect())
+    }
+
+    /// Return the selection for one node only when every manual-override gate passes:
+    /// the node is Active, belongs to the active subscription, holds a fresh healthy
+    /// report, and its verified exit region still matches its hint. Any other node
+    /// yields `Ok(None)`; storage failures surface as errors.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the node store or benchmark cache cannot be read.
+    pub fn healthy_selection_for(
+        &self,
+        node_id: NodeId,
+        subscription_id: SubscriptionId,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<Option<NodeSelection>, NetworkError> {
+        let Ok(stored) = self.nodes.get(node_id) else {
+            return Ok(None);
+        };
+        let node = &stored.node;
+        if node.state != ManagedNodeState::Active || node.subscription_id != subscription_id {
+            return Ok(None);
+        }
+        let fingerprint = node_fingerprint(node.outbound.document());
+        let Some(report) =
+            self.benchmarks
+                .get_fresh(node.id, &fingerprint, node.region_hint, now)?
+        else {
+            return Ok(None);
+        };
+        if !report.verdict.is_healthy() || report.verified_region != node.region_hint {
+            return Ok(None);
+        }
+        Ok(Some(NodeSelection::from_report(&report, &node.name)))
     }
 
     async fn quick_scan_all(
@@ -616,4 +688,187 @@ fn millis(duration: Duration) -> u64 {
 
 fn cancelled() -> NetworkError {
     NetworkError::Cancelled("benchmark cancelled".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{net::Ipv4Addr, sync::Arc};
+
+    use proxy_guard_core::{
+        BENCHMARK_SCHEMA_VERSION, BenchmarkReport, BenchmarkVerdict, CodexRegion, ManagedNode,
+        ManagedNodeState, NodeId, SingBoxOutbound, SubscriptionId,
+    };
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    use super::NodeBenchmarkService;
+    use super::node_fingerprint;
+    use crate::{ManagedPaths, ReqwestCodexPathProbe, SingBoxInstallation};
+
+    const KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn service() -> (tempfile::TempDir, NodeBenchmarkService) {
+        let temporary = tempdir().expect("temporary directory");
+        let paths = ManagedPaths::from_root(temporary.path().join("data"));
+        let service = NodeBenchmarkService::new(
+            &paths,
+            SingBoxInstallation::for_tests(),
+            std::time::Duration::from_secs(3600),
+            Arc::new(ReqwestCodexPathProbe),
+        )
+        .expect("service");
+        (temporary, service)
+    }
+
+    fn node(name: &str, subscription_id: SubscriptionId) -> ManagedNode {
+        ManagedNode::new(
+            name,
+            subscription_id,
+            CodexRegion::JP,
+            SingBoxOutbound::new(json!({
+                "type": "socks",
+                "server": "proxy.example",
+                "server_port": 1080
+            }))
+            .expect("outbound"),
+            KEY,
+        )
+        .expect("node")
+    }
+
+    fn healthy_report(node: &ManagedNode) -> BenchmarkReport {
+        BenchmarkReport {
+            schema_version: BENCHMARK_SCHEMA_VERSION,
+            node_id: node.id,
+            node_fingerprint: node_fingerprint(node.outbound.document()),
+            expected_region: node.region_hint,
+            verified_region: node.region_hint,
+            first_exit_ip: Ipv4Addr::new(203, 0, 113, 1).into(),
+            second_exit_ip: Ipv4Addr::new(203, 0, 113, 1).into(),
+            exit_ip_stable: true,
+            attempts: 5,
+            successes: 5,
+            median_header_ms: 80,
+            p95_header_ms: 120,
+            jitter_ms: 10,
+            score: 92,
+            verdict: BenchmarkVerdict::Healthy,
+            measured_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn healthy_selection_accepts_only_active_fresh_current_nodes() {
+        let (_temporary, service) = service();
+        let subscription = SubscriptionId::new();
+        let node = node("JP Tokyo", subscription);
+        service.nodes.create(node.clone()).expect("create node");
+        service
+            .benchmarks
+            .save(&healthy_report(&node))
+            .expect("save");
+
+        let selection = service
+            .healthy_selection_for(node.id, subscription, chrono::Utc::now())
+            .expect("read selection");
+        assert!(selection.is_some());
+        assert_eq!(selection.unwrap().node_id, node.id);
+    }
+
+    #[test]
+    fn healthy_selection_rejects_stale_nodes() {
+        let (_temporary, service) = service();
+        let subscription = SubscriptionId::new();
+        let mut node = node("JP Tokyo", subscription);
+        node.state = ManagedNodeState::Stale;
+        service.nodes.create(node.clone()).expect("create node");
+        service
+            .benchmarks
+            .save(&healthy_report(&node))
+            .expect("save");
+
+        assert!(
+            service
+                .healthy_selection_for(node.id, subscription, chrono::Utc::now())
+                .expect("read selection")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn healthy_selection_rejects_other_subscriptions_and_missing_nodes() {
+        let (_temporary, service) = service();
+        let subscription = SubscriptionId::new();
+        let node = node("JP Tokyo", subscription);
+        service.nodes.create(node.clone()).expect("create node");
+        service
+            .benchmarks
+            .save(&healthy_report(&node))
+            .expect("save");
+
+        let other = SubscriptionId::new();
+        assert!(
+            service
+                .healthy_selection_for(node.id, other, chrono::Utc::now())
+                .expect("read selection")
+                .is_none()
+        );
+        assert!(
+            service
+                .healthy_selection_for(NodeId::new(), subscription, chrono::Utc::now())
+                .expect("read selection")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn healthy_selection_requires_fresh_healthy_region_matching_report() {
+        let (_temporary, service) = service();
+        let subscription = SubscriptionId::new();
+        let node = node("JP Tokyo", subscription);
+        service.nodes.create(node.clone()).expect("create node");
+
+        assert!(
+            service
+                .healthy_selection_for(node.id, subscription, chrono::Utc::now())
+                .expect("no cache")
+                .is_none(),
+            "no fresh report must be rejected"
+        );
+
+        let mut rejected = healthy_report(&node);
+        rejected.verdict = BenchmarkVerdict::Rejected {
+            reason: proxy_guard_core::BenchmarkRejection::LowSuccessRate,
+        };
+        service.benchmarks.save(&rejected).expect("save rejected");
+        assert!(
+            service
+                .healthy_selection_for(node.id, subscription, chrono::Utc::now())
+                .expect("rejected")
+                .is_none(),
+            "rejected report must be rejected"
+        );
+
+        let mut mismatch = healthy_report(&node);
+        mismatch.verified_region = CodexRegion::SG;
+        service.benchmarks.save(&mismatch).expect("save mismatch");
+        assert!(
+            service
+                .healthy_selection_for(node.id, subscription, chrono::Utc::now())
+                .expect("region mismatch")
+                .is_none(),
+            "verified region mismatch must be rejected"
+        );
+
+        let mut stale = healthy_report(&node);
+        stale.measured_at = chrono::Utc::now() - chrono::Duration::hours(2);
+        service.benchmarks.save(&stale).expect("save stale");
+        assert!(
+            service
+                .healthy_selection_for(node.id, subscription, chrono::Utc::now())
+                .expect("stale cache")
+                .is_none(),
+            "stale cache must be rejected"
+        );
+    }
 }
