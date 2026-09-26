@@ -7,10 +7,12 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.4.1-rc.1"
+version = "0.4.1-rc.2"
 edition = "2024"
 license = "MIT"
-rust-version = "1.85"
+# let-chains in appx.rs require 1.88; locked dependencies declare at most
+# 1.88 (darling / ratatui / sysinfo).
+rust-version = "1.88"
 repository = "https://github.com/avrcp/codex-proxy-guard"
 
 [workspace.dependencies]

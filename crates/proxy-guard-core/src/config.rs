@@ -155,6 +155,13 @@ impl GuardConfig {
                 "proxy.port must be between 1 and 65535".into(),
             ));
         }
+        // Validation and URL construction must agree on the host, so reject
+        // leading/trailing whitespace instead of trimming in one place only.
+        if self.proxy.host != self.proxy.host.trim() || self.proxy.host.is_empty() {
+            return Err(GuardError::Config(
+                "proxy.host must not be empty or contain leading/trailing whitespace".into(),
+            ));
+        }
         let host = self.proxy.host.trim();
         let loopback = host.eq_ignore_ascii_case("localhost")
             || host
@@ -184,12 +191,25 @@ impl GuardConfig {
     }
 
     pub fn proxy_url(&self) -> String {
-        let host = if self.proxy.host.contains(':') {
-            format!("[{}]", self.proxy.host)
+        let host = self.normalized_host();
+        let host = if host.contains(':') {
+            format!("[{host}]")
         } else {
-            self.proxy.host.clone()
+            host.to_string()
         };
         format!("http://{host}:{}", self.proxy.port)
+    }
+
+    fn normalized_host(&self) -> &str {
+        self.proxy.host.trim()
+    }
+
+    /// Best-effort read of the `version` key for targeted repair messaging.
+    /// Returns `None` when the file is missing or not a TOML table.
+    pub fn read_version(path: &Path) -> Option<u32> {
+        let text = fs::read_to_string(path).ok()?;
+        let value = toml::from_str::<toml::Value>(&text).ok()?;
+        value.get("version")?.as_integer()?.try_into().ok()
     }
 
     pub fn no_proxy_value(&self) -> String {
@@ -274,6 +294,38 @@ mod tests {
         config.proxy.host = "127.0.0.1".into();
         config.proxy.scheme = "socks5".into();
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn host_validation_and_url_construction_agree() {
+        let mut config = GuardConfig::default();
+        config.proxy.host = " 127.0.0.1 ".into();
+        assert!(config.validate().is_err(), "whitespace hosts are rejected");
+        config.proxy.host = " 127.0.0.1".into();
+        assert!(config.validate().is_err());
+        config.proxy.host = "::1".into();
+        assert!(config.validate().is_ok());
+        assert_eq!(config.proxy_url(), "http://[::1]:10808");
+        config.proxy.host = "LOCALHOST".into();
+        assert!(config.validate().is_ok());
+        assert_eq!(config.proxy_url(), "http://LOCALHOST:10808");
+    }
+
+    #[test]
+    fn reads_version_for_targeted_repair_messaging() {
+        let path = std::env::temp_dir().join(format!(
+            "codex-proxy-guard-version-probe-{}-{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, "version = 3\n[proxy]\nhost = \"127.0.0.1\"\n").unwrap();
+        assert_eq!(GuardConfig::read_version(&path), Some(3));
+        std::fs::write(&path, "not toml").unwrap();
+        assert_eq!(GuardConfig::read_version(&path), None);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

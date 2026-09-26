@@ -1,5 +1,6 @@
 use proxy_guard_core::{
-    AppState, DesktopAppDiscovery, DesktopProcessState, LaunchState, ProxyEditor, ProxyField,
+    AppState, ConfigReadiness, DesktopAppDiscovery, DesktopProcessState, LaunchState, ProxyEditor,
+    ProxyField,
 };
 use ratatui::{
     Frame,
@@ -77,14 +78,18 @@ fn draw_content(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let mut lines = Vec::new();
     if let Some(editor) = &state.proxy_editor {
         draw_proxy_editor(&mut lines, editor.clone(), state.foreground.is_some());
+    } else if state.daemon_repair_prompt {
+        draw_daemon_repair_prompt(&mut lines);
     } else if let Some(error) = &state.error_message {
-        lines.push(Line::styled("Launch blocked", theme::error()));
+        lines.push(Line::styled("Launch unavailable", theme::error()));
         lines.push(Line::raw(error.clone()));
         lines.push(Line::raw(""));
-        lines.push(Line::styled(
-            "Press C to configure and replace it, or Enter/Esc to dismiss.",
-            theme::muted(),
-        ));
+        let hint = if state.config_readiness == ConfigReadiness::RepairRequired {
+            "Press C to rebuild the proxy configuration, or Enter/Esc to dismiss."
+        } else {
+            "Enter/Esc to dismiss; the message above names the matching cause."
+        };
+        lines.push(Line::styled(hint, theme::muted()));
     } else {
         lines.push(key_value(
             "Proxy",
@@ -118,6 +123,10 @@ fn draw_content(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
             "This sets process environment only; it does not enforce all traffic.",
             theme::muted(),
         ));
+        lines.push(Line::styled(
+            "Press D for a shared-daemon repair launch (asks first).",
+            theme::muted(),
+        ));
         lines.push(Line::raw(""));
         lines.push(Line::styled(primary_action(state), theme::accent()));
         lines.push(Line::styled(
@@ -126,6 +135,23 @@ fn draw_content(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         ));
     }
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
+}
+
+fn draw_daemon_repair_prompt(lines: &mut Vec<Line<'static>>) {
+    lines.push(Line::styled("Repair launch", theme::title()));
+    lines.push(Line::raw(""));
+    lines.push(Line::raw(
+        "Stop the shared Codex background server, then launch?",
+    ));
+    lines.push(Line::raw(
+        "This may interrupt tasks of other CLI / IDE / remote clients",
+    ));
+    lines.push(Line::raw("sharing the same Codex Home."));
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "Y  Confirm and launch      N / Esc  Cancel",
+        theme::accent(),
+    ));
 }
 
 fn draw_proxy_editor(lines: &mut Vec<Line<'static>>, editor: ProxyEditor, saving: bool) {
@@ -196,6 +222,12 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect) {
             Span::raw("Launch ChatGPT Desktop through the configured proxy"),
         ]),
         Line::from(vec![
+            Span::styled("D          ", theme::accent()),
+            Span::raw(
+                "Repair launch: stop the shared Codex background server first (asks for confirmation)",
+            ),
+        ]),
+        Line::from(vec![
             Span::styled("R          ", theme::accent()),
             Span::raw("Refresh ChatGPT Desktop discovery and running state"),
         ]),
@@ -216,12 +248,14 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect) {
 }
 
 fn draw_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
-    let shortcuts = if state.proxy_editor.is_some() {
+    let shortcuts = if state.daemon_repair_prompt {
+        "Y  Confirm     N / Esc  Cancel"
+    } else if state.proxy_editor.is_some() {
         "Ctrl-U  Clear     Tab / Up/Down  Field     Enter  Save     Esc  Cancel"
     } else if state.show_help {
         "? / Esc  Back     Q  Quit"
     } else {
-        "Enter  Launch     R  Refresh     ?  Help     Q  Quit"
+        "Enter  Launch     D  Repair     R  Refresh     ?  Help     Q  Quit"
     };
     frame.render_widget(
         Paragraph::new(vec![
@@ -304,7 +338,7 @@ fn primary_action(state: &AppState) -> &'static str {
     } else if matches!(state.desktop_process, DesktopProcessState::Running { .. }) {
         "ChatGPT Desktop is already running — exit it fully before relaunching"
     } else if matches!(state.launch, LaunchState::Running(_)) {
-        "ChatGPT Desktop launched through the configured proxy"
+        "ChatGPT Desktop process created with the proxy environment"
     } else {
         "Press Enter to launch ChatGPT Desktop through this proxy"
     }
@@ -369,6 +403,26 @@ mod tests {
     #[test]
     fn too_small_layout_is_actionable() {
         assert!(rendered(40, 10).contains("Terminal too small"));
+    }
+
+    #[test]
+    fn daemon_repair_prompt_shows_interruption_warning_and_choices() {
+        let backend = TestBackend::new(90, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = AppState::new(GuardConfig::default(), "config.toml".into());
+        state.daemon_repair_prompt = true;
+        terminal.draw(|frame| draw(frame, &state)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("Stop the shared Codex background server"));
+        assert!(text.contains("may interrupt tasks"));
+        assert!(text.contains("Y  Confirm and launch"));
+        assert!(!text.contains("Press Enter to launch"));
     }
 
     #[test]

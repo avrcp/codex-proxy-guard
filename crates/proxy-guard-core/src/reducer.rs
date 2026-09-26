@@ -1,7 +1,7 @@
 use crate::{
-    AppAction, AppEffect, AppState, DaemonPreparation, DesktopAppDiscovery, DesktopProcessState,
-    ForegroundOperation, LaunchReceipt, LaunchState, ProxyEditor, ProxyField, TaskResult,
-    UserIntent, redact_text,
+    AppAction, AppEffect, AppState, ConfigReadiness, DesktopAppDiscovery, DesktopProcessState,
+    ForegroundOperation, LaunchOptions, LaunchReceipt, LaunchState, ProxyEditor, ProxyField,
+    TaskResult, UserIntent, redact_text,
 };
 
 pub fn reduce(state: &mut AppState, action: AppAction) -> Vec<AppEffect> {
@@ -16,6 +16,53 @@ fn reduce_intent(state: &mut AppState, intent: UserIntent) -> Vec<AppEffect> {
         state.should_quit = true;
         return vec![AppEffect::Shutdown];
     }
+
+    // The repair confirmation is modal: only Y / N / Esc act on it, and refresh
+    // or proxy editing simply closes it. Y authorizes exactly one launch.
+    if state.daemon_repair_prompt {
+        match intent {
+            UserIntent::ConfirmDaemonRepairLaunch => {
+                state.daemon_repair_prompt = false;
+                if state.config_readiness != ConfigReadiness::Ready {
+                    state.status_message =
+                        "Configuration must be repaired before launch (press C)".into();
+                    return Vec::new();
+                }
+                if state.foreground.is_some() {
+                    state.status_message = "A launch operation is already in progress".into();
+                    return Vec::new();
+                }
+                state.foreground = Some(ForegroundOperation::Launch);
+                state.launch = LaunchState::Launching;
+                state.status_message =
+                    "Stopping the shared Codex background server, then launching… (you can cancel)"
+                        .into();
+                return vec![AppEffect::LaunchDesktop(LaunchOptions {
+                    refresh_codex_daemon: true,
+                })];
+            }
+            UserIntent::CancelDaemonRepairLaunch => {
+                state.daemon_repair_prompt = false;
+                state.status_message =
+                    "Repair launch cancelled; the shared Codex background server was not touched"
+                        .into();
+                return Vec::new();
+            }
+            UserIntent::RequestDaemonRepairLaunch => return Vec::new(),
+            UserIntent::Refresh | UserIntent::EditProxy => {
+                state.daemon_repair_prompt = false;
+            }
+            UserIntent::Launch
+            | UserIntent::UpdateProxyField { .. }
+            | UserIntent::ToggleProxyField
+            | UserIntent::SaveProxy
+            | UserIntent::CancelProxyEdit
+            | UserIntent::ToggleHelp
+            | UserIntent::Dismiss
+            | UserIntent::Quit => return Vec::new(),
+        }
+    }
+
     if intent == UserIntent::EditProxy {
         if state.foreground.is_none() {
             state.proxy_editor = Some(ProxyEditor {
@@ -73,6 +120,9 @@ fn reduce_intent(state: &mut AppState, intent: UserIntent) -> Vec<AppEffect> {
                 return vec![AppEffect::SaveConfig(updated)];
             }
             UserIntent::Launch
+            | UserIntent::RequestDaemonRepairLaunch
+            | UserIntent::ConfirmDaemonRepairLaunch
+            | UserIntent::CancelDaemonRepairLaunch
             | UserIntent::Refresh
             | UserIntent::ToggleHelp
             | UserIntent::Dismiss
@@ -93,6 +143,19 @@ fn reduce_intent(state: &mut AppState, intent: UserIntent) -> Vec<AppEffect> {
     if state.show_help {
         return Vec::new();
     }
+
+    // An unrepaired configuration keeps blocking every launch entry. Clearing
+    // or dismissing the visible error must never turn the in-memory default
+    // substitute into a launchable configuration.
+    if state.config_readiness != ConfigReadiness::Ready
+        && matches!(
+            intent,
+            UserIntent::Launch | UserIntent::RequestDaemonRepairLaunch
+        )
+    {
+        state.status_message = "Configuration must be repaired before launch (press C)".into();
+        return Vec::new();
+    }
     if state.error_message.is_some() {
         state.error_message = None;
         return Vec::new();
@@ -106,8 +169,13 @@ fn reduce_intent(state: &mut AppState, intent: UserIntent) -> Vec<AppEffect> {
         UserIntent::Launch => {
             state.foreground = Some(ForegroundOperation::Launch);
             state.launch = LaunchState::Launching;
-            state.status_message = "Launching Desktop with proxy environment…".into();
-            vec![AppEffect::LaunchDesktop]
+            state.status_message = "Launching Desktop with the proxy environment…".into();
+            vec![AppEffect::LaunchDesktop(LaunchOptions::default())]
+        }
+        UserIntent::RequestDaemonRepairLaunch => {
+            state.daemon_repair_prompt = true;
+            state.status_message = "Confirm the shared-daemon repair launch".into();
+            Vec::new()
         }
         UserIntent::Refresh => {
             state.foreground = Some(ForegroundOperation::Refresh);
@@ -120,6 +188,8 @@ fn reduce_intent(state: &mut AppState, intent: UserIntent) -> Vec<AppEffect> {
         | UserIntent::ToggleProxyField
         | UserIntent::SaveProxy
         | UserIntent::CancelProxyEdit
+        | UserIntent::ConfirmDaemonRepairLaunch
+        | UserIntent::CancelDaemonRepairLaunch
         | UserIntent::ToggleHelp
         | UserIntent::Dismiss
         | UserIntent::Quit => unreachable!(),
@@ -127,6 +197,11 @@ fn reduce_intent(state: &mut AppState, intent: UserIntent) -> Vec<AppEffect> {
 }
 
 fn reduce_result(state: &mut AppState, result: TaskResult) -> Vec<AppEffect> {
+    // Guard is shutting down: never consume a late task result into UI state,
+    // and never schedule new effects during shutdown.
+    if state.should_quit {
+        return Vec::new();
+    }
     match result {
         TaskResult::LocalStateRefreshed {
             desktop_app,
@@ -181,6 +256,7 @@ fn reduce_result(state: &mut AppState, result: TaskResult) -> Vec<AppEffect> {
                 Ok(config) => {
                     state.config = config;
                     state.proxy_editor = None;
+                    state.config_readiness = ConfigReadiness::Ready;
                     state.status_message = "Proxy configuration saved".into();
                 }
                 Err(message) => {
@@ -195,19 +271,14 @@ fn reduce_result(state: &mut AppState, result: TaskResult) -> Vec<AppEffect> {
     Vec::new()
 }
 
+/// Reports only what Guard actually observed: a Desktop process was created
+/// with the proxy environment, and — for the explicit repair path — that the
+/// shared daemon was stopped. It never claims the network path was verified.
 fn launch_status_message(receipt: &LaunchReceipt) -> String {
-    let base = match receipt.daemon_preparation {
-        DaemonPreparation::LifecycleUnavailable => {
-            format!(
-                "Desktop launched with process-scoped proxy (PID {})",
-                receipt.pid
-            )
-        }
-        DaemonPreparation::NotNeeded | DaemonPreparation::Stopped => format!(
-            "Desktop launched through the configured proxy (PID {})",
-            receipt.pid
-        ),
-    };
+    let base = format!(
+        "Desktop process created with the proxy environment (PID {})",
+        receipt.pid
+    );
     match receipt.daemon_preparation.status_detail() {
         "" => base,
         detail => format!("{base}; {detail}"),
@@ -217,7 +288,9 @@ fn launch_status_message(receipt: &LaunchReceipt) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{DesktopDiscoverySource, DesktopLaunchInfo, DesktopProduct, GuardConfig};
+    use crate::{
+        DaemonPreparation, DesktopDiscoverySource, DesktopLaunchInfo, DesktopProduct, GuardConfig,
+    };
     use std::path::PathBuf;
 
     fn state() -> AppState {
@@ -229,16 +302,146 @@ mod tests {
         let mut state = state();
         assert_eq!(
             reduce(&mut state, AppAction::Intent(UserIntent::Launch)),
-            vec![AppEffect::LaunchDesktop]
+            vec![AppEffect::LaunchDesktop(LaunchOptions::default())]
         );
         assert!(reduce(&mut state, AppAction::Intent(UserIntent::Refresh)).is_empty());
         assert_eq!(state.foreground, Some(ForegroundOperation::Launch));
     }
 
     #[test]
+    fn daemon_repair_requires_an_explicit_single_use_confirmation() {
+        let mut state = state();
+        // D opens the confirmation; Enter and other keys do nothing while it shows.
+        assert!(
+            reduce(
+                &mut state,
+                AppAction::Intent(UserIntent::RequestDaemonRepairLaunch)
+            )
+            .is_empty()
+        );
+        assert!(state.daemon_repair_prompt);
+        assert!(reduce(&mut state, AppAction::Intent(UserIntent::Launch)).is_empty());
+        // Esc cancels without any launch effect.
+        assert!(
+            reduce(
+                &mut state,
+                AppAction::Intent(UserIntent::CancelDaemonRepairLaunch)
+            )
+            .is_empty()
+        );
+        assert!(!state.daemon_repair_prompt);
+        // Y only acts while the prompt is shown; exactly one authorized launch.
+        reduce(
+            &mut state,
+            AppAction::Intent(UserIntent::RequestDaemonRepairLaunch),
+        );
+        assert_eq!(
+            reduce(
+                &mut state,
+                AppAction::Intent(UserIntent::ConfirmDaemonRepairLaunch)
+            ),
+            vec![AppEffect::LaunchDesktop(LaunchOptions {
+                refresh_codex_daemon: true
+            })]
+        );
+        assert!(!state.daemon_repair_prompt);
+    }
+
+    #[test]
+    fn refresh_closes_the_repair_confirmation_without_launching() {
+        let mut state = state();
+        reduce(
+            &mut state,
+            AppAction::Intent(UserIntent::RequestDaemonRepairLaunch),
+        );
+        let effects = reduce(&mut state, AppAction::Intent(UserIntent::Refresh));
+        assert!(
+            effects
+                .iter()
+                .all(|effect| !matches!(effect, AppEffect::LaunchDesktop(_)))
+        );
+        assert!(!state.daemon_repair_prompt);
+    }
+
+    #[test]
+    fn unrepaired_configuration_blocks_every_launch_entry() {
+        let mut state = state();
+        state.config_readiness = ConfigReadiness::RepairRequired;
+        state.error_message = Some("CONFIG_INVALID: broken".into());
+        // Launch and repair requests are blocked before any effect is produced,
+        // even after the visible error has been dismissed.
+        assert!(
+            reduce(&mut state, AppAction::Intent(UserIntent::Launch)).is_empty(),
+            "launch must be blocked while the configuration is unrepaired"
+        );
+        assert!(
+            reduce(
+                &mut state,
+                AppAction::Intent(UserIntent::RequestDaemonRepairLaunch)
+            )
+            .is_empty()
+        );
+        assert!(reduce(&mut state, AppAction::Intent(UserIntent::Dismiss)).is_empty());
+        assert!(reduce(&mut state, AppAction::Intent(UserIntent::Launch)).is_empty());
+        assert_eq!(state.config_readiness, ConfigReadiness::RepairRequired);
+        // A failed save keeps the block; only a successful save lifts it. The
+        // save results arrive as if a SaveConfig operation was in flight.
+        state.foreground = Some(ForegroundOperation::SaveConfig);
+        reduce(
+            &mut state,
+            AppAction::TaskComplete(Box::new(TaskResult::ConfigSaved(Err("disk full".into())))),
+        );
+        assert_eq!(state.config_readiness, ConfigReadiness::RepairRequired);
+        state.foreground = Some(ForegroundOperation::SaveConfig);
+        reduce(
+            &mut state,
+            AppAction::TaskComplete(Box::new(TaskResult::ConfigSaved(
+                Ok(GuardConfig::default()),
+            ))),
+        );
+        assert_eq!(state.config_readiness, ConfigReadiness::Ready);
+        assert_eq!(
+            reduce(&mut state, AppAction::Intent(UserIntent::Launch)),
+            vec![AppEffect::LaunchDesktop(LaunchOptions::default())]
+        );
+    }
+
+    #[test]
     fn launch_completion_updates_process_without_extra_effects() {
         let mut state = state();
         reduce(&mut state, AppAction::Intent(UserIntent::Launch));
+        let info = crate::DesktopAppInfo {
+            product: DesktopProduct::ChatGpt,
+            package_name: "OpenAI.Codex".into(),
+            package_version: "1".into(),
+            architecture: "X64".into(),
+            discovery_source: DesktopDiscoverySource::AppxManifest,
+            install_location: PathBuf::from("app"),
+            executable: PathBuf::from("app/Codex.exe"),
+        };
+        let receipt = LaunchReceipt {
+            pid: 42,
+            proxy_endpoint: "http://127.0.0.1:10808".into(),
+            daemon_preparation: DaemonPreparation::Skipped,
+            desktop: DesktopLaunchInfo::from(&info),
+        };
+        assert!(
+            reduce(
+                &mut state,
+                AppAction::TaskComplete(Box::new(TaskResult::LaunchCompleted(Ok((info, receipt)))))
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            state.desktop_process,
+            DesktopProcessState::Running { pid: 42 }
+        );
+    }
+
+    #[test]
+    fn late_results_are_ignored_after_quit() {
+        let mut state = state();
+        reduce(&mut state, AppAction::Intent(UserIntent::Quit));
         let info = crate::DesktopAppInfo {
             product: DesktopProduct::ChatGpt,
             package_name: "OpenAI.Codex".into(),
@@ -261,10 +464,7 @@ mod tests {
             )
             .is_empty()
         );
-        assert_eq!(
-            state.desktop_process,
-            DesktopProcessState::Running { pid: 42 }
-        );
+        assert_eq!(state.launch, LaunchState::Idle);
     }
 
     #[test]
@@ -282,18 +482,18 @@ mod tests {
             },
         };
         assert_eq!(
+            launch_status_message(&receipt(DaemonPreparation::Skipped)),
+            "Desktop process created with the proxy environment (PID 7)"
+        );
+        assert_eq!(
             launch_status_message(&receipt(DaemonPreparation::NotNeeded)),
-            "Desktop launched through the configured proxy (PID 7)"
+            "Desktop process created with the proxy environment (PID 7); \
+             the shared Codex background server was not running"
         );
         assert_eq!(
             launch_status_message(&receipt(DaemonPreparation::Stopped)),
-            "Desktop launched through the configured proxy (PID 7); \
-             Codex background server was refreshed for the new proxy environment"
-        );
-        assert_eq!(
-            launch_status_message(&receipt(DaemonPreparation::LifecycleUnavailable)),
-            "Desktop launched with process-scoped proxy (PID 7); \
-             Codex daemon lifecycle API was not available"
+            "Desktop process created with the proxy environment (PID 7); \
+             the shared Codex background server was stopped before launch"
         );
     }
 

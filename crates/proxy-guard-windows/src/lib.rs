@@ -5,7 +5,13 @@ pub mod environment;
 pub mod process;
 
 pub use appx::discover_desktop_app;
-pub use codex_daemon::{CodexCli, prepare_codex_daemon_for_launch, resolve_codex_cli};
-pub use elevation::{ELEVATED_LAUNCH_UNSUPPORTED, ensure_non_elevated, is_elevated};
+pub use codex_daemon::{
+    CodexCli, CodexHomeInput, DaemonStopBudget, resolve_codex_cli, resolve_codex_cli_from,
+    stop_codex_daemon,
+};
+pub use elevation::{
+    ELEVATED_LAUNCH_UNSUPPORTED, ElevationState, elevation_gate, ensure_non_elevated,
+    query_elevation,
+};
 pub use environment::{apply_proxy_environment, proxy_environment};
-pub use process::{desktop_process_state, launch_codex};
+pub use process::{LaunchHooks, desktop_process_state, launch_codex, launch_codex_with};

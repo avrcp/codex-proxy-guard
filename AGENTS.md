@@ -32,20 +32,25 @@ decrypt TLS, modify the Windows system proxy, edit `~/.codex/config.toml` or
 commands must be bounded, timed out, cancellable where asynchronous, and redacted
 before display.
 
-Codex daemon compatibility is limited to invoking the public
-`codex app-server daemon stop` lifecycle command before Desktop launch. The Guard
-must never connect to the app-server socket, read daemon private state, inspect
-auth data, or directly terminate Codex processes. Daemon stop exists only to
-discard a stale process environment before the newly launched Desktop starts a
-fresh daemon under the injected proxy environment. Guard must refuse to launch
-when it is itself running elevated, matching the Codex background-server
-elevation requirement.
+Normal launches must have zero daemon side effects: they never resolve the Codex
+CLI and never run daemon commands. Codex daemon compatibility is limited to the
+explicitly authorized repair launch invoking the public
+`codex app-server daemon stop` lifecycle command once (single-use user
+confirmation per launch; the stop may interrupt shared tasks of other clients on
+the same Codex Home). The Guard must never connect to the app-server socket, read
+daemon private state, inspect auth data, start/restart/update/bootstrap the
+daemon, or directly terminate shared Codex or Desktop processes. Guard may
+terminate and reap only its own short-lived helper children (bounded output,
+bounded wait) on timeout or cancellation. Guard must refuse to launch when it is
+itself running elevated — or when the elevation query itself fails — matching the
+Codex background-server elevation requirement.
 
 Do not add network health probes, Node Readiness, Usage/account telemetry, Codex
 app-server or private IPC, v2rayN management, sing-box management, network
 benchmarks, subscription management, diagnostics/history persistence, daemon
-start/restart/update/bootstrap flows, or process termination. The product owns
-only proxy-environment injection into a newly launched Desktop process tree.
+start/restart/update/bootstrap flows, or a persisted auto-stop configuration.
+The product owns only proxy-environment injection into a newly launched Desktop
+process tree.
 
 ## Completion commands
 

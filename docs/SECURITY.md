@@ -16,7 +16,8 @@
 
 ## Codex daemon 兼容边界
 
-允许的唯一 daemon 交互是：
+普通启动对共享 daemon 零副作用：不解析 Codex CLI、不执行任何 daemon 命令、不依赖 CLI
+已安装。允许的唯一 daemon 交互是显式修复启动（用户单次确认）中的：
 
 ```text
 codex app-server daemon stop
@@ -24,36 +25,50 @@ codex app-server daemon stop
 
 并且仅限：
 
-- Desktop 启动前的准备阶段；
-- 通过本地解析出的官方 Codex CLI（override / CODEX_HOME 包布局 / `where.exe`）执行；
-- stdin 为 null、输出管道化并设 64 KiB 上限、超时 75 秒、可取消、kill_on_drop。
+- 该次调用已获得用户明确授权（CLI `--refresh-codex-daemon` 或 TUI `D`+`Y`），授权不
+  持久化到配置；
+- 通过可信来源解析出的官方 Codex CLI 执行：显式 override（现存绝对路径 native `.exe`，
+  失效即错不换源）、显式 `CODEX_HOME`（必须存在，不回退默认目录、不跨 Home 扫描）、
+  已知包布局、PATH 中的绝对目录（跳过当前目录与相对项，不使用 `where.exe`）；
+- stdin 为 null、两条管道各 64 KiB 硬上限（超限先于解析失败）、严格 UTF-8、恰好一个
+  JSON 对象、只接受精确 `stopped` / `notRunning`；
+- 总预算 720 秒、取消全程可用；超时/取消时只终止并回收 Guard 自己创建的短命 CLI 子
+  进程。
+
+注意：官方 stop 命令本身也是破坏性操作——会中断同一 Codex Home 下其他 CLI / IDE /
+远程客户端正在执行的任务；stop 成功也不代表新进程一定使用新代理（Codex CLI 启动时
+可能用 Codex Home 下 `.env` 的值覆盖继承环境，Guard 不读取也不修改该文件）。
 
 禁止：
 
+- 在普通启动中隐式执行任何 daemon 命令；
 - `daemon start`、`daemon restart`、`daemon update`、`daemon bootstrap` 或任何形式的
   remote-control；
 - 连接 app-server socket、JSON-RPC、私有 IPC、daemon PID file 或 daemon settings；
 - 读取 daemon 私有状态或任何认证数据；
-- 直接终止 Codex 进程（`TerminateProcess` / `taskkill` / PID 强杀 / Job Object）；
+- 直接终止共享 Codex 进程或 Desktop（`TerminateProcess` / `taskkill` / PID 强杀 /
+  Job Object）；
 - 修改 `~/.codex/config.toml`、`~/.codex/.env`，或写入 `features.daemon_auto_start` 之类
   的开关来对抗 daemon 架构。
-
-daemon stop 的唯一目的是在 Desktop 启动前丢弃旧 daemon 持有的过期进程环境，让新启动的
-Desktop 在注入的代理环境下建立新 daemon。
 
 ## 权限边界
 
 Guard 不以管理员身份启动 Desktop：Codex 0.157+ 的共享后台服务要求非提升进程。Guard 用
-与 Codex 官方一致的 `TokenElevation` 检查；发现自身提升运行时直接阻止 Launch
-（`ELEVATED_LAUNCH_UNSUPPORTED`），不自动 UAC、不创建低权限 token、不做降权伪装。
+与 Codex 官方一致的 `TokenElevation` 查询（RAII handle、失败即时捕获 last_os_error）；
+发现自身提升运行时直接阻止 Launch（`ELEVATED_LAUNCH_UNSUPPORTED`），查询本身失败也
+阻止（`ELEVATION_QUERY_FAILED`），绝不把查询失败解释成非提升，也不自动 UAC、不创建
+低权限 token、不做降权伪装。
 
 ## 信任边界
 
-配置文件由当前用户控制，但仍必须通过 loopback HTTP 校验。APPX 与 override 路径在
-启动前必须是现存普通文件。APPX 清单入口必须是安装目录内的相对路径，canonicalize 后不得
-逃逸至安装目录外；清单缺失时仅使用固定的受控后备可执行文件名。`cli_executable_override`
-只在指向现存文件时生效，否则回退到 CODEX_HOME 与 PATH 解析。Desktop “已运行”只由与已
-发现可执行文件路径相同、具有有效启动时间且不是 Chromium `--type=` 子进程的根进程证明。
+配置文件由当前用户控制，但仍必须通过 loopback HTTP 校验；host 的校验与 URL 构造使用
+同一规则。APPX 与 override 路径在启动前必须是现存普通文件；APPX 查询固定使用系统目录
+下 Windows PowerShell 的绝对路径。APPX 清单入口必须是安装目录内的相对路径，
+canonicalize 后不得逃逸至安装目录外；清单缺失时仅使用固定的受控后备可执行文件名。
+`cli_executable_override` 只在指向现存绝对路径 `.exe` 时生效，失效报错而不换源；CLI 与
+Desktop 的身份比较采用一致的 Windows 路径规范化（普通与 extended-length 写法等价），
+名称相似但路径不可读的候选报告 Unknown 而不是“未运行”。Desktop “已运行”只由与已发现
+可执行文件路径相同、具有有效启动时间且不是 Chromium `--type=` 子进程的根进程证明。
 
 ## 不做网络判断
 
@@ -63,3 +78,4 @@ Guard 不访问配置的代理端口，也不访问 OpenAI 域名。代理失效
 `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` 仅传递给新启动的进程树。它们不构成 VPN、
 透明代理或防泄漏控制：Guard 不接管 DNS、UDP、系统服务或应用后续以其他路径建立的连接。
 尤其不应把 ChatGPT Voice 等可能使用 UDP 的流量视为已经被 HTTP 代理覆盖。
+

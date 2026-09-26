@@ -1,8 +1,13 @@
-use crate::{DesktopAppInfo, DesktopProcessState, GuardConfig, LaunchReceipt, ProxyField};
+use crate::{
+    DesktopAppInfo, DesktopProcessState, GuardConfig, LaunchOptions, LaunchReceipt, ProxyField,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UserIntent {
     Launch,
+    RequestDaemonRepairLaunch,
+    ConfirmDaemonRepairLaunch,
+    CancelDaemonRepairLaunch,
     Refresh,
     EditProxy,
     UpdateProxyField { field: ProxyField, value: String },
@@ -23,7 +28,7 @@ pub enum AppAction {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AppEffect {
     RefreshLocalState,
-    LaunchDesktop,
+    LaunchDesktop(LaunchOptions),
     SaveConfig(GuardConfig),
     Shutdown,
 }
@@ -59,7 +64,7 @@ impl Capabilities {
     pub fn authorize(&self, effect: &AppEffect) -> Result<(), String> {
         let allowed = match effect {
             AppEffect::RefreshLocalState => true,
-            AppEffect::LaunchDesktop => self.launch_process,
+            AppEffect::LaunchDesktop(_) => self.launch_process,
             AppEffect::SaveConfig(_) => self.save_config,
             AppEffect::Shutdown => self.quit,
         };
@@ -72,6 +77,7 @@ impl Capabilities {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::LaunchOptions;
 
     #[test]
     fn launching_requires_launch_capability() {
@@ -80,7 +86,18 @@ mod tests {
             save_config: true,
             quit: true,
         };
-        assert!(capabilities.authorize(&AppEffect::LaunchDesktop).is_err());
+        assert!(
+            capabilities
+                .authorize(&AppEffect::LaunchDesktop(LaunchOptions::default()))
+                .is_err()
+        );
+        assert!(
+            capabilities
+                .authorize(&AppEffect::LaunchDesktop(LaunchOptions {
+                    refresh_codex_daemon: true
+                }))
+                .is_err()
+        );
         assert!(
             capabilities
                 .authorize(&AppEffect::RefreshLocalState)

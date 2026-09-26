@@ -96,7 +96,7 @@ pub async fn discover_desktop_app(
     {
         use std::os::windows::process::CommandExt;
 
-        let mut command = Command::new("powershell.exe");
+        let mut command = Command::new(system_powershell()?);
         command
             .args([
                 "-NoLogo",
@@ -175,7 +175,7 @@ pub async fn discover_desktop_app(
     }
 }
 
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg(windows)]
 fn validate_appx_output_lengths(stdout_len: usize, stderr_len: usize) -> Result<(), String> {
     if stdout_len > 64 * 1024 {
         return Err("APPX_DISCOVERY_OUTPUT_LIMIT: stdout exceeded 64 KiB".into());
@@ -184,6 +184,31 @@ fn validate_appx_output_lengths(stdout_len: usize, stderr_len: usize) -> Result<
         return Err("APPX_DISCOVERY_OUTPUT_LIMIT: stderr exceeded 128 KiB".into());
     }
     Ok(())
+}
+
+/// Resolves the system Windows PowerShell by absolute path from the Windows
+/// directory. Never resolves via PATH, so a same-named file in the working
+/// directory can never become the discovery helper.
+#[cfg(windows)]
+fn system_powershell() -> Result<PathBuf, String> {
+    let windows_dir = std::env::var_os("WINDIR")
+        .or_else(|| std::env::var_os("SYSTEMROOT"))
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "APPX_DISCOVERY_FAILED: cannot locate the Windows directory".to_string())?;
+    let powershell = PathBuf::from(windows_dir)
+        .join("System32")
+        .join("WindowsPowerShell")
+        .join("v1.0")
+        .join("powershell.exe");
+    if powershell.is_file() {
+        Ok(powershell)
+    } else {
+        Err(
+            "APPX_DISCOVERY_FAILED: system Windows PowerShell was not found under the Windows \
+             directory"
+                .into(),
+        )
+    }
 }
 
 pub fn parse_appx_json(input: &str) -> Result<DesktopAppInfo, String> {

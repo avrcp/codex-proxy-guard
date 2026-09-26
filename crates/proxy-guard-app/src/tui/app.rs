@@ -79,7 +79,10 @@ pub async fn run(mut state: AppState) -> anyhow::Result<()> {
             }
         }
     }
+    // Cancel first, then wait (bounded) for the foreground task to finish its
+    // cleanup — the launched Desktop and all external processes keep running.
     cancellation.cancel();
+    dispatcher.shutdown().await;
     Ok(())
 }
 
@@ -89,32 +92,44 @@ fn handle_key(
     capabilities: &Capabilities,
     dispatcher: &EffectDispatcher,
 ) {
-    let intent = if matches!(key.code, KeyCode::Char('c'))
-        && key.modifiers.contains(KeyModifiers::CONTROL)
-    {
-        Some(UserIntent::Quit)
-    } else if state.proxy_editor.is_some() {
-        proxy_editor_intent(state, key)
-    } else if matches!(key.code, KeyCode::Char('q') | KeyCode::Char('Q')) {
-        Some(UserIntent::Quit)
-    } else if state.show_help || state.error_message.is_some() {
-        match key.code {
+    if let Some(intent) = key_to_intent(state, key) {
+        handle_action(state, AppAction::Intent(intent), capabilities, dispatcher);
+    }
+}
+
+fn key_to_intent(state: &AppState, key: KeyEvent) -> Option<UserIntent> {
+    if matches!(key.code, KeyCode::Char('c')) && key.modifiers.contains(KeyModifiers::CONTROL) {
+        return Some(UserIntent::Quit);
+    }
+    if state.daemon_repair_prompt {
+        // The repair confirmation is modal; only Y / N / Esc act on it.
+        return match key.code {
+            KeyCode::Char('y' | 'Y') => Some(UserIntent::ConfirmDaemonRepairLaunch),
+            KeyCode::Char('n' | 'N') | KeyCode::Esc => Some(UserIntent::CancelDaemonRepairLaunch),
+            _ => None,
+        };
+    }
+    if state.proxy_editor.is_some() {
+        return proxy_editor_intent(state, key);
+    }
+    if matches!(key.code, KeyCode::Char('q') | KeyCode::Char('Q')) {
+        return Some(UserIntent::Quit);
+    }
+    if state.show_help || state.error_message.is_some() {
+        return match key.code {
             KeyCode::Char('c' | 'C') => Some(UserIntent::EditProxy),
             KeyCode::Esc | KeyCode::Enter | KeyCode::Char('?') => Some(UserIntent::Dismiss),
             _ => None,
-        }
-    } else {
-        match key.code {
-            KeyCode::Enter | KeyCode::Char('l' | 'L') => Some(UserIntent::Launch),
-            KeyCode::Char('r' | 'R') => Some(UserIntent::Refresh),
-            KeyCode::Char('c' | 'C') => Some(UserIntent::EditProxy),
-            KeyCode::Char('?') => Some(UserIntent::ToggleHelp),
-            KeyCode::Esc => Some(UserIntent::Dismiss),
-            _ => None,
-        }
-    };
-    if let Some(intent) = intent {
-        handle_action(state, AppAction::Intent(intent), capabilities, dispatcher);
+        };
+    }
+    match key.code {
+        KeyCode::Enter | KeyCode::Char('l' | 'L') => Some(UserIntent::Launch),
+        KeyCode::Char('d' | 'D') => Some(UserIntent::RequestDaemonRepairLaunch),
+        KeyCode::Char('r' | 'R') => Some(UserIntent::Refresh),
+        KeyCode::Char('c' | 'C') => Some(UserIntent::EditProxy),
+        KeyCode::Char('?') => Some(UserIntent::ToggleHelp),
+        KeyCode::Esc => Some(UserIntent::Dismiss),
+        _ => None,
     }
 }
 
@@ -203,5 +218,38 @@ mod tests {
             proxy_editor_intent(&editing, KeyEvent::from(KeyCode::Char('9'))),
             Some(UserIntent::UpdateProxyField { value, .. }) if value == "108089"
         ));
+    }
+
+    #[test]
+    fn daemon_repair_confirmation_is_modal_and_single_shot() {
+        let state = AppState::new(GuardConfig::default(), "config.toml".into());
+        let mut prompting = state;
+        prompting.daemon_repair_prompt = true;
+        // While the prompt shows, only Y / N / Esc act; Enter and D do nothing.
+        assert_eq!(handle_intent_key(&prompting, KeyCode::Enter), None);
+        assert_eq!(handle_intent_key(&prompting, KeyCode::Char('d')), None);
+        assert_eq!(
+            handle_intent_key(&prompting, KeyCode::Char('y')),
+            Some(UserIntent::ConfirmDaemonRepairLaunch)
+        );
+        assert_eq!(
+            handle_intent_key(&prompting, KeyCode::Esc),
+            Some(UserIntent::CancelDaemonRepairLaunch)
+        );
+        // Outside the prompt, D requests the repair confirmation.
+        let mut normal = AppState::new(GuardConfig::default(), "config.toml".into());
+        normal.daemon_repair_prompt = false;
+        assert_eq!(
+            handle_intent_key(&normal, KeyCode::Char('d')),
+            Some(UserIntent::RequestDaemonRepairLaunch)
+        );
+        assert_eq!(
+            handle_intent_key(&normal, KeyCode::Enter),
+            Some(UserIntent::Launch)
+        );
+    }
+
+    fn handle_intent_key(state: &AppState, code: KeyCode) -> Option<UserIntent> {
+        key_to_intent(state, KeyEvent::from(code))
     }
 }

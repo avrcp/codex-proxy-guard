@@ -99,30 +99,36 @@ pub enum DesktopProcessState {
     },
 }
 
-/// Outcome of the pre-launch Codex daemon compatibility step. The Guard never
-/// owns the daemon; it only discards a stale daemon environment through the
-/// public `codex app-server daemon stop` lifecycle command so the freshly
-/// launched Desktop starts a new daemon under the injected proxy environment.
+/// Outcome of the daemon compatibility step for one launch. Normal launches
+/// never touch the shared daemon (`Skipped`); the stop command runs only in the
+/// explicitly authorized repair launch, and even then Guard only invokes the
+/// public `codex app-server daemon stop` lifecycle command.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum DaemonPreparation {
-    /// No daemon was running; nothing had to be refreshed.
+    /// No daemon was running when the explicit stop was requested.
     NotNeeded,
-    /// A running daemon was stopped through the official lifecycle command.
+    /// The shared daemon was stopped through the official lifecycle command.
     Stopped,
-    /// The Codex CLI or its daemon lifecycle API is unavailable (for example
-    /// Codex older than 0.157); Desktop launches with process-scoped proxy.
-    LifecycleUnavailable,
+    /// Normal launch: the daemon was not inspected or touched at all.
+    Skipped,
 }
 
 impl DaemonPreparation {
     pub fn status_detail(self) -> &'static str {
         match self {
-            Self::NotNeeded => "",
-            Self::Stopped => "Codex background server was refreshed for the new proxy environment",
-            Self::LifecycleUnavailable => "Codex daemon lifecycle API was not available",
+            Self::NotNeeded => "the shared Codex background server was not running",
+            Self::Stopped => "the shared Codex background server was stopped before launch",
+            Self::Skipped => "",
         }
     }
+}
+
+/// Single-use launch intent; never persisted to configuration. Carries the
+/// user's one-shot authorization for the daemon repair step.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LaunchOptions {
+    pub refresh_codex_daemon: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -168,10 +174,12 @@ pub struct ProxyEditor {
 pub struct AppState {
     pub config: GuardConfig,
     pub config_path: PathBuf,
+    pub config_readiness: ConfigReadiness,
     pub desktop_app: DesktopAppDiscovery,
     pub desktop_process: DesktopProcessState,
     pub launch: LaunchState,
     pub foreground: Option<ForegroundOperation>,
+    pub daemon_repair_prompt: bool,
     pub status_message: String,
     pub error_message: Option<String>,
     pub show_help: bool,
@@ -179,15 +187,28 @@ pub struct AppState {
     pub should_quit: bool,
 }
 
+/// Runtime-only configuration gate. An invalid configuration keeps blocking
+/// launches until the user successfully saves (or reloads) a valid one; closing
+/// the error message must never make the in-memory default substitute
+/// launchable.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ConfigReadiness {
+    #[default]
+    Ready,
+    RepairRequired,
+}
+
 impl AppState {
     pub fn new(config: GuardConfig, config_path: PathBuf) -> Self {
         Self {
             config,
             config_path,
+            config_readiness: ConfigReadiness::Ready,
             desktop_app: DesktopAppDiscovery::Unknown,
             desktop_process: DesktopProcessState::Unknown,
             launch: LaunchState::Idle,
             foreground: None,
+            daemon_repair_prompt: false,
             status_message: "Ready to launch through the configured proxy".into(),
             error_message: None,
             show_help: false,
@@ -221,8 +242,13 @@ mod tests {
         assert_eq!(value["desktop"]["discovery_source"], "appx_manifest");
         assert_eq!(value["daemon_preparation"], "stopped");
         assert_eq!(
-            DaemonPreparation::LifecycleUnavailable.status_detail(),
-            "Codex daemon lifecycle API was not available"
+            DaemonPreparation::Skipped.status_detail(),
+            "",
+            "normal launches make no claim about the daemon"
+        );
+        assert_eq!(
+            DaemonPreparation::NotNeeded.status_detail(),
+            "the shared Codex background server was not running"
         );
     }
 }
