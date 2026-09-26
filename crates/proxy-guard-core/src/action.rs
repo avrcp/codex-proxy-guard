@@ -5,6 +5,9 @@ use crate::{
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UserIntent {
     Launch,
+    RequestPackageContextLaunch,
+    ConfirmPackageContextLaunch,
+    CancelPackageContextLaunch,
     RequestDaemonRepairLaunch,
     ConfirmDaemonRepairLaunch,
     CancelDaemonRepairLaunch,
@@ -94,7 +97,8 @@ mod tests {
         assert!(
             capabilities
                 .authorize(&AppEffect::LaunchDesktop(LaunchOptions {
-                    refresh_codex_daemon: true
+                    refresh_codex_daemon: true,
+                    package_context_compat: false,
                 }))
                 .is_err()
         );

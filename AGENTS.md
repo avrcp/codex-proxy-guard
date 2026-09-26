@@ -52,6 +52,15 @@ start/restart/update/bootstrap flows, or a persisted auto-stop configuration.
 The product owns only proxy-environment injection into a newly launched Desktop
 process tree.
 
+The launcher may query the OS-assigned package identity of the selected Desktop
+process and use a narrowly scoped, verified packaged-app launch backend. A
+short-lived Guard-owned helper and its one-shot local handoff are allowed only
+for this backend; they are not Codex private IPC. The package-context candidate
+uses a Windows debugging command for confirmed FullTrust Desktop applications
+and requires one-shot selection until real Desktop, proxy, and sandbox acceptance
+has passed. Its token behavior must not be presented as normal activation.
+Normal launch still never resolves the Codex CLI or stops the shared daemon.
+
 ## Completion commands
 
 ```powershell

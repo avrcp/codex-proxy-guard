@@ -79,7 +79,16 @@ fn draw_content(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     if let Some(editor) = &state.proxy_editor {
         draw_proxy_editor(&mut lines, editor.clone(), state.foreground.is_some());
     } else if state.daemon_repair_prompt {
-        draw_daemon_repair_prompt(&mut lines);
+        draw_daemon_repair_prompt(
+            &mut lines,
+            matches!(
+                &state.desktop_app,
+                DesktopAppDiscovery::Found(info)
+                    if matches!(info.target_kind, proxy_guard_core::DesktopTargetKind::RegisteredPackage(_))
+            ),
+        );
+    } else if state.package_context_prompt {
+        draw_package_context_prompt(&mut lines);
     } else if let Some(error) = &state.error_message {
         lines.push(Line::styled("Launch unavailable", theme::error()));
         lines.push(Line::raw(error.clone()));
@@ -127,6 +136,10 @@ fn draw_content(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
             "Press D for a shared-daemon repair launch (asks first).",
             theme::muted(),
         ));
+        lines.push(Line::styled(
+            "Press P for the one-shot package-context candidate (asks first).",
+            theme::muted(),
+        ));
         lines.push(Line::raw(""));
         lines.push(Line::styled(primary_action(state), theme::accent()));
         lines.push(Line::styled(
@@ -137,7 +150,7 @@ fn draw_content(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
 }
 
-fn draw_daemon_repair_prompt(lines: &mut Vec<Line<'static>>) {
+fn draw_daemon_repair_prompt(lines: &mut Vec<Line<'static>>, packaged: bool) {
     lines.push(Line::styled("Repair launch", theme::title()));
     lines.push(Line::raw(""));
     lines.push(Line::raw(
@@ -147,9 +160,34 @@ fn draw_daemon_repair_prompt(lines: &mut Vec<Line<'static>>) {
         "This may interrupt tasks of other CLI / IDE / remote clients",
     ));
     lines.push(Line::raw("sharing the same Codex Home."));
+    if packaged {
+        lines.push(Line::raw(
+            "This also uses the unverified package-context candidate.",
+        ));
+    }
     lines.push(Line::raw(""));
     lines.push(Line::styled(
         "Y  Confirm and launch      N / Esc  Cancel",
+        theme::accent(),
+    ));
+}
+
+fn draw_package_context_prompt(lines: &mut Vec<Line<'static>>) {
+    lines.push(Line::styled("Package-context candidate", theme::title()));
+    lines.push(Line::raw(""));
+    lines.push(Line::raw(
+        "Launch with the registered FullTrust package context?",
+    ));
+    lines.push(Line::raw(""));
+    lines.push(Line::raw(
+        "This uses a Windows debugging command. Its real Desktop",
+    ));
+    lines.push(Line::raw(
+        "and sandbox behavior has not passed machine acceptance.",
+    ));
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "Y  Launch once      N / Esc  Cancel",
         theme::accent(),
     ));
 }
@@ -226,6 +264,10 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect) {
             Span::raw(
                 "Repair launch: stop the shared Codex background server first (asks for confirmation)",
             ),
+        ]),
+        Line::from(vec![
+            Span::styled("P          ", theme::accent()),
+            Span::raw("Test the package-context candidate once (asks for confirmation)"),
         ]),
         Line::from(vec![
             Span::styled("R          ", theme::accent()),
@@ -339,6 +381,12 @@ fn primary_action(state: &AppState) -> &'static str {
         "ChatGPT Desktop is already running — exit it fully before relaunching"
     } else if matches!(state.launch, LaunchState::Running(_)) {
         "ChatGPT Desktop process created with the proxy environment"
+    } else if matches!(
+        &state.desktop_app,
+        DesktopAppDiscovery::Found(info)
+            if matches!(info.target_kind, proxy_guard_core::DesktopTargetKind::RegisteredPackage(_))
+    ) {
+        "Press P to test the package-context candidate (asks first)"
     } else {
         "Press Enter to launch ChatGPT Desktop through this proxy"
     }
@@ -348,7 +396,9 @@ fn primary_action(state: &AppState) -> &'static str {
 mod tests {
     use std::path::PathBuf;
 
-    use proxy_guard_core::{DesktopAppInfo, DesktopDiscoverySource, DesktopProduct, GuardConfig};
+    use proxy_guard_core::{
+        DesktopAppInfo, DesktopDiscoverySource, DesktopProduct, DesktopTargetKind, GuardConfig,
+    };
     use ratatui::{Terminal, backend::TestBackend};
 
     use super::*;
@@ -430,15 +480,16 @@ mod tests {
         let backend = TestBackend::new(110, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut state = AppState::new(GuardConfig::default(), "config.toml".into());
-        state.desktop_app = DesktopAppDiscovery::Found(DesktopAppInfo {
+        state.desktop_app = DesktopAppDiscovery::Found(Box::new(DesktopAppInfo {
             product: DesktopProduct::ChatGpt,
             package_name: "OpenAI.Codex".into(),
             package_version: "26.727.6591.0".into(),
             architecture: "X64".into(),
             discovery_source: DesktopDiscoverySource::AppxManifest,
+            target_kind: DesktopTargetKind::UnpackagedExecutable,
             install_location: PathBuf::from("app"),
             executable: PathBuf::from("app/ChatGPT.exe"),
-        });
+        }));
         terminal.draw(|frame| draw(frame, &state)).unwrap();
         let text: String = terminal
             .backend()

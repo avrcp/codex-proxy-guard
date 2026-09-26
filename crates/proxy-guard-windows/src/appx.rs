@@ -6,7 +6,10 @@ use std::{
 #[cfg(windows)]
 use std::{process::Stdio, time::Duration};
 
-use proxy_guard_core::{DesktopAppInfo, DesktopDiscoverySource, DesktopProduct, GuardConfig};
+use proxy_guard_core::{
+    DesktopAppInfo, DesktopDiscoverySource, DesktopProduct, DesktopTargetKind, GuardConfig,
+    PackageApplication, PackageRuntimeKind,
+};
 use serde::Deserialize;
 #[cfg(windows)]
 use tokio::{io::AsyncReadExt, process::Command};
@@ -15,30 +18,37 @@ use tokio_util::sync::CancellationToken;
 #[cfg(windows)]
 const APPX_DISCOVERY_SCRIPT: &str = r#"
 $ErrorActionPreference = 'Stop'
+function Read-ManifestAttribute($element, [string]$name) {
+  $attribute = @($element.Attributes | Where-Object { $_.LocalName -eq $name })
+  if ($attribute.Count -gt 1) { throw "APPX_DISCOVERY_INVALID: ambiguous manifest attribute $name" }
+  if ($attribute.Count -eq 1) { return [string]$attribute[0].Value }
+  return $null
+}
 $records = @(
   foreach ($name in @('OpenAI.Codex', 'OpenAI.ChatGPT-Desktop')) {
     $package = Get-AppxPackage -Name $name | Sort-Object Version -Descending | Select-Object -First 1
     if ($null -ne $package) {
-      $manifestExecutable = $null
-      try {
-        $manifest = Get-AppxPackageManifest -Package $package
-        $application = @(
-          $manifest.Package.Applications.Application |
-            Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_.Executable) } |
-            Select-Object -First 1
-        )
-        if ($application.Count -gt 0) {
-          $manifestExecutable = [string]$application[0].Executable
+      $manifest = Get-AppxPackageManifest -Package $package.PackageFullName
+      $applications = @(
+        $manifest.Package.Applications.Application | ForEach-Object {
+          [PSCustomObject]@{
+            application_id = [string]$_.Id
+            manifest_executable = [string]$_.Executable
+            entry_point = [string]$_.EntryPoint
+            runtime_behavior = Read-ManifestAttribute $_ 'RuntimeBehavior'
+            trust_level = Read-ManifestAttribute $_ 'TrustLevel'
+          }
         }
-      } catch {
-        $manifestExecutable = $null
-      }
+      )
+      if ($applications.Count -gt 16) { throw 'APPX_DISCOVERY_INVALID: package has too many applications' }
       [PSCustomObject]@{
         package_name = [string]$package.Name
+        package_full_name = [string]$package.PackageFullName
+        package_family_name = [string]$package.PackageFamilyName
         package_version = [string]$package.Version
         architecture = [string]$package.Architecture
         install_location = [string]$package.InstallLocation
-        manifest_executable = $manifestExecutable
+        applications = $applications
       }
     }
   }
@@ -57,12 +67,30 @@ const MAX_APPX_STDERR_BYTES: u64 = 128 * 1024;
 #[derive(Debug, Deserialize)]
 struct AppxRecord {
     package_name: String,
+    #[serde(default)]
+    package_full_name: String,
+    #[serde(default)]
+    package_family_name: String,
     package_version: String,
     #[serde(default)]
     architecture: String,
     install_location: PathBuf,
     #[serde(default)]
-    manifest_executable: Option<String>,
+    applications: Vec<AppxApplicationRecord>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AppxApplicationRecord {
+    #[serde(default)]
+    application_id: String,
+    #[serde(default)]
+    manifest_executable: String,
+    #[serde(default)]
+    entry_point: String,
+    #[serde(default)]
+    runtime_behavior: String,
+    #[serde(default)]
+    trust_level: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -77,10 +105,12 @@ pub async fn discover_desktop_app(
     cached: Option<&DesktopAppInfo>,
     cancellation: &CancellationToken,
 ) -> Result<DesktopAppInfo, String> {
+    #[cfg(not(windows))]
     if !config.codex.executable_override.as_os_str().is_empty() {
-        return info_from_override(&config.codex.executable_override);
+        return info_from_unpacked_override(&config.codex.executable_override);
     }
     if let Some(cached) = cached
+        && config.codex.executable_override.as_os_str().is_empty()
         && cached.executable.is_file()
     {
         return Ok(cached.clone());
@@ -170,8 +200,10 @@ pub async fn discover_desktop_app(
                 stderr.trim()
             ));
         }
-        let stdout = String::from_utf8_lossy(&stdout);
-        parse_appx_json(stdout.trim())
+        desktop_info_from_discovery_output(
+            &String::from_utf8_lossy(&stdout),
+            &config.codex.executable_override,
+        )
     }
 }
 
@@ -186,32 +218,46 @@ fn validate_appx_output_lengths(stdout_len: usize, stderr_len: usize) -> Result<
     Ok(())
 }
 
-/// Resolves the system Windows PowerShell by absolute path from the Windows
-/// directory. Never resolves via PATH, so a same-named file in the working
-/// directory can never become the discovery helper.
+/// Resolve the system PowerShell from OS metadata, never inherited environment.
 #[cfg(windows)]
 fn system_powershell() -> Result<PathBuf, String> {
-    let windows_dir = std::env::var_os("WINDIR")
-        .or_else(|| std::env::var_os("SYSTEMROOT"))
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| "APPX_DISCOVERY_FAILED: cannot locate the Windows directory".to_string())?;
-    let powershell = PathBuf::from(windows_dir)
-        .join("System32")
-        .join("WindowsPowerShell")
-        .join("v1.0")
-        .join("powershell.exe");
-    if powershell.is_file() {
-        Ok(powershell)
-    } else {
-        Err(
-            "APPX_DISCOVERY_FAILED: system Windows PowerShell was not found under the Windows \
-             directory"
-                .into(),
-        )
-    }
+    crate::system_tools::system_powershell()
+        .map_err(|error| format!("APPX_DISCOVERY_FAILED: {error}"))
 }
 
 pub fn parse_appx_json(input: &str) -> Result<DesktopAppInfo, String> {
+    desktop_info_from_records(parse_appx_records(input)?)
+}
+
+/// A successful discovery helper emits no JSON when no supported package is
+/// installed. That is distinct from a failed helper: the caller has already
+/// checked its exit status before reaching here. A native executable override
+/// remains usable in that specific no-package case only.
+#[cfg(windows)]
+fn desktop_info_from_discovery_output(
+    input: &str,
+    executable_override: &Path,
+) -> Result<DesktopAppInfo, String> {
+    let records = if input.trim().is_empty() {
+        Vec::new()
+    } else {
+        parse_appx_records(input)?
+    };
+    if records.is_empty() {
+        return if executable_override.as_os_str().is_empty() {
+            Err(no_supported_package_error())
+        } else {
+            info_from_unpacked_override_canonical(canonicalize_existing(executable_override)?)
+        };
+    }
+    if executable_override.as_os_str().is_empty() {
+        desktop_info_from_records(records)
+    } else {
+        info_from_override(executable_override, records)
+    }
+}
+
+fn parse_appx_records(input: &str) -> Result<Vec<AppxRecord>, String> {
     if input.trim().is_empty() {
         return Err(
             "CODEX_NOT_INSTALLED: ChatGPT Desktop was not found. Install the current app from https://chatgpt.com/download/ (Microsoft Store ID 9PLM9XGG6VKS), or set codex.executable_override"
@@ -224,18 +270,30 @@ pub fn parse_appx_json(input: &str) -> Result<DesktopAppInfo, String> {
         AppxRecords::One(record) => vec![record],
         AppxRecords::Many(records) => records,
     };
+    if records.is_empty() {
+        return Err(no_supported_package_error());
+    }
+    Ok(records)
+}
+
+fn no_supported_package_error() -> String {
+    "CODEX_NOT_INSTALLED: no supported ChatGPT Desktop package was returned by Windows".into()
+}
+
+fn desktop_info_from_records(records: Vec<AppxRecord>) -> Result<DesktopAppInfo, String> {
     let record = select_preferred_record(records)?;
     if record.install_location.as_os_str().is_empty() {
         return Err("APPX_DISCOVERY_INVALID: package has no install location".into());
     }
     let product = desktop_product(&record.package_name)?;
-    let (install_location, executable, discovery_source) = resolve_appx_executable(&record)?;
+    let (install_location, executable, application) = resolve_appx_executable(&record, product)?;
     Ok(DesktopAppInfo {
         product,
         package_name: record.package_name,
         package_version: record.package_version,
         architecture: metadata_or_unknown(record.architecture),
-        discovery_source,
+        discovery_source: DesktopDiscoverySource::AppxManifest,
+        target_kind: DesktopTargetKind::RegisteredPackage(application),
         install_location,
         executable,
     })
@@ -267,7 +325,8 @@ fn desktop_product(package_name: &str) -> Result<DesktopProduct, String> {
 
 fn resolve_appx_executable(
     record: &AppxRecord,
-) -> Result<(PathBuf, PathBuf, DesktopDiscoverySource), String> {
+    product: DesktopProduct,
+) -> Result<(PathBuf, PathBuf, PackageApplication), String> {
     let install_location = fs::canonicalize(&record.install_location).map_err(|error| {
         format!(
             "APPX_INSTALL_LOCATION_INVALID: cannot canonicalize {}: {error}",
@@ -275,38 +334,100 @@ fn resolve_appx_executable(
         )
     })?;
 
-    if let Some(manifest_executable) = record.manifest_executable.as_deref() {
-        let candidate = manifest_executable_path(&install_location, manifest_executable)?;
-        if candidate.is_file() {
-            let executable = canonicalize_existing(&candidate)?;
-            ensure_within_install_location(&install_location, &executable)?;
-            return Ok((
-                install_location,
-                executable,
-                DesktopDiscoverySource::AppxManifest,
-            ));
-        }
+    let application = select_package_application(record, product)?;
+    let candidate = manifest_executable_path(&install_location, &application.manifest_executable)?;
+    if !candidate.is_file() {
+        return Err(format!(
+            "CODEX_EXECUTABLE_MISSING: selected APPX application executable does not exist: {}",
+            candidate.display()
+        ));
     }
-
-    let executable = [
-        install_location.join("app").join("ChatGPT.exe"),
-        install_location.join("app").join("Codex.exe"),
-    ]
-    .into_iter()
-    .find(|path| path.is_file())
-    .ok_or_else(|| {
-        format!(
-            "CODEX_EXECUTABLE_MISSING: neither the APPX manifest executable nor app\\ChatGPT.exe/app\\Codex.exe exists under {}",
-            install_location.display()
-        )
-    })?;
+    let executable = candidate;
     let executable = canonicalize_existing(&executable)?;
     ensure_within_install_location(&install_location, &executable)?;
-    Ok((
-        install_location,
-        executable,
-        DesktopDiscoverySource::KnownExecutableFallback,
-    ))
+    Ok((install_location, executable, application))
+}
+
+fn select_package_application(
+    record: &AppxRecord,
+    product: DesktopProduct,
+) -> Result<PackageApplication, String> {
+    let package_full_name = required_metadata(&record.package_full_name, "PackageFullName")?;
+    let package_family_name = required_metadata(&record.package_family_name, "PackageFamilyName")?;
+    let candidates: Vec<_> = record
+        .applications
+        .iter()
+        .filter(|application| match product {
+            DesktopProduct::ChatGpt => {
+                application.application_id == "App"
+                    && manifest_path_matches(&application.manifest_executable, "app/ChatGPT.exe")
+            }
+            DesktopProduct::ChatGptClassic => {
+                package_runtime_kind(application) == PackageRuntimeKind::FullTrustDesktop
+                    && manifest_file_name_is(&application.manifest_executable, "ChatGPT.exe")
+            }
+            DesktopProduct::ExecutableOverride => false,
+        })
+        .collect();
+    let [application] = candidates.as_slice() else {
+        return if candidates.is_empty() {
+            Err(format!(
+                "APPX_APPLICATION_MISSING: no trusted Desktop application was found in {}",
+                record.package_name
+            ))
+        } else {
+            Err(format!(
+                "APPX_APPLICATION_AMBIGUOUS: multiple trusted Desktop applications were found in {}",
+                record.package_name
+            ))
+        };
+    };
+    let application_id = required_metadata(&application.application_id, "Application.Id")?;
+    let manifest_executable =
+        required_metadata(&application.manifest_executable, "Application.Executable")?;
+    Ok(PackageApplication {
+        app_user_model_id: format!("{package_family_name}!{application_id}"),
+        package_full_name,
+        package_family_name,
+        application_id,
+        manifest_executable,
+        runtime_kind: package_runtime_kind(application),
+    })
+}
+
+fn required_metadata(value: &str, field: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        Err(format!("APPX_METADATA_INCOMPLETE: {field} is missing"))
+    } else {
+        Ok(value.into())
+    }
+}
+
+fn package_runtime_kind(application: &AppxApplicationRecord) -> PackageRuntimeKind {
+    if application
+        .entry_point
+        .eq_ignore_ascii_case("Windows.FullTrustApplication")
+    {
+        PackageRuntimeKind::FullTrustDesktop
+    } else if application.entry_point.trim().is_empty()
+        && application.runtime_behavior.trim().is_empty()
+        && application.trust_level.trim().is_empty()
+    {
+        PackageRuntimeKind::Unknown
+    } else {
+        PackageRuntimeKind::AppContainer
+    }
+}
+
+fn manifest_path_matches(value: &str, expected: &str) -> bool {
+    value.replace('\\', "/").eq_ignore_ascii_case(expected)
+}
+
+fn manifest_file_name_is(value: &str, expected: &str) -> bool {
+    Path::new(value)
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case(expected))
 }
 
 fn manifest_executable_path(install_location: &Path, executable: &str) -> Result<PathBuf, String> {
@@ -353,8 +474,48 @@ fn metadata_or_unknown(value: String) -> String {
     }
 }
 
-fn info_from_override(path: &Path) -> Result<DesktopAppInfo, String> {
+#[cfg(windows)]
+fn info_from_override(path: &Path, records: Vec<AppxRecord>) -> Result<DesktopAppInfo, String> {
     let executable = canonicalize_existing(path)?;
+    for record in records {
+        let product = match desktop_product(&record.package_name) {
+            Ok(product) => product,
+            Err(_) => continue,
+        };
+        let Ok(candidate_install_location) = fs::canonicalize(&record.install_location) else {
+            continue;
+        };
+        if !executable.starts_with(&candidate_install_location) {
+            continue;
+        }
+        let (install_location, registered_executable, application) =
+            resolve_appx_executable(&record, product)?;
+        if executable == registered_executable {
+            return Ok(DesktopAppInfo {
+                product,
+                package_name: record.package_name,
+                package_version: record.package_version,
+                architecture: metadata_or_unknown(record.architecture),
+                discovery_source: DesktopDiscoverySource::ExecutableOverride,
+                target_kind: DesktopTargetKind::RegisteredPackage(application),
+                install_location,
+                executable,
+            });
+        }
+        return Err(format!(
+            "APPX_OVERRIDE_INVALID: configured executable is inside registered package {} but is not its selected Desktop application",
+            record.package_name
+        ));
+    }
+    info_from_unpacked_override_canonical(executable)
+}
+
+#[cfg(not(windows))]
+fn info_from_unpacked_override(path: &Path) -> Result<DesktopAppInfo, String> {
+    info_from_unpacked_override_canonical(canonicalize_existing(path)?)
+}
+
+fn info_from_unpacked_override_canonical(executable: PathBuf) -> Result<DesktopAppInfo, String> {
     let install_location = executable
         .parent()
         .unwrap_or_else(|| Path::new(""))
@@ -365,6 +526,7 @@ fn info_from_override(path: &Path) -> Result<DesktopAppInfo, String> {
         package_version: "manual".into(),
         architecture: "manual".into(),
         discovery_source: DesktopDiscoverySource::ExecutableOverride,
+        target_kind: DesktopTargetKind::UnpackagedExecutable,
         install_location,
         executable,
     })
@@ -410,9 +572,16 @@ mod tests {
         let root = temp_install();
         let input = serde_json::json!({
             "package_name": "OpenAI.ChatGPT-Desktop",
+            "package_full_name": "OpenAI.ChatGPT-Desktop_1.2.3.4_x64__fixture",
+            "package_family_name": "OpenAI.ChatGPT-Desktop_fixture",
             "package_version": "1.2.3.4",
             "architecture": "X64",
             "install_location": root,
+            "applications": [{
+                "application_id": "Desktop",
+                "manifest_executable": "app/ChatGPT.exe",
+                "entry_point": "Windows.FullTrustApplication"
+            }]
         })
         .to_string();
         let result = parse_appx_json(&input).unwrap();
@@ -421,9 +590,97 @@ mod tests {
         assert_eq!(result.architecture, "X64");
         assert_eq!(
             result.discovery_source,
-            DesktopDiscoverySource::KnownExecutableFallback
+            DesktopDiscoverySource::AppxManifest
         );
         fs::remove_dir_all(result.install_location).unwrap();
+    }
+
+    #[test]
+    fn rejects_ambiguous_classic_desktop_entries() {
+        let root = temp_install();
+        fs::write(root.join("app").join("ChatGPT-copy.exe"), b"test").unwrap();
+        let input = serde_json::json!({
+            "package_name": "OpenAI.ChatGPT-Desktop",
+            "package_full_name": "OpenAI.ChatGPT-Desktop_1.0.0.0_x64__fixture",
+            "package_family_name": "OpenAI.ChatGPT-Desktop_fixture",
+            "package_version": "1.0.0.0",
+            "architecture": "X64",
+            "install_location": root.clone(),
+            "applications": [
+                {"application_id": "One", "manifest_executable": "app/ChatGPT.exe", "entry_point": "Windows.FullTrustApplication"},
+                {"application_id": "Two", "manifest_executable": "other/ChatGPT.exe", "entry_point": "Windows.FullTrustApplication"}
+            ]
+        })
+        .to_string();
+        let error = parse_appx_json(&input).unwrap_err();
+        assert!(error.contains("APPX_APPLICATION_AMBIGUOUS"), "{error}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rejects_missing_registered_identity_metadata() {
+        let root = temp_install();
+        let input = serde_json::json!({
+            "package_name": "OpenAI.Codex",
+            "package_version": "1.0.0.0",
+            "architecture": "X64",
+            "install_location": root.clone(),
+            "applications": [{
+                "application_id": "App",
+                "manifest_executable": "app/ChatGPT.exe",
+                "entry_point": "Windows.FullTrustApplication"
+            }]
+        })
+        .to_string();
+        let error = parse_appx_json(&input).unwrap_err();
+        assert!(error.contains("APPX_METADATA_INCOMPLETE"), "{error}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn override_matching_the_registered_primary_entry_remains_packaged() {
+        let root = temp_install();
+        let executable = root.join("app").join("ChatGPT.exe");
+        let info = info_from_override(
+            &executable,
+            vec![AppxRecord {
+                package_name: "OpenAI.Codex".into(),
+                package_full_name: "OpenAI.Codex_1.0.0.0_x64__fixture".into(),
+                package_family_name: "OpenAI.Codex_fixture".into(),
+                package_version: "1.0.0.0".into(),
+                architecture: "X64".into(),
+                install_location: root.clone(),
+                applications: vec![AppxApplicationRecord {
+                    application_id: "App".into(),
+                    manifest_executable: "app/ChatGPT.exe".into(),
+                    entry_point: "Windows.FullTrustApplication".into(),
+                    runtime_behavior: String::new(),
+                    trust_level: String::new(),
+                }],
+            }],
+        )
+        .unwrap();
+        assert!(matches!(
+            info.target_kind,
+            DesktopTargetKind::RegisteredPackage(_)
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn empty_successful_discovery_allows_a_native_override() {
+        let root = temp_install();
+        let executable = root.join("app").join("ChatGPT.exe");
+        let info = desktop_info_from_discovery_output("", &executable).unwrap();
+        assert_eq!(info.target_kind, DesktopTargetKind::UnpackagedExecutable);
+        assert_eq!(
+            info.discovery_source,
+            DesktopDiscoverySource::ExecutableOverride
+        );
+        assert_eq!(info.executable, fs::canonicalize(&executable).unwrap());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -433,15 +690,29 @@ mod tests {
         let input = serde_json::json!([
             {
                 "package_name": "OpenAI.ChatGPT-Desktop",
+                "package_full_name": "OpenAI.ChatGPT-Desktop_99.0.0.0_x64__fixture",
+                "package_family_name": "OpenAI.ChatGPT-Desktop_fixture",
                 "package_version": "99.0.0.0",
                 "architecture": "X64",
                 "install_location": classic.clone(),
+                "applications": [{
+                    "application_id": "Classic",
+                    "manifest_executable": "app/ChatGPT.exe",
+                    "entry_point": "Windows.FullTrustApplication"
+                }]
             },
             {
                 "package_name": "OpenAI.Codex",
+                "package_full_name": "OpenAI.Codex_1.0.0.0_arm64__fixture",
+                "package_family_name": "OpenAI.Codex_fixture",
                 "package_version": "1.0.0.0",
                 "architecture": "Arm64",
                 "install_location": current,
+                "applications": [{
+                    "application_id": "App",
+                    "manifest_executable": "app/ChatGPT.exe",
+                    "entry_point": "Windows.FullTrustApplication"
+                }]
             }
         ])
         .to_string();
@@ -459,18 +730,40 @@ mod tests {
         fs::write(root.join("app").join("Codex.exe"), b"test").unwrap();
         let input = serde_json::json!({
             "package_name": "OpenAI.Codex",
+            "package_full_name": "OpenAI.Codex_26.727.6591.0_x64__fixture",
+            "package_family_name": "OpenAI.Codex_fixture",
             "package_version": "26.727.6591.0",
             "architecture": "X64",
             "install_location": root.clone(),
-            "manifest_executable": "app/Codex.exe",
+            "applications": [
+                {
+                    "application_id": "App",
+                    "manifest_executable": "app/ChatGPT.exe",
+                    "entry_point": "Windows.FullTrustApplication"
+                },
+                {
+                    "application_id": "CodexCoreCommandRunner",
+                    "manifest_executable": "app/resources/codex-command-runner.exe",
+                    "entry_point": "Windows.FullTrustApplication"
+                }
+            ]
         })
         .to_string();
         let result = parse_appx_json(&input).unwrap();
         assert_eq!(result.product, DesktopProduct::ChatGpt);
-        assert!(result.executable.ends_with("app/Codex.exe"));
+        assert!(result.executable.ends_with("app/ChatGPT.exe"));
         assert_eq!(
             result.discovery_source,
             DesktopDiscoverySource::AppxManifest
+        );
+        let DesktopTargetKind::RegisteredPackage(application) = result.target_kind else {
+            panic!("manifest discovery must retain registered package identity");
+        };
+        assert_eq!(application.application_id, "App");
+        assert_eq!(application.app_user_model_id, "OpenAI.Codex_fixture!App");
+        assert_eq!(
+            application.runtime_kind,
+            PackageRuntimeKind::FullTrustDesktop
         );
         fs::remove_dir_all(result.install_location).unwrap();
     }
@@ -478,15 +771,7 @@ mod tests {
     #[test]
     fn rejects_manifest_paths_outside_the_install_location() {
         let root = temp_install();
-        let input = serde_json::json!({
-            "package_name": "OpenAI.Codex",
-            "package_version": "26.727.6591.0",
-            "architecture": "X64",
-            "install_location": root,
-            "manifest_executable": "../outside.exe",
-        })
-        .to_string();
-        let error = parse_appx_json(&input).unwrap_err();
+        let error = manifest_executable_path(&root, "../outside.exe").unwrap_err();
         assert!(error.contains("APPX_EXECUTABLE_INVALID"));
         fs::remove_dir_all(root).unwrap();
     }

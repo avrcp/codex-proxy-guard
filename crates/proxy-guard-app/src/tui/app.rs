@@ -109,6 +109,13 @@ fn key_to_intent(state: &AppState, key: KeyEvent) -> Option<UserIntent> {
             _ => None,
         };
     }
+    if state.package_context_prompt {
+        return match key.code {
+            KeyCode::Char('y' | 'Y') => Some(UserIntent::ConfirmPackageContextLaunch),
+            KeyCode::Char('n' | 'N') | KeyCode::Esc => Some(UserIntent::CancelPackageContextLaunch),
+            _ => None,
+        };
+    }
     if state.proxy_editor.is_some() {
         return proxy_editor_intent(state, key);
     }
@@ -124,6 +131,7 @@ fn key_to_intent(state: &AppState, key: KeyEvent) -> Option<UserIntent> {
     }
     match key.code {
         KeyCode::Enter | KeyCode::Char('l' | 'L') => Some(UserIntent::Launch),
+        KeyCode::Char('p' | 'P') => Some(UserIntent::RequestPackageContextLaunch),
         KeyCode::Char('d' | 'D') => Some(UserIntent::RequestDaemonRepairLaunch),
         KeyCode::Char('r' | 'R') => Some(UserIntent::Refresh),
         KeyCode::Char('c' | 'C') => Some(UserIntent::EditProxy),
@@ -246,6 +254,25 @@ mod tests {
         assert_eq!(
             handle_intent_key(&normal, KeyCode::Enter),
             Some(UserIntent::Launch)
+        );
+    }
+
+    #[test]
+    fn package_context_confirmation_is_modal() {
+        let mut state = AppState::new(GuardConfig::default(), "config.toml".into());
+        assert_eq!(
+            handle_intent_key(&state, KeyCode::Char('p')),
+            Some(UserIntent::RequestPackageContextLaunch)
+        );
+        state.package_context_prompt = true;
+        assert_eq!(handle_intent_key(&state, KeyCode::Enter), None);
+        assert_eq!(
+            handle_intent_key(&state, KeyCode::Char('y')),
+            Some(UserIntent::ConfirmPackageContextLaunch)
+        );
+        assert_eq!(
+            handle_intent_key(&state, KeyCode::Esc),
+            Some(UserIntent::CancelPackageContextLaunch)
         );
     }
 

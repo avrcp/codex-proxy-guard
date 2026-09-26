@@ -17,6 +17,39 @@ fn reduce_intent(state: &mut AppState, intent: UserIntent) -> Vec<AppEffect> {
         return vec![AppEffect::Shutdown];
     }
 
+    if state.package_context_prompt {
+        match intent {
+            UserIntent::ConfirmPackageContextLaunch => {
+                state.package_context_prompt = false;
+                if state.config_readiness != ConfigReadiness::Ready {
+                    state.status_message =
+                        "Configuration must be repaired before launch (press C)".into();
+                    return Vec::new();
+                }
+                if state.foreground.is_some() {
+                    state.status_message = "A launch operation is already in progress".into();
+                    return Vec::new();
+                }
+                state.foreground = Some(ForegroundOperation::Launch);
+                state.launch = LaunchState::Launching;
+                state.status_message = "Launching the package-context candidate…".into();
+                return vec![AppEffect::LaunchDesktop(LaunchOptions {
+                    refresh_codex_daemon: false,
+                    package_context_compat: true,
+                })];
+            }
+            UserIntent::CancelPackageContextLaunch => {
+                state.package_context_prompt = false;
+                state.status_message = "Package-context launch cancelled".into();
+                return Vec::new();
+            }
+            UserIntent::Refresh | UserIntent::EditProxy => {
+                state.package_context_prompt = false;
+            }
+            _ => return Vec::new(),
+        }
+    }
+
     // The repair confirmation is modal: only Y / N / Esc act on it, and refresh
     // or proxy editing simply closes it. Y authorizes exactly one launch.
     if state.daemon_repair_prompt {
@@ -34,11 +67,17 @@ fn reduce_intent(state: &mut AppState, intent: UserIntent) -> Vec<AppEffect> {
                 }
                 state.foreground = Some(ForegroundOperation::Launch);
                 state.launch = LaunchState::Launching;
+                let package_context_compat = matches!(
+                    &state.desktop_app,
+                    DesktopAppDiscovery::Found(info)
+                        if matches!(info.target_kind, crate::DesktopTargetKind::RegisteredPackage(_))
+                );
                 state.status_message =
                     "Stopping the shared Codex background server, then launching… (you can cancel)"
                         .into();
                 return vec![AppEffect::LaunchDesktop(LaunchOptions {
                     refresh_codex_daemon: true,
+                    package_context_compat,
                 })];
             }
             UserIntent::CancelDaemonRepairLaunch => {
@@ -53,6 +92,9 @@ fn reduce_intent(state: &mut AppState, intent: UserIntent) -> Vec<AppEffect> {
                 state.daemon_repair_prompt = false;
             }
             UserIntent::Launch
+            | UserIntent::RequestPackageContextLaunch
+            | UserIntent::ConfirmPackageContextLaunch
+            | UserIntent::CancelPackageContextLaunch
             | UserIntent::UpdateProxyField { .. }
             | UserIntent::ToggleProxyField
             | UserIntent::SaveProxy
@@ -120,6 +162,9 @@ fn reduce_intent(state: &mut AppState, intent: UserIntent) -> Vec<AppEffect> {
                 return vec![AppEffect::SaveConfig(updated)];
             }
             UserIntent::Launch
+            | UserIntent::RequestPackageContextLaunch
+            | UserIntent::ConfirmPackageContextLaunch
+            | UserIntent::CancelPackageContextLaunch
             | UserIntent::RequestDaemonRepairLaunch
             | UserIntent::ConfirmDaemonRepairLaunch
             | UserIntent::CancelDaemonRepairLaunch
@@ -150,7 +195,9 @@ fn reduce_intent(state: &mut AppState, intent: UserIntent) -> Vec<AppEffect> {
     if state.config_readiness != ConfigReadiness::Ready
         && matches!(
             intent,
-            UserIntent::Launch | UserIntent::RequestDaemonRepairLaunch
+            UserIntent::Launch
+                | UserIntent::RequestPackageContextLaunch
+                | UserIntent::RequestDaemonRepairLaunch
         )
     {
         state.status_message = "Configuration must be repaired before launch (press C)".into();
@@ -172,6 +219,11 @@ fn reduce_intent(state: &mut AppState, intent: UserIntent) -> Vec<AppEffect> {
             state.status_message = "Launching Desktop with the proxy environment…".into();
             vec![AppEffect::LaunchDesktop(LaunchOptions::default())]
         }
+        UserIntent::RequestPackageContextLaunch => {
+            state.package_context_prompt = true;
+            state.status_message = "Confirm the package-context candidate launch".into();
+            Vec::new()
+        }
         UserIntent::RequestDaemonRepairLaunch => {
             state.daemon_repair_prompt = true;
             state.status_message = "Confirm the shared-daemon repair launch".into();
@@ -188,11 +240,14 @@ fn reduce_intent(state: &mut AppState, intent: UserIntent) -> Vec<AppEffect> {
         | UserIntent::ToggleProxyField
         | UserIntent::SaveProxy
         | UserIntent::CancelProxyEdit
-        | UserIntent::ConfirmDaemonRepairLaunch
-        | UserIntent::CancelDaemonRepairLaunch
         | UserIntent::ToggleHelp
         | UserIntent::Dismiss
         | UserIntent::Quit => unreachable!(),
+        // A stale confirmation may arrive after its modal was consumed.
+        UserIntent::ConfirmDaemonRepairLaunch
+        | UserIntent::CancelDaemonRepairLaunch
+        | UserIntent::ConfirmPackageContextLaunch
+        | UserIntent::CancelPackageContextLaunch => Vec::new(),
     }
 }
 
@@ -214,9 +269,17 @@ fn reduce_result(state: &mut AppState, result: TaskResult) -> Vec<AppEffect> {
             state.desktop_process = process;
             match desktop_app {
                 Ok(info) => {
-                    state.desktop_app = DesktopAppDiscovery::Found(info);
+                    let packaged = matches!(
+                        &info.target_kind,
+                        crate::DesktopTargetKind::RegisteredPackage(_)
+                    );
+                    state.desktop_app = DesktopAppDiscovery::Found(Box::new(info));
                     state.status_message = match state.desktop_process {
                         DesktopProcessState::Running { .. } => "Desktop is already running".into(),
+                        _ if packaged => {
+                            "Registered Desktop: press P for the one-shot candidate; Enter blocks"
+                                .into()
+                        }
                         _ => "Ready to launch through the configured proxy".into(),
                     };
                 }
@@ -234,7 +297,7 @@ fn reduce_result(state: &mut AppState, result: TaskResult) -> Vec<AppEffect> {
             state.foreground = None;
             match result {
                 Ok((info, receipt)) => {
-                    state.desktop_app = DesktopAppDiscovery::Found(info);
+                    state.desktop_app = DesktopAppDiscovery::Found(Box::new(info));
                     state.desktop_process = DesktopProcessState::Running { pid: receipt.pid };
                     state.status_message = launch_status_message(&receipt);
                     state.launch = LaunchState::Running(receipt);
@@ -271,14 +334,18 @@ fn reduce_result(state: &mut AppState, result: TaskResult) -> Vec<AppEffect> {
     Vec::new()
 }
 
-/// Reports only what Guard actually observed: a Desktop process was created
-/// with the proxy environment, and — for the explicit repair path — that the
-/// shared daemon was stopped. It never claims the network path was verified.
+/// Reports only the creation and identity facts observed by Guard.
 fn launch_status_message(receipt: &LaunchReceipt) -> String {
-    let base = format!(
-        "Desktop process created with the proxy environment (PID {})",
-        receipt.pid
-    );
+    let base = match receipt.package_identity {
+        crate::PackageIdentityObservation::Verified => format!(
+            "Desktop created; package identity verified; proxy environment supplied (PID {})",
+            receipt.pid
+        ),
+        crate::PackageIdentityObservation::NotApplicable => format!(
+            "Desktop process created with the proxy environment (PID {})",
+            receipt.pid
+        ),
+    };
     match receipt.daemon_preparation.status_detail() {
         "" => base,
         detail => format!("{base}; {detail}"),
@@ -341,10 +408,91 @@ mod tests {
                 AppAction::Intent(UserIntent::ConfirmDaemonRepairLaunch)
             ),
             vec![AppEffect::LaunchDesktop(LaunchOptions {
-                refresh_codex_daemon: true
+                refresh_codex_daemon: true,
+                package_context_compat: false,
             })]
         );
         assert!(!state.daemon_repair_prompt);
+    }
+
+    #[test]
+    fn package_context_candidate_requires_single_use_confirmation() {
+        let mut state = state();
+        assert!(
+            reduce(
+                &mut state,
+                AppAction::Intent(UserIntent::RequestPackageContextLaunch)
+            )
+            .is_empty()
+        );
+        assert!(state.package_context_prompt);
+        assert!(reduce(&mut state, AppAction::Intent(UserIntent::Launch)).is_empty());
+        assert!(
+            reduce(
+                &mut state,
+                AppAction::Intent(UserIntent::CancelPackageContextLaunch)
+            )
+            .is_empty()
+        );
+        assert!(!state.package_context_prompt);
+        assert!(
+            reduce(
+                &mut state,
+                AppAction::Intent(UserIntent::ConfirmPackageContextLaunch)
+            )
+            .is_empty()
+        );
+        reduce(
+            &mut state,
+            AppAction::Intent(UserIntent::RequestPackageContextLaunch),
+        );
+        assert_eq!(
+            reduce(
+                &mut state,
+                AppAction::Intent(UserIntent::ConfirmPackageContextLaunch)
+            ),
+            vec![AppEffect::LaunchDesktop(LaunchOptions {
+                refresh_codex_daemon: false,
+                package_context_compat: true,
+            })]
+        );
+        assert!(!state.package_context_prompt);
+    }
+
+    #[test]
+    fn registered_package_repair_confirmation_includes_package_context_choice() {
+        let mut state = state();
+        state.desktop_app = DesktopAppDiscovery::Found(Box::new(crate::DesktopAppInfo {
+            product: DesktopProduct::ChatGpt,
+            package_name: "OpenAI.Codex".into(),
+            package_version: "1".into(),
+            architecture: "X64".into(),
+            discovery_source: DesktopDiscoverySource::AppxManifest,
+            target_kind: crate::DesktopTargetKind::RegisteredPackage(crate::PackageApplication {
+                package_full_name: "OpenAI.Codex_1_x64__test".into(),
+                package_family_name: "OpenAI.Codex_test".into(),
+                application_id: "App".into(),
+                app_user_model_id: "OpenAI.Codex_test!App".into(),
+                manifest_executable: "app/ChatGPT.exe".into(),
+                runtime_kind: crate::PackageRuntimeKind::FullTrustDesktop,
+            }),
+            install_location: PathBuf::from("app"),
+            executable: PathBuf::from("app/ChatGPT.exe"),
+        }));
+        reduce(
+            &mut state,
+            AppAction::Intent(UserIntent::RequestDaemonRepairLaunch),
+        );
+        assert_eq!(
+            reduce(
+                &mut state,
+                AppAction::Intent(UserIntent::ConfirmDaemonRepairLaunch)
+            ),
+            vec![AppEffect::LaunchDesktop(LaunchOptions {
+                refresh_codex_daemon: true,
+                package_context_compat: true,
+            })]
+        );
     }
 
     #[test]
@@ -416,6 +564,7 @@ mod tests {
             package_version: "1".into(),
             architecture: "X64".into(),
             discovery_source: DesktopDiscoverySource::AppxManifest,
+            target_kind: crate::DesktopTargetKind::UnpackagedExecutable,
             install_location: PathBuf::from("app"),
             executable: PathBuf::from("app/Codex.exe"),
         };
@@ -423,6 +572,8 @@ mod tests {
             pid: 42,
             proxy_endpoint: "http://127.0.0.1:10808".into(),
             daemon_preparation: DaemonPreparation::Skipped,
+            launch_method: crate::LaunchMethod::NativeProcess,
+            package_identity: crate::PackageIdentityObservation::NotApplicable,
             desktop: DesktopLaunchInfo::from(&info),
         };
         assert!(
@@ -448,6 +599,7 @@ mod tests {
             package_version: "1".into(),
             architecture: "X64".into(),
             discovery_source: DesktopDiscoverySource::AppxManifest,
+            target_kind: crate::DesktopTargetKind::UnpackagedExecutable,
             install_location: PathBuf::from("app"),
             executable: PathBuf::from("app/Codex.exe"),
         };
@@ -455,6 +607,8 @@ mod tests {
             pid: 42,
             proxy_endpoint: "http://127.0.0.1:10808".into(),
             daemon_preparation: DaemonPreparation::NotNeeded,
+            launch_method: crate::LaunchMethod::NativeProcess,
+            package_identity: crate::PackageIdentityObservation::NotApplicable,
             desktop: DesktopLaunchInfo::from(&info),
         };
         assert!(
@@ -473,6 +627,8 @@ mod tests {
             pid: 7,
             proxy_endpoint: "http://127.0.0.1:10808".into(),
             daemon_preparation: preparation,
+            launch_method: crate::LaunchMethod::NativeProcess,
+            package_identity: crate::PackageIdentityObservation::NotApplicable,
             desktop: DesktopLaunchInfo {
                 product: DesktopProduct::ChatGpt,
                 package_name: "OpenAI.Codex".into(),

@@ -9,8 +9,8 @@ use std::{
 };
 
 use proxy_guard_core::{
-    DaemonPreparation, DesktopAppInfo, DesktopDiscoverySource, DesktopProduct, GuardConfig,
-    LaunchOptions,
+    DaemonPreparation, DesktopAppInfo, DesktopDiscoverySource, DesktopProduct, DesktopTargetKind,
+    GuardConfig, LaunchOptions, PackageApplication, PackageRuntimeKind,
 };
 use proxy_guard_windows::{
     CodexCli, DaemonStopBudget, LaunchHooks, launch_codex_with, stop_codex_daemon,
@@ -47,6 +47,7 @@ fn desktop_info(executable: &Path) -> DesktopAppInfo {
         package_version: "test".into(),
         architecture: "test".into(),
         discovery_source: DesktopDiscoverySource::ExecutableOverride,
+        target_kind: DesktopTargetKind::UnpackagedExecutable,
         install_location: executable.parent().unwrap().to_path_buf(),
         executable: executable.to_path_buf(),
     }
@@ -150,6 +151,46 @@ async fn normal_launch_never_invokes_the_codex_cli() {
 }
 
 #[tokio::test]
+async fn registered_package_without_one_shot_backend_never_spawns_or_stops_daemon() {
+    let root = temp_dir("package-preflight");
+    let stop_marker = root.join("stop-invoked");
+    let desktop_marker = root.join("desktop-spawned");
+    with_fixture_env(
+        &desktop_marker,
+        &[("FAKE_CLI_TOUCH", stop_marker.to_str().unwrap())],
+        async {
+            let config = config_with_cli_override(&fake_cli_exe());
+            let mut info = desktop_info(&fake_cli_exe());
+            info.target_kind = DesktopTargetKind::RegisteredPackage(PackageApplication {
+                package_full_name: "Fixture_1.0.0.0_x64__test".into(),
+                package_family_name: "Fixture_test".into(),
+                application_id: "App".into(),
+                app_user_model_id: "Fixture_test!App".into(),
+                manifest_executable: "app/ChatGPT.exe".into(),
+                runtime_kind: PackageRuntimeKind::FullTrustDesktop,
+            });
+            let error = launch_codex_with(
+                &info,
+                &config,
+                LaunchOptions {
+                    refresh_codex_daemon: true,
+                    package_context_compat: false,
+                },
+                &CancellationToken::new(),
+                &launch_hooks(&real_resolver),
+            )
+            .await
+            .unwrap_err();
+            assert!(error.contains("APPX_PROXY_LAUNCH_UNSUPPORTED"), "{error}");
+            assert!(!stop_marker.exists());
+            assert!(!desktop_marker.exists());
+        },
+    )
+    .await;
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
 async fn repair_launch_stops_the_daemon_once_then_launches() {
     let root = temp_dir("a2-stopped");
     let stop_marker = root.join("stop-invoked");
@@ -168,6 +209,7 @@ async fn repair_launch_stops_the_daemon_once_then_launches() {
                 &config,
                 LaunchOptions {
                     refresh_codex_daemon: true,
+                    package_context_compat: false,
                 },
                 &CancellationToken::new(),
                 &launch_hooks(&real_resolver),
@@ -198,6 +240,7 @@ async fn repair_launch_maps_not_running_to_not_needed() {
                 &config,
                 LaunchOptions {
                     refresh_codex_daemon: true,
+                    package_context_compat: false,
                 },
                 &CancellationToken::new(),
                 &launch_hooks(&real_resolver),
@@ -224,6 +267,7 @@ async fn repair_blocks_when_no_cli_is_available() {
             &config,
             LaunchOptions {
                 refresh_codex_daemon: true,
+                package_context_compat: false,
             },
             &CancellationToken::new(),
             &launch_hooks(&|_config| Ok(None)),
@@ -249,6 +293,7 @@ async fn repair_blocks_on_invalid_override_without_fallback() {
             &config,
             LaunchOptions {
                 refresh_codex_daemon: true,
+                package_context_compat: false,
             },
             &CancellationToken::new(),
             &launch_hooks(&real_resolver),
@@ -280,6 +325,7 @@ async fn repair_blocks_on_unsupported_daemon_command() {
                 &config,
                 LaunchOptions {
                     refresh_codex_daemon: true,
+                    package_context_compat: false,
                 },
                 &CancellationToken::new(),
                 &launch_hooks(&real_resolver),
@@ -309,6 +355,7 @@ async fn repair_blocks_on_unknown_or_running_status() {
                 &config,
                 LaunchOptions {
                     refresh_codex_daemon: true,
+                    package_context_compat: false,
                 },
                 &CancellationToken::new(),
                 &launch_hooks(&real_resolver),
@@ -340,6 +387,7 @@ async fn cancelled_token_blocks_before_any_spawn_or_stop() {
                 LaunchOptions::default(),
                 LaunchOptions {
                     refresh_codex_daemon: true,
+                    package_context_compat: false,
                 },
             ] {
                 let error = launch_codex_with(
@@ -384,6 +432,7 @@ async fn cancel_during_stop_reports_unconfirmed_state_and_never_spawns() {
                     &config,
                     LaunchOptions {
                         refresh_codex_daemon: true,
+                        package_context_compat: false,
                     },
                     &token,
                     &launch_hooks(&real_resolver),

@@ -8,14 +8,15 @@ use std::{
 };
 
 use proxy_guard_core::{
-    DaemonPreparation, DesktopAppInfo, DesktopProcessState, GuardConfig, LaunchOptions,
-    LaunchReceipt,
+    DaemonPreparation, DesktopAppInfo, DesktopProcessState, DesktopTargetKind, GuardConfig,
+    LaunchOptions, LaunchReceipt, PackageRuntimeKind,
 };
 use sysinfo::System;
 use tokio_util::sync::CancellationToken;
 
 use crate::codex_daemon::{CodexCli, DaemonStopBudget, resolve_codex_cli, stop_codex_daemon};
 use crate::environment::{apply_proxy_environment, proxy_environment};
+use crate::packaged_launch::launch_packaged;
 
 struct StartupLock {
     _file: File,
@@ -189,7 +190,9 @@ pub async fn launch_codex_with(
 
     // The repair path always refuses an already-running Desktop; a normal
     // launch may allow it only when explicitly configured.
-    let refuse_if_running = options.refresh_codex_daemon || config.codex.refuse_if_running;
+    let refuse_if_running = matches!(&info.target_kind, DesktopTargetKind::RegisteredPackage(_))
+        || options.refresh_codex_daemon
+        || config.codex.refuse_if_running;
     if refuse_if_running {
         match desktop_process_state(info) {
             DesktopProcessState::Running { .. } => {
@@ -212,6 +215,34 @@ pub async fn launch_codex_with(
             "CODEX_EXECUTABLE_MISSING: {} no longer exists; refresh and retry",
             info.executable.display()
         ));
+    }
+
+    // Reject an unsupported packaged launch before the optional daemon stop.
+    // A registered Desktop must never fall through to a naked EXE spawn.
+    match &info.target_kind {
+        DesktopTargetKind::RegisteredPackage(package) => {
+            if package.runtime_kind != PackageRuntimeKind::FullTrustDesktop
+                || package.package_full_name.is_empty()
+                || package.package_family_name.is_empty()
+                || package.application_id.is_empty()
+                || package.manifest_executable.is_empty()
+                || package.app_user_model_id
+                    != format!("{}!{}", package.package_family_name, package.application_id)
+            {
+                return Err("APPX_METADATA_INCOMPLETE: registered Desktop package has no verified FullTrust application identity".into());
+            }
+            if !options.package_context_compat {
+                return Err("APPX_PROXY_LAUNCH_UNSUPPORTED: registered Desktop requires an identity-preserving proxy launch; the package-context candidate is available only with explicit one-shot selection and still requires real Desktop acceptance".into());
+            }
+            let current = crate::appx::discover_desktop_app(config, None, cancellation).await?;
+            if current.target_kind != info.target_kind || current.executable != info.executable {
+                return Err("APPX_PACKAGE_CHANGED: Desktop package changed before launch; refresh and retry".into());
+            }
+        }
+        DesktopTargetKind::UnpackagedExecutable if options.package_context_compat => {
+            return Err("APPX_PROXY_LAUNCH_UNSUPPORTED: package-context launch requires a registered Desktop application".into());
+        }
+        DesktopTargetKind::UnpackagedExecutable => {}
     }
 
     let mut pinned_home = None;
@@ -265,33 +296,82 @@ pub async fn launch_codex_with(
         DaemonPreparation::Skipped
     };
 
+    if matches!(&info.target_kind, DesktopTargetKind::RegisteredPackage(_)) {
+        if options.refresh_codex_daemon {
+            let current = crate::appx::discover_desktop_app(config, None, cancellation).await?;
+            if current.target_kind != info.target_kind || current.executable != info.executable {
+                return Err("APPX_PACKAGE_CHANGED: Desktop package changed during preparation; refresh and retry".into());
+            }
+        }
+        if !matches!(desktop_process_state(info), DesktopProcessState::Stopped) {
+            return Err("CODEX_ALREADY_RUNNING: Desktop appeared before package launch; no second instance was started".into());
+        }
+    }
+
     // Final cancellation checkpoint. No `await` is allowed between here and
-    // the synchronous Desktop spawn below.
+    // the native spawn; the packaged backend owns its later permit boundary.
     if cancellation.is_cancelled() {
         return Err("LAUNCH_CANCELLED: Guard is shutting down".into());
     }
     let environment = proxy_environment(config);
-    let mut command = Command::new(&info.executable);
-    apply_proxy_environment(&mut command, &environment);
-    if let Some(home) = &pinned_home {
-        // Keep the Desktop and the stop helper on the same explicit Home scope.
-        command.env("CODEX_HOME", home);
-    }
-    let child = command.spawn().map_err(|error| match daemon_preparation {
-        DaemonPreparation::Stopped => format!(
-            "CODEX_LAUNCH_FAILED: Desktop could not be started: {error}; note: the shared \
-                 Codex background server was stopped before this failure"
-        ),
-        _ => format!("CODEX_LAUNCH_FAILED: Desktop could not be started: {error}"),
-    })?;
-    lock.mark_spawned();
+    let (pid, launch_method, package_identity) = match &info.target_kind {
+        DesktopTargetKind::RegisteredPackage(package) => {
+            // The backend owns its own cancellation/permit boundary. Mark the
+            // anti-race window before entering it: an outcome-unknown result
+            // must not invite an immediate duplicate launch.
+            lock.mark_spawned();
+            let pid = launch_packaged(
+                info,
+                package,
+                &environment,
+                pinned_home.as_deref(),
+                cancellation,
+            )
+            .await
+            .map_err(|error| daemon_failure_context(error, daemon_preparation))?;
+            (
+                pid,
+                proxy_guard_core::LaunchMethod::PackagedContextCompat,
+                proxy_guard_core::PackageIdentityObservation::Verified,
+            )
+        }
+        DesktopTargetKind::UnpackagedExecutable => {
+            let mut command = Command::new(&info.executable);
+            apply_proxy_environment(&mut command, &environment);
+            if let Some(home) = &pinned_home {
+                command.env("CODEX_HOME", home);
+            }
+            let child = command.spawn().map_err(|error| {
+                daemon_failure_context(
+                    format!("CODEX_LAUNCH_FAILED: Desktop could not be started: {error}"),
+                    daemon_preparation,
+                )
+            })?;
+            lock.mark_spawned();
+            (
+                child.id(),
+                proxy_guard_core::LaunchMethod::NativeProcess,
+                proxy_guard_core::PackageIdentityObservation::NotApplicable,
+            )
+        }
+    };
 
     Ok(LaunchReceipt {
-        pid: child.id(),
+        pid,
         proxy_endpoint: environment.proxy_url,
         daemon_preparation,
         desktop: info.into(),
+        launch_method,
+        package_identity,
     })
+}
+
+fn daemon_failure_context(error: String, preparation: DaemonPreparation) -> String {
+    if preparation == DaemonPreparation::Stopped {
+        format!("{error}; note: the shared Codex background server was stopped before this failure")
+    } else {
+        error
+    }
 }
 
 fn now_unix_ms() -> u64 {

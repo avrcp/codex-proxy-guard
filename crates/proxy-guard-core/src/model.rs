@@ -34,15 +34,47 @@ impl DesktopProduct {
 #[serde(rename_all = "snake_case")]
 pub enum DesktopDiscoverySource {
     AppxManifest,
-    KnownExecutableFallback,
     ExecutableOverride,
+}
+
+/// Whether a launch target is a registered Windows package application or an
+/// ordinary executable. A path beneath WindowsApps alone is not sufficient to
+/// recreate the application's package identity; registered targets retain the
+/// exact application metadata Windows registered for that package.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DesktopTargetKind {
+    RegisteredPackage(PackageApplication),
+    UnpackagedExecutable,
+}
+
+/// Runtime classification obtained from the registered manifest. Unknown is
+/// intentional: omitted manifest evidence must not be treated as FullTrust.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PackageRuntimeKind {
+    FullTrustDesktop,
+    AppContainer,
+    Unknown,
+}
+
+/// Stable identity of the exact registered package application selected for a
+/// Desktop launch. `manifest_executable` preserves the original relative text
+/// rather than deriving identity from a canonicalized filesystem path.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct PackageApplication {
+    pub package_full_name: String,
+    pub package_family_name: String,
+    pub application_id: String,
+    pub app_user_model_id: String,
+    pub manifest_executable: String,
+    pub runtime_kind: PackageRuntimeKind,
 }
 
 impl DesktopDiscoverySource {
     pub const fn display_name(self) -> &'static str {
         match self {
             Self::AppxManifest => "APPX manifest",
-            Self::KnownExecutableFallback => "known APPX executable",
             Self::ExecutableOverride => "configuration override",
         }
     }
@@ -55,6 +87,7 @@ pub struct DesktopAppInfo {
     pub package_version: String,
     pub architecture: String,
     pub discovery_source: DesktopDiscoverySource,
+    pub target_kind: DesktopTargetKind,
     pub install_location: PathBuf,
     pub executable: PathBuf,
 }
@@ -85,7 +118,7 @@ pub enum DesktopAppDiscovery {
     #[default]
     Unknown,
     Searching,
-    Found(DesktopAppInfo),
+    Found(Box<DesktopAppInfo>),
     NotFound(String),
 }
 
@@ -124,11 +157,25 @@ impl DaemonPreparation {
     }
 }
 
-/// Single-use launch intent; never persisted to configuration. Carries the
-/// user's one-shot authorization for the daemon repair step.
+/// Single-use launch intent; never persisted to configuration.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LaunchOptions {
     pub refresh_codex_daemon: bool,
+    pub package_context_compat: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LaunchMethod {
+    NativeProcess,
+    PackagedContextCompat,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PackageIdentityObservation {
+    NotApplicable,
+    Verified,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -136,6 +183,8 @@ pub struct LaunchReceipt {
     pub pid: u32,
     pub proxy_endpoint: String,
     pub daemon_preparation: DaemonPreparation,
+    pub launch_method: LaunchMethod,
+    pub package_identity: PackageIdentityObservation,
     pub desktop: DesktopLaunchInfo,
 }
 
@@ -180,6 +229,7 @@ pub struct AppState {
     pub launch: LaunchState,
     pub foreground: Option<ForegroundOperation>,
     pub daemon_repair_prompt: bool,
+    pub package_context_prompt: bool,
     pub status_message: String,
     pub error_message: Option<String>,
     pub show_help: bool,
@@ -209,6 +259,7 @@ impl AppState {
             launch: LaunchState::Idle,
             foreground: None,
             daemon_repair_prompt: false,
+            package_context_prompt: false,
             status_message: "Ready to launch through the configured proxy".into(),
             error_message: None,
             show_help: false,
@@ -228,6 +279,8 @@ mod tests {
             pid: 42,
             proxy_endpoint: "http://127.0.0.1:10808".into(),
             daemon_preparation: DaemonPreparation::Stopped,
+            launch_method: LaunchMethod::PackagedContextCompat,
+            package_identity: PackageIdentityObservation::Verified,
             desktop: DesktopLaunchInfo {
                 product: DesktopProduct::ChatGpt,
                 package_name: "OpenAI.Codex".into(),
@@ -241,6 +294,8 @@ mod tests {
         assert_eq!(value["desktop"]["architecture"], "X64");
         assert_eq!(value["desktop"]["discovery_source"], "appx_manifest");
         assert_eq!(value["daemon_preparation"], "stopped");
+        assert_eq!(value["launch_method"], "packaged_context_compat");
+        assert_eq!(value["package_identity"], "verified");
         assert_eq!(
             DaemonPreparation::Skipped.status_detail(),
             "",

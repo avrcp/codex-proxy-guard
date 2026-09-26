@@ -12,7 +12,7 @@ Codex Proxy Guard 是一个单一职责的 Windows 启动器：使用用户配�
 
 - 只接受 `localhost`、`127.0.0.0/8` 或 `::1` 上的 HTTP 代理；
 - 自动发现当前 ChatGPT Desktop，并在其不存在时回退到 ChatGPT Classic；
-- 支持显式可执行文件 override；
+- 支持显式可执行文件 override；包内 override 仍按已注册包处理；
 - 启动前确认 Desktop 根进程没有运行；
 - 拒绝在管理员权限的 Guard（或权限查询失败）中启动；
 - 普通启动不解析 Codex CLI、不执行任何 daemon 命令；
@@ -21,6 +21,7 @@ Codex Proxy Guard 是一个单一职责的 Windows 启动器：使用用户配�
 - 清除新进程树中的 `ALL_PROXY` / `all_proxy`；
 - 使用跨 Guard 实例的启动锁，避免并发启动竞态；
 - Guard 退出不终止 Desktop。
+- 已注册包必须核验实际目标进程的精确程序包身份；包上下文候选只可单次显式选择。
 
 明确不包含：
 
@@ -50,7 +51,8 @@ cargo build --release -p codex-proxy-guard
 
 | 按键 | 行为 |
 | --- | --- |
-| `Enter` / `L` | 通过配置的代理启动 Desktop（不触碰共享服务） |
+| `Enter` / `L` | 普通启动；已注册包在真实 Desktop 验收前明确阻断，不裸启动包内 EXE |
+| `P` | 单次确认后尝试包上下文候选；需按验收文档检查真实 Desktop 与沙箱 |
 | `D` | 修复启动：确认后先停止共享 Codex 后台服务再启动（`Y` 确认 / `N`、`Esc` 取消） |
 | `R` | 刷新 Desktop 发现与运行状态 |
 | `?` | 查看帮助 |
@@ -61,20 +63,31 @@ cargo build --release -p codex-proxy-guard
 ```powershell
 codex-proxy-guard launch
 codex-proxy-guard launch --json
+codex-proxy-guard launch --package-context-compat
 codex-proxy-guard launch --refresh-codex-daemon
+codex-proxy-guard launch --refresh-codex-daemon --package-context-compat
 codex-proxy-guard config-path
 ```
 
 `launch --json` 的回执除了 PID 与代理端点外，还会包含所选应用的产品类型、包名、版本、
-架构、发现来源，以及本次启动的 daemon 准备结果（`skipped` / `stopped` / `not_needed`）；
+架构、发现来源、启动方法、包身份查询结果，以及本次启动的 daemon 准备结果（`skipped` /
+`stopped` / `not_needed`）；
 不会输出本地安装路径或认证信息。回执只陈述 Guard 观测到的事实（进程已创建、环境已传入、
-共享服务已停止）；不表示已验证联网或新 daemon 已继承代理。
+共享服务已停止）；不表示已验证界面、联网、沙箱或新 daemon 已继承代理。
 
 ## 普通启动与显式修复启动
 
-**普通启动（默认，`Enter` / `launch`）**：只做 配置校验 → 权限检查 → 发现 Desktop →
-启动锁 → 确认未运行 → 注入进程级代理环境 → 启动。它不解析 Codex CLI、不执行任何
-daemon 命令、不依赖 CLI 已安装，对共享后台服务零副作用。
+**普通启动（默认，`Enter` / `launch`）**：配置校验 → 权限检查 → 发现 Desktop →
+启动锁 → 确认未运行。普通非打包 override 在创建处注入代理环境；已注册包因尚未完成
+真实 Desktop 验收而返回 `APPX_PROXY_LAUNCH_UNSUPPORTED`，不把包内 EXE 当普通程序裸启动。
+普通路径不解析 Codex CLI、不执行 daemon 命令。
+
+**包上下文候选（`P`+`Y` 或 `launch --package-context-compat`）**：仅针对已注册的
+FullTrust Desktop。Guard 使用 Windows 的 `Invoke-CommandInDesktopPackage` 调试工具启动
+同一 EXE 的短命 helper；helper 在最终创建目标处设置代理环境，并查询实际目标进程的
+精确 PackageFullName。该方法和正常应用激活的 token 行为不同，真实 Desktop 的界面、
+后端、沙箱与代理业务尚未验收；不能把测试程序通过当作用户故障已修复。完整状态见
+[包身份验收记录](docs/PACKAGE_IDENTITY_ACCEPTANCE.md)。
 
 **显式修复启动（`D` 键确认后 `Y`，或 `launch --refresh-codex-daemon`）**：Codex 0.157+
 的常驻共享 daemon 保留其启动时继承的环境变量，已运行的旧 daemon 不会因新 Desktop
@@ -86,6 +99,10 @@ Codex 自行创建新的 daemon。
 它绝不在普通启动中隐式执行：CLI 入口每次调用都要带 `--refresh-codex-daemon`，TUI 中
 `D` 之后必须再按 `Y` 单次确认（默认取消）。修复路径中 stop 失败、超时（总预算 720 秒，
 期间可随时取消）或输出无法识别都会阻止本次启动，不会悄悄降级为普通启动。
+
+对 TUI 中已发现的注册包，`D` 的确认页也明确提示会使用尚未验收的包上下文候选；CLI
+若需要同时做共享服务修复和包启动，必须同时给两个标志。本次包身份弹窗本身不需要
+先停止 daemon；不要把 `D` 当成程序包身份修复步骤。
 
 Guard 不启动、不重启、不更新、不监控 daemon，不连接其私有 IPC。唯一例外是 Guard 自己
 创建的短命 CLI 子进程：超时或取消时会被终止并回收。注意：stop 成功也不保证新 daemon
@@ -117,8 +134,9 @@ Guard 首选当前 ChatGPT Desktop（现有 Codex 用户更新后得到的统一
 winget install --id 9PLM9XGG6VKS -s msstore
 ```
 
-自动发现读取每个已知 APPX 包的清单入口，并要求入口解析后仍位于该包的安装目录内；仅在
-清单入口缺失或不存在时才使用受控的 `app\ChatGPT.exe` / `app\Codex.exe` 后备路径。
+自动发现读取已注册包的 FullName、FamilyName 与 Application.Id，并选择可证明的桌面
+主入口；多个无法区分的入口会报错。入口解析后必须仍位于包安装目录内，缺失的清单
+入口不会退化为包内 EXE 路径猜测。
 
 ## 配置
 

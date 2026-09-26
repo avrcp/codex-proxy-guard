@@ -36,6 +36,31 @@ executable_override = "D:\\Path\\To\\ChatGPT.exe"
 现有 ChatGPT Desktop 进程无法事后继承新环境。请从系统托盘完全退出 ChatGPT，然后在
 Guard 中按 `R` 刷新并重新启动。Guard 不提供强制终止。
 
+## `APPX_PROXY_LAUNCH_UNSUPPORTED`
+
+已注册的 ChatGPT Desktop 需要包身份，而普通路径尚无经真实应用验收的身份加代理
+启动后端。Guard 会阻断裸 EXE 启动；这不是端口错误，也不应先按 `D` 停止共享服务。
+本轮提供单次包上下文候选：TUI 按 `P` 再按 `Y`，或 CLI 使用
+`launch --package-context-compat`。它使用 Windows 调试命令，真实 Desktop、网络和
+沙箱行为仍需按 [验收记录](PACKAGE_IDENTITY_ACCEPTANCE.md) 完成验证。
+
+## `APPX_METADATA_INCOMPLETE` / `APPX_APPLICATION_AMBIGUOUS`
+
+包注册元数据不足，或多个 Application 无法唯一确定桌面主入口。Guard 不会任选首个
+EXE。可用 `scripts/inspect-package-launch.ps1` 只读检查本机包与 Application；该脚本
+不会启动应用或读认证内容。不要把包目录、家庭目录等本机路径原样贴到公开报告。
+
+## `APPX_IDENTITY_MISSING` / `APPX_IDENTITY_MISMATCH` / `APPX_IDENTITY_QUERY_FAILED`
+
+分别表示实际目标进程没有包身份、身份与本轮所选包不一致、或 Windows 查询未能确认。
+即使进程曾被创建，这些结果都不是启动成功。不要自动再次启动，也不要以修改代理端口
+代替身份排查；记录错误码、目标 PID 与包版本后再定位。
+
+## `APPX_PACKAGE_LAUNCH_OUTCOME_UNKNOWN` / `APPX_LAUNCH_EARLY_EXIT_OR_UNQUERYABLE` / `APPX_TARGET_VERIFY_FAILED`
+
+启动许可可能已经提交、目标在启动期退出，或目标句柄查询失败。Guard 不会自动重复拉起或结束 Desktop。
+先查看目标应用是否仍在运行，再决定是否需要刷新和下一次显式启动。
+
 ## `LAUNCH_BUSY`
 
 另一 Guard 实例正在执行启动。等待其完成后重试；这是防止并发启动两个 Desktop 的
@@ -60,7 +85,8 @@ Guard 无法查询自身的权限状态（Win32 token 查询失败）。查询�
 ## 普通启动与修复启动的区别
 
 普通启动（`Enter` / `launch`）不解析 Codex CLI、不执行任何 daemon 命令：它对共享
-后台服务零副作用，也不会因为本机没有 Codex CLI 而失败。只有你显式授权的修复启动
+后台服务零副作用，也不会因为本机没有 Codex CLI 而失败。它仍会对未经验收的已注册
+包明确阻断。只有你显式授权的修复启动
 （TUI 按 `D` 再按 `Y`，或 `launch --refresh-codex-daemon`）才会执行
 `codex app-server daemon stop`——该命令可能中断同一 Codex Home 下其他 CLI / IDE /
 远程客户端正在执行的任务，因此必须逐次确认，授权不会保存。
@@ -70,7 +96,7 @@ Guard 无法查询自身的权限状态（Win32 token 查询失败）。查询�
 显式修复启动找不到可用的官方 Codex CLI，或配置的 override / `CODEX_HOME` 无效。这些
 错误不会静默降级为普通启动。
 
-- 未安装 CLI：可先普通启动；如确需刷新共享服务，请安装官方 Codex CLI 后重试；
+- 未安装 CLI：普通路径不需要 CLI；包身份阻断需按上面的包启动说明处理；
 - override 无效：`codex.cli_executable_override` 必须是现存绝对路径的 native
     `codex.exe`（不支持 `.cmd`/`.ps1` shim）；
 - 显式 `CODEX_HOME` 必须是现存目录；未设置时使用用户目录下的默认 `.codex`。
@@ -78,7 +104,7 @@ Guard 无法查询自身的权限状态（Win32 token 查询失败）。查询�
 ## `CODEX_DAEMON_UNSUPPORTED`
 
 已解析的 Codex CLI 不支持 `app-server daemon` 生命周期命令（常见于较旧版本）。修复
-启动被阻止，但普通启动不受影响——直接按 `Enter` 即可按传统环境注入启动。
+启动被阻止；普通路径仍不会操作 daemon，但已注册包可能因包身份要求而阻断。
 
 ## `CODEX_DAEMON_STOP_FAILED`
 

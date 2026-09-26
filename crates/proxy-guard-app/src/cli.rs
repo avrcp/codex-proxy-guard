@@ -31,6 +31,17 @@ pub enum Command {
         /// same Codex Home.
         #[arg(long)]
         refresh_codex_daemon: bool,
+        /// One-shot package-context candidate for a registered FullTrust Desktop.
+        /// Its real Desktop and sandbox behavior still needs machine acceptance.
+        #[arg(long)]
+        package_context_compat: bool,
+    },
+    #[command(hide = true)]
+    PackageHelper {
+        #[arg(long, hide = true)]
+        pipe: String,
+        #[arg(long, hide = true)]
+        nonce: String,
     },
     /// Create the minimal configuration file.
     InitConfig {
@@ -61,7 +72,8 @@ mod tests {
                 .command,
             Some(Command::Launch {
                 json: true,
-                refresh_codex_daemon: false
+                refresh_codex_daemon: false,
+                package_context_compat: false,
             })
         ));
         assert!(matches!(
@@ -70,7 +82,17 @@ mod tests {
                 .command,
             Some(Command::Launch {
                 json: true,
-                refresh_codex_daemon: true
+                refresh_codex_daemon: true,
+                package_context_compat: false,
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["cpg", "launch", "--package-context-compat"])
+                .unwrap()
+                .command,
+            Some(Command::Launch {
+                package_context_compat: true,
+                ..
             })
         ));
         assert!(matches!(

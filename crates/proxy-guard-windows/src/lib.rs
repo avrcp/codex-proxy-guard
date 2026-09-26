@@ -2,7 +2,12 @@ pub mod appx;
 pub mod codex_daemon;
 pub mod elevation;
 pub mod environment;
+#[cfg(windows)]
+pub mod package_identity;
+pub mod packaged_launch;
 pub mod process;
+#[cfg(windows)]
+mod system_tools;
 
 pub use appx::discover_desktop_app;
 pub use codex_daemon::{

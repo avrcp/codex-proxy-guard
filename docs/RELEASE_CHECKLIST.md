@@ -19,8 +19,11 @@
 - [ ] 大小写代理环境变量被正确注入，`ALL_PROXY` 被移除。
 - [ ] 当前 ChatGPT Desktop、ChatGPT Classic 与显式 override 发现均可用；两者并存时优先当前应用。
 - [ ] APPX 清单入口被优先使用，且解析路径不能逃逸安装目录；APPX 查询使用系统目录 PowerShell 绝对路径。
+- [ ] FullName、FamilyName、Application.Id、AUMID 来自同一注册快照；多 Application 不任选首个，包内 override 不降级成普通 EXE。
+- [ ] 已注册包普通启动明确阻断裸 EXE；包上下文候选只能单次选择，真实目标 PackageFullName 不符或查询失败不返回成功回执。
+- [ ] helper 管道单次授权、消息上限、取消提交边界和 helper 清理通过受控测试；未知结果不自动重试、不终止 Desktop。
 - [ ] TUI 与 `launch --json` 均显示产品类型、包名、版本、架构、发现来源与 `daemon_preparation`（skipped/stopped/not_needed），不输出安装路径或认证信息。
-- [ ] 普通启动：不解析 Codex CLI、不执行任何 daemon 命令；无 CLI 的机器可正常启动。
+- [ ] 普通启动：不解析 Codex CLI、不执行任何 daemon 命令；非打包 override 可正常启动；已注册包依身份验收状态阻断。
 - [ ] 修复启动：TUI `D`+`Y` 或 `launch --refresh-codex-daemon` 单次授权；取消确认（Esc/N）严格零调用；授权不持久化。
 - [ ] 修复路径错误均阻断且可行动（CLI 不可用 / override 无效 / Home 无效 / 命令不支持 / stop 失败或超时），不静默降级为普通启动。
 - [ ] 修复 stop 输出协议：超限/非法 UTF-8/多 JSON/未知状态一律失败；`stopped`/`notRunning` 才继续；总预算可注入测试。
@@ -33,6 +36,13 @@
 - [ ] README、架构、安全与排障文档与实现一致。
 
 ## Windows 手工验收
+
+当前候选的 A/B/C 与真实 Desktop 代理业务结果记录在 [包身份验收表](PACKAGE_IDENTITY_ACCEPTANCE.md)。
+标为 `NOT RUN` 的项目不能因编译、fixture 或 portable smoke 通过而勾选。
+
+- [ ] 同一包版本下 A 正常注册入口、B 旧 Guard、C 包上下文候选依次验证目标 PID、精确 PackageFullName、弹窗和界面行为。
+- [ ] 候选方式以两个实际可用代理端口完成真实 ChatGPT/Codex 请求，并运行无破坏性的本地 Codex 任务验证沙箱。
+- [ ] Guard 退出后 Desktop 仍运行；普通 Enter 不停止共享服务；包更新、带空格/中文路径的发行 EXE 完成 smoke。
 
 - [ ] Windows 10 与 Windows 11 各完成一次 portable 双击启动。
 - [ ] Microsoft Store 当前 ChatGPT Desktop、ChatGPT Classic（如安装）与带空格路径的 override 均可启动。

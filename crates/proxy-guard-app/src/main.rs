@@ -17,6 +17,14 @@ use tokio_util::sync::CancellationToken;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    if let Some(Command::PackageHelper { pipe, nonce }) = &cli.command {
+        // This hidden, one-shot path runs before user configuration, the TUI,
+        // and all daemon code. The Windows adapter validates its package
+        // context and accepts only the bounded launch protocol.
+        return proxy_guard_windows::packaged_launch::run_package_helper(pipe, nonce)
+            .await
+            .map_err(|error| anyhow::anyhow!(redact_text(&error)));
+    }
     let config_path = cli.config.unwrap_or(GuardConfig::config_path()?);
 
     match cli.command {
@@ -32,11 +40,13 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Launch {
             json,
             refresh_codex_daemon,
+            package_context_compat,
         }) => {
             let (config, _) = GuardConfig::load_or_create(&config_path)
                 .with_context(|| format!("load configuration {}", config_path.display()))?;
             let options = LaunchOptions {
                 refresh_codex_daemon,
+                package_context_compat,
             };
             let (_, receipt) = launch_command(&config, options).await?;
             if json {
@@ -54,6 +64,7 @@ async fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
+        Some(Command::PackageHelper { .. }) => unreachable!("handled before configuration"),
         None => tui::run(with_elevation_hint(tui_state(&config_path))).await,
     }
 }

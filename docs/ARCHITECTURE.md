@@ -138,12 +138,22 @@ Codex CLI 与 Desktop 是独立产品；修复路径的对象是“已解析 Cod
 
 ## APPX 发现与环境
 
-优先使用 `codex.executable_override`，PowerShell 查询固定使用系统目录下 Windows
+`codex.executable_override` 会与已注册包比对；PowerShell 查询固定使用系统目录下 Windows
 PowerShell 的绝对路径（不解析 PATH，不接受工作目录同名文件），超时 15 秒、输出上限
 64/128 KiB。发现阶段只从同一产品内选择最高版本；选择阶段固定优先当前 ChatGPT Desktop，
 Classic 仅作后备。Rust 端校验包名，要求清单入口为相对路径，并在 canonicalize 后仍位于
-安装目录内（该 containment 校验与路径身份比较是两回事，不互相替代）。清单入口不存在
-时才尝试受控的 `app\ChatGPT.exe` 与 `app\Codex.exe` 后备路径。
+安装目录内（该 containment 校验与路径身份比较是两回事，不互相替代）。发现保留
+PackageFullName、FamilyName、Application.Id 和 AUMID；当前包只选已核对的 `App` /
+`app\ChatGPT.exe`，Classic 必须有唯一 FullTrust 桌面入口。缺失或歧义会阻断，不猜测
+后备 EXE。位于已注册包内的 override 仍保留包目标类型。
+
+普通已注册包启动在本轮真实 Desktop 验收前返回 `APPX_PROXY_LAUNCH_UNSUPPORTED`，避免
+无身份的裸 EXE 被当作成功。单次显式包上下文候选从 TUI `P`+`Y` 或 CLI
+`--package-context-compat` 进入。Guard 用随机一次性命名管道和短命同 EXE helper；helper
+通过 Windows 调试命令进入已选 FullTrust Application 上下文，在最终 Desktop 创建处
+覆盖代理环境。Guard 校验 helper 和目标的精确包身份与 EXE；结果未知时不自动重试，
+也不杀 Desktop。`-PreventBreakaway` 在受控测试程序中保留子进程身份，真实 Desktop/
+沙箱行为仍按 [验收记录](PACKAGE_IDENTITY_ACCEPTANCE.md) 标为未执行。
 
 进程身份比较把普通路径与 extended-length（`\\?\C:\...`、`\\?\UNC\server\share\...`）
 写法规范化后做 ASCII 忽略大小写比较，等价写法不漏检、别处同名 exe 不误认；无法读取

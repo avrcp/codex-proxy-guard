@@ -177,11 +177,12 @@ impl GuardConfig {
                 "proxy.no_proxy must contain 1 to 32 entries".into(),
             ));
         }
-        if self
-            .proxy
-            .no_proxy
-            .iter()
-            .any(|value| value.len() > 255 || value.contains(['\r', '\n']))
+        if self.proxy.no_proxy.iter().any(|value| {
+            value.is_empty()
+                || value != value.trim()
+                || value.len() > 255
+                || value.contains(['\r', '\n', '\0'])
+        }) || self.no_proxy_value().len() > 4096
         {
             return Err(GuardError::Config(
                 "proxy.no_proxy contains an invalid entry".into(),
@@ -309,6 +310,25 @@ mod tests {
         config.proxy.host = "LOCALHOST".into();
         assert!(config.validate().is_ok());
         assert_eq!(config.proxy_url(), "http://LOCALHOST:10808");
+    }
+
+    #[test]
+    fn no_proxy_validation_matches_package_helper_limit() {
+        let mut config = GuardConfig::default();
+        for value in ["", " ", " example.com", "example.com ", "a\0b"] {
+            config.proxy.no_proxy = vec![value.into()];
+            assert!(
+                config.validate().is_err(),
+                "entry {value:?} must be rejected"
+            );
+        }
+        config.proxy.no_proxy = vec!["a".repeat(255); 32];
+        assert!(
+            config.validate().is_err(),
+            "joined value exceeds 4096 bytes"
+        );
+        config.proxy.no_proxy = vec!["localhost".into()];
+        assert!(config.validate().is_ok());
     }
 
     #[test]

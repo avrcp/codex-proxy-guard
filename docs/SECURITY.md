@@ -14,6 +14,21 @@
 - 所有外部错误在 TUI/CLI 展示前脱敏；
 - Guard 退出只取消自身工作，不终止外部进程。
 
+## 程序包身份边界
+
+已注册 Desktop 不能以包目录内裸 EXE 的创建成功充当启动成功。普通 Enter/L 对尚未
+验收的打包后端返回 `APPX_PROXY_LAUNCH_UNSUPPORTED`。只有 TUI `P`+`Y` 或 CLI
+`--package-context-compat` 的本次选择才能使用包上下文候选；选择不写入配置。
+该路线使用 Windows 的 `Invoke-CommandInDesktopPackage` 调试命令，仅限已确认的
+FullTrust 桌面 Application。其 token 与正常激活不同，真实应用和沙箱尚未验收。
+
+Guard 查询 OS 分配给**实际目标进程**的 PackageFullName，并与本轮注册元数据精确
+比较；无身份、版本不匹配和查询失败分别报告。一次性本地命名管道有随机 nonce、
+有界消息和对端 PID/路径/包身份校验。helper 只接收已注册目标、loopback HTTP 代理
+和本轮允许的 Home 作用域；它不是 Codex 私有 IPC、通用命令执行器或常驻服务。
+启动许可发出后结果未知时，不自动重试，不终止 Desktop。只清理 Guard 自己的短命
+PowerShell/helper 进程。
+
 ## Codex daemon 兼容边界
 
 普通启动对共享 daemon 零副作用：不解析 Codex CLI、不执行任何 daemon 命令、不依赖 CLI
@@ -64,7 +79,8 @@ Guard 不以管理员身份启动 Desktop：Codex 0.157+ 的共享后台服务�
 配置文件由当前用户控制，但仍必须通过 loopback HTTP 校验；host 的校验与 URL 构造使用
 同一规则。APPX 与 override 路径在启动前必须是现存普通文件；APPX 查询固定使用系统目录
 下 Windows PowerShell 的绝对路径。APPX 清单入口必须是安装目录内的相对路径，
-canonicalize 后不得逃逸至安装目录外；清单缺失时仅使用固定的受控后备可执行文件名。
+canonicalize 后不得逃逸至安装目录外；清单缺失或多入口歧义时阻断，不以文件名猜测
+后备程序。
 `cli_executable_override` 只在指向现存绝对路径 `.exe` 时生效，失效报错而不换源；CLI 与
 Desktop 的身份比较采用一致的 Windows 路径规范化（普通与 extended-length 写法等价），
 名称相似但路径不可读的候选报告 Unknown 而不是“未运行”。Desktop “已运行”只由与已发现
