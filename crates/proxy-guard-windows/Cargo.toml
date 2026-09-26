@@ -13,6 +13,9 @@ sysinfo.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }
+
 [[bin]]
 name = "child-env-probe"
 path = "src/bin/child-env-probe.rs"

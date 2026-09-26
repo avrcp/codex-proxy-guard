@@ -1,7 +1,8 @@
 # Codex Proxy Guard
 
-Codex Proxy Guard 是一个单一职责的 Windows 启动器：为新启动的 ChatGPT Desktop
-（Chat、Work 和 Codex）进程树注入 loopback HTTP 代理环境。
+Codex Proxy Guard 是一个单一职责的 Windows 启动器：使用用户配置的本机 HTTP/Mixed 代理
+启动 ChatGPT Desktop（Chat、Work 和 Codex），并在必要时通过 Codex 官方生命周期命令刷新
+旧后台 daemon，确保新的代理环境真正生效。
 
 它不修改 Windows 系统代理，不读取认证信息，不检测代理质量，也不管理 v2rayN。
 
@@ -13,6 +14,8 @@ Codex Proxy Guard 是一个单一职责的 Windows 启动器：为新启动的 C
 - 自动发现当前 ChatGPT Desktop，并在其不存在时回退到 ChatGPT Classic；
 - 支持显式可执行文件 override；
 - 启动前确认 Desktop 根进程没有运行；
+- 拒绝在管理员权限的 Guard 中启动（Codex 0.157+ 后台服务要求非提升进程）；
+- 启动前通过官方 `codex app-server daemon stop` 清理持有旧环境的后台 daemon；
 - 注入大小写两套 `HTTP_PROXY`、`HTTPS_PROXY` 和 `NO_PROXY`；
 - 清除新进程树中的 `ALL_PROXY` / `all_proxy`；
 - 使用跨 Guard 实例的启动锁，避免并发启动竞态；
@@ -24,6 +27,7 @@ Codex Proxy Guard 是一个单一职责的 Windows 启动器：为新启动的 C
 - Node Readiness、Usage 查询、历史与导出；
 - `codex doctor` 或日志扫描；
 - v2rayN 发现、启动、切换节点或进程管理；
+- 启动、重启、更新或监控 Codex daemon，连接 app-server 私有 IPC，或直接终止 Codex 进程；
 - 强制终止 Desktop；
 - 系统代理、TUN、WFP、WinDivert、Hook、Relay 或 TLS 解密。
 
@@ -58,7 +62,30 @@ codex-proxy-guard config-path
 ```
 
 `launch --json` 的回执除了 PID 与代理端点外，还会包含所选应用的产品类型、包名、版本、
-架构和发现来源；不会输出本地安装路径或认证信息。
+架构、发现来源，以及本次启动的 daemon 准备结果（`not_needed` / `stopped` /
+`lifecycle_unavailable`）；不会输出本地安装路径或认证信息。
+
+## Codex 0.157+ daemon 兼容
+
+Codex 0.157 起默认启用常驻后台 daemon，daemon 保留其启动时继承的环境变量；新打开的
+Desktop 进程无法改变已在运行的 daemon 的环境。因此在启动 Desktop 前，Guard 会先尝试：
+
+```text
+codex app-server daemon stop
+```
+
+由 Codex 官方 CLI 正常关闭旧 daemon；随后 Desktop 以注入的代理环境启动，并由 Codex
+自行创建新的 daemon。Guard 不启动、不重启、不监控 daemon，不连接其私有 IPC，也绝不
+直接终止 Codex 进程。
+
+CLI 解析顺序：`codex.cli_executable_override` → `%CODEX_HOME%\packages\app-server-daemon\current\bin\codex.exe`
+→ `%CODEX_HOME%\packages\standalone\current\bin\codex.exe`（默认 CODEX_HOME 为
+`%USERPROFILE%\.codex`）→ `where.exe codex.exe`。找不到 CLI 或旧版 Codex 不支持该命令时，
+Guard 不会阻止启动，仍按传统环境注入流程进行。
+
+另外，Codex 0.157+ 拒绝从提升（管理员）进程启动共享后台服务，因此 Guard 自身以管理员
+身份运行时会直接阻止 Launch（`ELEVATED_LAUNCH_UNSUPPORTED`）。请正常双击启动 Guard，
+不要“以管理员身份运行”。
 
 ## 支持的 ChatGPT Desktop 与安装
 
@@ -90,6 +117,7 @@ no_proxy = ["localhost", "127.0.0.1", "::1"]
 
 [codex]
 executable_override = ""
+cli_executable_override = ""
 refuse_if_running = true
 
 [tui]
@@ -97,6 +125,9 @@ alternate_screen = "auto"
 ```
 
 `10808` 只是首次生成配置的默认示例端口；请替换为实际代理软件的 HTTP/Mixed 端口。
+`executable_override` 指 ChatGPT Desktop 可执行文件；`cli_executable_override` 指官方
+Codex CLI 可执行文件（仅用于 daemon 生命周期命令，留空时自动解析）。`cli_executable_override`
+是 V2 schema 的可选扩展，已有的 V2 配置无需修改即可继续使用。
 
 这是唯一支持的配置结构：旧版配置不会迁移或忽略字段，而是会被拒绝。需要重置时执行
 `codex-proxy-guard init-config --force`。

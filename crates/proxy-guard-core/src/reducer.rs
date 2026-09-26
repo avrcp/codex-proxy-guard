@@ -1,6 +1,7 @@
 use crate::{
-    AppAction, AppEffect, AppState, DesktopAppDiscovery, DesktopProcessState, ForegroundOperation,
-    LaunchState, ProxyEditor, ProxyField, TaskResult, UserIntent, redact_text,
+    AppAction, AppEffect, AppState, DaemonPreparation, DesktopAppDiscovery, DesktopProcessState,
+    ForegroundOperation, LaunchReceipt, LaunchState, ProxyEditor, ProxyField, TaskResult,
+    UserIntent, redact_text,
 };
 
 pub fn reduce(state: &mut AppState, action: AppAction) -> Vec<AppEffect> {
@@ -160,7 +161,7 @@ fn reduce_result(state: &mut AppState, result: TaskResult) -> Vec<AppEffect> {
                 Ok((info, receipt)) => {
                     state.desktop_app = DesktopAppDiscovery::Found(info);
                     state.desktop_process = DesktopProcessState::Running { pid: receipt.pid };
-                    state.status_message = format!("Desktop launched (PID {})", receipt.pid);
+                    state.status_message = launch_status_message(&receipt);
                     state.launch = LaunchState::Running(receipt);
                 }
                 Err(message) => {
@@ -194,12 +195,29 @@ fn reduce_result(state: &mut AppState, result: TaskResult) -> Vec<AppEffect> {
     Vec::new()
 }
 
+fn launch_status_message(receipt: &LaunchReceipt) -> String {
+    let base = match receipt.daemon_preparation {
+        DaemonPreparation::LifecycleUnavailable => {
+            format!(
+                "Desktop launched with process-scoped proxy (PID {})",
+                receipt.pid
+            )
+        }
+        DaemonPreparation::NotNeeded | DaemonPreparation::Stopped => format!(
+            "Desktop launched through the configured proxy (PID {})",
+            receipt.pid
+        ),
+    };
+    match receipt.daemon_preparation.status_detail() {
+        "" => base,
+        detail => format!("{base}; {detail}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        DesktopDiscoverySource, DesktopLaunchInfo, DesktopProduct, GuardConfig, LaunchReceipt,
-    };
+    use crate::{DesktopDiscoverySource, DesktopLaunchInfo, DesktopProduct, GuardConfig};
     use std::path::PathBuf;
 
     fn state() -> AppState {
@@ -233,6 +251,7 @@ mod tests {
         let receipt = LaunchReceipt {
             pid: 42,
             proxy_endpoint: "http://127.0.0.1:10808".into(),
+            daemon_preparation: DaemonPreparation::NotNeeded,
             desktop: DesktopLaunchInfo::from(&info),
         };
         assert!(
@@ -245,6 +264,36 @@ mod tests {
         assert_eq!(
             state.desktop_process,
             DesktopProcessState::Running { pid: 42 }
+        );
+    }
+
+    #[test]
+    fn launch_status_reports_the_daemon_preparation_outcome() {
+        let receipt = |preparation| LaunchReceipt {
+            pid: 7,
+            proxy_endpoint: "http://127.0.0.1:10808".into(),
+            daemon_preparation: preparation,
+            desktop: DesktopLaunchInfo {
+                product: DesktopProduct::ChatGpt,
+                package_name: "OpenAI.Codex".into(),
+                package_version: "1".into(),
+                architecture: "X64".into(),
+                discovery_source: DesktopDiscoverySource::AppxManifest,
+            },
+        };
+        assert_eq!(
+            launch_status_message(&receipt(DaemonPreparation::NotNeeded)),
+            "Desktop launched through the configured proxy (PID 7)"
+        );
+        assert_eq!(
+            launch_status_message(&receipt(DaemonPreparation::Stopped)),
+            "Desktop launched through the configured proxy (PID 7); \
+             Codex background server was refreshed for the new proxy environment"
+        );
+        assert_eq!(
+            launch_status_message(&receipt(DaemonPreparation::LifecycleUnavailable)),
+            "Desktop launched with process-scoped proxy (PID 7); \
+             Codex daemon lifecycle API was not available"
         );
     }
 

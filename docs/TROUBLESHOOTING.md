@@ -41,6 +41,52 @@ Guard 中按 `R` 刷新并重新启动。Guard 不提供强制终止。
 另一 Guard 实例正在执行启动。等待其完成后重试；这是防止并发启动两个 Desktop 的
 安全锁。
 
+## `ELEVATED_LAUNCH_UNSUPPORTED`
+
+Guard 自身正在以管理员身份运行。Codex 0.157+ 的共享后台服务必须由非提升进程启动，
+因此 Guard 在提升运行时会直接阻止 Launch。
+
+请关闭当前的管理员实例，正常双击启动 Codex Proxy Guard。不要尝试用 UAC、降权或代理
+进程绕过；Guard 与 Codex 均不支持该用法。
+
+## `CODEX_DAEMON_STOP_FAILED`
+
+Guard 找到了官方 Codex CLI，但 `codex app-server daemon stop` 明确失败。此时可能存在
+持有旧代理环境的后台 daemon，Guard 不会在此状态下启动 Desktop。
+
+建议手动执行：
+
+```powershell
+codex app-server daemon stop
+```
+
+然后重新启动 Guard 并 Launch。若 CLI 反复失败，请确认安装的是官方 Codex CLI；必要时
+可用 `[codex] cli_executable_override` 指定其 `codex.exe` 的绝对路径。
+
+## `CODEX_DAEMON_STOP_TIMEOUT`
+
+Codex daemon 默认有 60 秒的 graceful shutdown 窗口，Guard 等待 75 秒后超时并只终止 CLI
+子进程（绝不直接杀 daemon）。本次 Launch 已被阻止。
+
+可手动执行并等待其完成：
+
+```powershell
+codex app-server daemon stop
+```
+
+确认关闭后重新启动 Guard 并 Launch。
+
+## 切换代理端口后 Codex 仍走旧代理
+
+Codex 0.157+ 的常驻 daemon 保留其启动时继承的环境变量，旧 daemon 存在时新 Desktop 的
+代理环境不会生效。Guard 会在启动前通过官方 `daemon stop` 刷新它：成功启动后如果流量
+仍走旧端口，先完全退出 Desktop，再手动执行 `codex app-server daemon stop`，然后通过
+Guard 重新启动。
+
+若 Launch 回执显示 `daemon_preparation` 为 `lifecycle_unavailable`，说明本机未找到官方
+Codex CLI（或版本早于 0.157）。此时 Guard 仍按传统环境注入启动；如受 stale daemon 影响，
+请安装或更新官方 Codex CLI 后重试。
+
 ## Desktop 启动后无法联网
 
 Guard 不检测代理可用性。请在代理软件中确认：

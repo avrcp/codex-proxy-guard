@@ -32,7 +32,12 @@ pub struct ProxyConfig {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct CodexConfig {
+    /// ChatGPT Desktop executable override.
     pub executable_override: PathBuf,
+    /// Official Codex CLI executable override used only for the public
+    /// `app-server daemon stop` lifecycle command. Empty means resolve from
+    /// CODEX_HOME packages and PATH.
+    pub cli_executable_override: PathBuf,
     pub refuse_if_running: bool,
 }
 
@@ -77,6 +82,7 @@ impl Default for CodexConfig {
     fn default() -> Self {
         Self {
             executable_override: PathBuf::new(),
+            cli_executable_override: PathBuf::new(),
             refuse_if_running: true,
         }
     }
@@ -231,6 +237,33 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("unknown field"));
+    }
+
+    #[test]
+    fn cli_override_is_an_optional_v2_extension() {
+        let config = GuardConfig::parse(
+            r#"
+                version = 2
+                [codex]
+                executable_override = ""
+                refuse_if_running = true
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.codex.cli_executable_override, PathBuf::new());
+
+        let config = GuardConfig::parse(
+            r#"
+                version = 2
+                [codex]
+                cli_executable_override = "D:\\Tools\\codex.exe"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.codex.cli_executable_override,
+            PathBuf::from(r"D:\Tools\codex.exe")
+        );
     }
 
     #[test]

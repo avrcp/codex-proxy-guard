@@ -99,10 +99,37 @@ pub enum DesktopProcessState {
     },
 }
 
+/// Outcome of the pre-launch Codex daemon compatibility step. The Guard never
+/// owns the daemon; it only discards a stale daemon environment through the
+/// public `codex app-server daemon stop` lifecycle command so the freshly
+/// launched Desktop starts a new daemon under the injected proxy environment.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DaemonPreparation {
+    /// No daemon was running; nothing had to be refreshed.
+    NotNeeded,
+    /// A running daemon was stopped through the official lifecycle command.
+    Stopped,
+    /// The Codex CLI or its daemon lifecycle API is unavailable (for example
+    /// Codex older than 0.157); Desktop launches with process-scoped proxy.
+    LifecycleUnavailable,
+}
+
+impl DaemonPreparation {
+    pub fn status_detail(self) -> &'static str {
+        match self {
+            Self::NotNeeded => "",
+            Self::Stopped => "Codex background server was refreshed for the new proxy environment",
+            Self::LifecycleUnavailable => "Codex daemon lifecycle API was not available",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct LaunchReceipt {
     pub pid: u32,
     pub proxy_endpoint: String,
+    pub daemon_preparation: DaemonPreparation,
     pub desktop: DesktopLaunchInfo,
 }
 
@@ -179,6 +206,7 @@ mod tests {
         let receipt = LaunchReceipt {
             pid: 42,
             proxy_endpoint: "http://127.0.0.1:10808".into(),
+            daemon_preparation: DaemonPreparation::Stopped,
             desktop: DesktopLaunchInfo {
                 product: DesktopProduct::ChatGpt,
                 package_name: "OpenAI.Codex".into(),
@@ -191,5 +219,10 @@ mod tests {
         assert_eq!(value["desktop"]["product"], "chat_gpt");
         assert_eq!(value["desktop"]["architecture"], "X64");
         assert_eq!(value["desktop"]["discovery_source"], "appx_manifest");
+        assert_eq!(value["daemon_preparation"], "stopped");
+        assert_eq!(
+            DaemonPreparation::LifecycleUnavailable.status_detail(),
+            "Codex daemon lifecycle API was not available"
+        );
     }
 }

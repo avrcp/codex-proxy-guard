@@ -19,8 +19,12 @@
 - [ ] 大小写代理环境变量被正确注入，`ALL_PROXY` 被移除。
 - [ ] 当前 ChatGPT Desktop、ChatGPT Classic 与显式 override 发现均可用；两者并存时优先当前应用。
 - [ ] APPX 清单入口被优先使用，且解析路径不能逃逸安装目录；仅在入口缺失时使用受控后备路径。
-- [ ] TUI 与 `launch --json` 均显示产品类型、包名、版本、架构和发现来源，不输出安装路径或认证信息。
+- [ ] TUI 与 `launch --json` 均显示产品类型、包名、版本、架构、发现来源与 `daemon_preparation`，不输出安装路径或认证信息。
 - [ ] 已运行的 Desktop 阻止再次启动；并发 Guard 启动锁有效。
+- [ ] 管理员运行的 Guard 被阻止 Launch（`ELEVATED_LAUNCH_UNSUPPORTED`），不自动 UAC。
+- [ ] 已存在 Codex daemon 时，启动前通过官方 `codex app-server daemon stop` 刷新；修改代理端口后下一次启动不复用旧 daemon 环境。
+- [ ] 未找到 Codex CLI 或旧版 Codex 不支持 daemon 命令时，按 `lifecycle_unavailable` 继续传统启动。
+- [ ] Guard 不执行 daemon start/restart/update/bootstrap，不连接 app-server 私有 IPC，不直接终止 Codex 进程，不写 `~/.codex` 配置。
 - [ ] Guard 退出不终止 Desktop。
 - [ ] 不存在网络探测、Usage、app-server、诊断持久化、进程终止或全流量代理入口。
 - [ ] README、架构、安全与排障文档与实现一致。
@@ -29,6 +33,10 @@
 
 - [ ] Windows 10 与 Windows 11 各完成一次 portable 双击启动。
 - [ ] Microsoft Store 当前 ChatGPT Desktop、ChatGPT Classic（如安装）与带空格路径的 override 均可启动。
+- [ ] 普通首次启动（Desktop 与 daemon 均未运行）正常。
+- [ ] 预先 `codex app-server daemon start` 后通过 Guard 启动：旧 daemon 被 stop，Desktop 启动后 `codex app-server daemon version` 重新显示 running。
+- [ ] 代理端口从 10808 改为 7890 后再次 Launch：新 daemon 继承 7890，不继续使用 10808。
+- [ ] “以管理员身份运行” Guard 后按 Launch：不启动 Desktop 并显示 `ELEVATED_LAUNCH_UNSUPPORTED`；正常双击启动后可正常 Launch。
 - [ ] 代理未运行时，Guard 仍只执行环境注入与 Desktop 启动。
 - [ ] 通过代理手工验证登录、Chat 流式输出、Work、Codex、文件上传和内置浏览器；失败时记录应用错误，Guard 不新增探测。
 - [ ] 在代理或安全网关环境中确认 HTTPS 与 WebSocket Upgrade 可用；ChatGPT Voice 不作为 HTTP 代理覆盖保证。

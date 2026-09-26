@@ -41,11 +41,26 @@ async fn main() -> anyhow::Result<()> {
                     receipt.proxy_endpoint,
                     receipt.pid
                 );
+                if !receipt.daemon_preparation.status_detail().is_empty() {
+                    println!("{}", receipt.daemon_preparation.status_detail());
+                }
             }
             Ok(())
         }
-        None => tui::run(tui_state(&config_path)).await,
+        None => tui::run(with_elevation_hint(tui_state(&config_path))).await,
     }
+}
+
+/// Shows the elevation block up front when Guard itself runs elevated. The
+/// launch pipeline enforces the same rule regardless of this hint; Guard never
+/// automates UAC or privilege tricks to work around Codex's requirement.
+fn with_elevation_hint(mut state: AppState) -> AppState {
+    if proxy_guard_windows::is_elevated() {
+        state.status_message = "Launch unavailable".into();
+        state.error_message =
+            Some(proxy_guard_windows::elevation::ELEVATED_LAUNCH_UNSUPPORTED.into());
+    }
+    state
 }
 
 fn tui_state(config_path: &Path) -> AppState {
@@ -98,6 +113,13 @@ fn init_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn non_elevated_startup_keeps_the_default_state() {
+        let state =
+            with_elevation_hint(AppState::new(GuardConfig::default(), "config.toml".into()));
+        assert!(state.error_message.is_none());
+    }
 
     #[test]
     fn invalid_configuration_opens_the_tui_in_repair_mode() {

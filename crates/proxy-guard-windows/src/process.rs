@@ -8,7 +8,10 @@ use std::{
 
 use proxy_guard_core::{DesktopAppInfo, DesktopProcessState, GuardConfig, LaunchReceipt};
 use sysinfo::System;
+use tokio_util::sync::CancellationToken;
 
+use crate::codex_daemon::{prepare_codex_daemon_for_launch, resolve_codex_cli};
+use crate::elevation::ensure_non_elevated;
 use crate::environment::{apply_proxy_environment, proxy_environment};
 
 struct StartupLock {
@@ -82,9 +85,18 @@ pub fn desktop_process_state(info: &DesktopAppInfo) -> DesktopProcessState {
         })
 }
 
-pub fn launch_codex(info: &DesktopAppInfo, config: &GuardConfig) -> Result<LaunchReceipt, String> {
+/// Launches Desktop with the proxy environment injected. The startup lock is
+/// held from the Desktop running-check through the daemon preparation step to
+/// the spawn itself, so concurrent Guard instances cannot race a daemon stop
+/// against a Desktop launch. Guard never terminates Desktop or Codex.
+pub async fn launch_codex(
+    info: &DesktopAppInfo,
+    config: &GuardConfig,
+    cancellation: &CancellationToken,
+) -> Result<LaunchReceipt, String> {
     config.validate().map_err(|error| error.to_string())?;
     let mut lock = StartupLock::acquire()?;
+    ensure_non_elevated()?;
 
     if config.codex.refuse_if_running
         && matches!(
@@ -103,6 +115,12 @@ pub fn launch_codex(info: &DesktopAppInfo, config: &GuardConfig) -> Result<Launc
             info.executable.display()
         ));
     }
+    if cancellation.is_cancelled() {
+        return Err("LAUNCH_CANCELLED: Guard is shutting down".into());
+    }
+
+    let cli = resolve_codex_cli(config, cancellation).await;
+    let daemon_preparation = prepare_codex_daemon_for_launch(cli.as_ref(), cancellation).await?;
 
     let environment = proxy_environment(config);
     let mut command = Command::new(&info.executable);
@@ -115,6 +133,7 @@ pub fn launch_codex(info: &DesktopAppInfo, config: &GuardConfig) -> Result<Launc
     Ok(LaunchReceipt {
         pid: child.id(),
         proxy_endpoint: environment.proxy_url,
+        daemon_preparation,
         desktop: info.into(),
     })
 }

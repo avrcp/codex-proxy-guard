@@ -88,6 +88,6 @@ pub async fn launch_pipeline(
     if cancellation.is_cancelled() {
         return Err("LAUNCH_CANCELLED: Guard is shutting down".into());
     }
-    let receipt = launch_codex(&info, config)?;
+    let receipt = launch_codex(&info, config, cancellation).await?;
     Ok((info, receipt))
 }

@@ -11,11 +11,14 @@ stale or unhealthy index.
 
 ## Workspace responsibilities
 
-- `proxy-guard-core`: minimal configuration, domain state, reducer, capabilities, and
-  redaction; no terminal, network, process, or Windows dependencies.
-- `proxy-guard-windows`: bounded APPX discovery, Desktop-root detection, cross-process
-  startup locking, environment injection, and process launch.
-- `codex-proxy-guard`: minimal CLI, single-screen TUI, dispatch, and launch orchestration.
+- `proxy-guard-core`: minimal configuration, domain state (including
+  `DaemonPreparation`), reducer, capabilities, and redaction; no terminal,
+  network, process, or Windows dependencies.
+- `proxy-guard-windows`: bounded APPX discovery, Desktop-root detection, elevation
+  check, cross-process startup locking, Codex CLI resolution, the public daemon
+  stop compatibility step, environment injection, and process launch.
+- `codex-proxy-guard`: minimal CLI, single-screen TUI, dispatch, and launch
+  orchestration.
 
 Preserve the state boundary `Action -> candidate reduce -> authorize -> commit ->
 dispatch -> TaskResult`. Only one foreground operation may be active. Guard shutdown
@@ -24,14 +27,25 @@ must not terminate Desktop.
 ## Security invariants
 
 Only loopback HTTP/Mixed proxies are allowed. Never read Token/Cookie/auth files,
-decrypt TLS, modify the Windows system proxy, edit `~/.codex/config.toml`, or add
-TUN/WFP/WinDivert/hooks/relay behavior. External text and commands must be bounded,
-timed out, cancellable where asynchronous, and redacted before display.
+decrypt TLS, modify the Windows system proxy, edit `~/.codex/config.toml` or
+`~/.codex/.env`, or add TUN/WFP/WinDivert/hooks/relay behavior. External text and
+commands must be bounded, timed out, cancellable where asynchronous, and redacted
+before display.
+
+Codex daemon compatibility is limited to invoking the public
+`codex app-server daemon stop` lifecycle command before Desktop launch. The Guard
+must never connect to the app-server socket, read daemon private state, inspect
+auth data, or directly terminate Codex processes. Daemon stop exists only to
+discard a stale process environment before the newly launched Desktop starts a
+fresh daemon under the injected proxy environment. Guard must refuse to launch
+when it is itself running elevated, matching the Codex background-server
+elevation requirement.
 
 Do not add network health probes, Node Readiness, Usage/account telemetry, Codex
-app-server or private IPC, v2rayN management, diagnostics/history persistence, or
-process termination. The product owns only proxy-environment injection into a newly
-launched Desktop process tree.
+app-server or private IPC, v2rayN management, sing-box management, network
+benchmarks, subscription management, diagnostics/history persistence, daemon
+start/restart/update/bootstrap flows, or process termination. The product owns
+only proxy-environment injection into a newly launched Desktop process tree.
 
 ## Completion commands
 
