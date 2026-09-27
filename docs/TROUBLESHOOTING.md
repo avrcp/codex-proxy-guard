@@ -36,6 +36,14 @@ executable_override = "D:\\Path\\To\\ChatGPT.exe"
 现有 ChatGPT Desktop 进程无法事后继承新环境。请从系统托盘完全退出 ChatGPT，然后在
 Guard 中按 `R` 刷新并重新启动。Guard 不提供强制终止。
 
+## `APPX_DISCOVERY_PROTOCOL_INVALID` / `APPX_DISCOVERY_PROTOCOL_UNSUPPORTED`
+
+发现脚本的 JSON 契约损坏：成功执行但没有 envelope、envelope 结构不合法、或 schema
+版本不是当前支持的版本（错误中会带实际版本号）。这是协议故障，不是"未安装"——
+Guard 不会把它当成 CODEX_NOT_INSTALLED，更不会退化为裸 EXE 启动。可用
+`powershell -File resources/appx-discovery.ps1` 人工执行同一份生产脚本核对输出；
+若输出异常请连同 schema_version、records 数量与 applications 的 JSON 类型一并记录。
+
 ## `ACTIVATION_ONLY_UNSUPPORTED`
 
 `launch --activation-only` 是注册应用激活路径的身份对照诊断；普通未打包 EXE 没有激活可对照。

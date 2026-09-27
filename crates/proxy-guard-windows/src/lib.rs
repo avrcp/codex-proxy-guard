@@ -9,13 +9,15 @@ pub mod process;
 pub mod proxy_env_file;
 pub mod proxy_launch_plan;
 #[cfg(windows)]
-mod system_tools;
+pub mod system_tools;
 
 pub use appmodel_activation::{
     ActivationOutcome, ActivationWorkerReceipt, ActivationWorkerRequest, PROTOCOL_VERSION,
     run_activation_worker,
 };
 pub use appx::discover_desktop_app;
+#[cfg(windows)]
+pub use appx::discovery_script;
 pub use codex_daemon::{
     CodexCli, CodexHomeInput, DaemonStopBudget, resolve_codex_cli, resolve_codex_cli_from,
     stop_codex_daemon,

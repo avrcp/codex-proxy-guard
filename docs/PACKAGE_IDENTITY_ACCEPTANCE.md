@@ -1,5 +1,40 @@
 # Package identity launch acceptance (2026-09-26, updated 2026-09-27)
 
+## 2026-09-27 round 2: APPX discovery JSON protocol fix
+
+The TUI refresh blocked with
+`APPX_DISCOVERY_INVALID: malformed PowerShell JSON: data did not match any
+variant of untagged enum AppxRecords` before any launch logic ran. Root causes
+confirmed by running the then-current production script on this machine:
+
+| Finding | Evidence |
+| --- | --- |
+| Single package emitted a bare JSON object at the top level | reproduced stdout began `{"package_name":"OpenAI.Codex",...}` (no array), which only the untagged enum tolerated |
+| Optional manifest attributes serialized as JSON `null` | `"runtime_behavior":null,"trust_level":null` while the Rust model used `String`, which rejects null |
+| Default `ConvertTo-Json` depth (2) unsuitable for the nested envelope | applications nesting grew past the default once the fixed envelope wrapped `records` |
+
+Fix (0.4.1-rc.4, discovery layer only — launch/activation/daemon layers
+untouched this round): `resources/appx-discovery.ps1` is now the single
+production source (`include_str!`; production, Windows integration tests, and
+manual diagnosis execute the same file), emitting a fixed
+`{"schema_version":1,"records":[...]}` envelope with `ConvertTo-Json -Depth 8`
+and strict UTF-8 output; the Rust side parses the envelope struct, models
+optional manifest attributes as `Option<String>`, treats empty stdout after
+success as `APPX_DISCOVERY_PROTOCOL_INVALID`, refuses unknown schema versions
+with `APPX_DISCOVERY_PROTOCOL_UNSUPPORTED`, and fails closed (no bare-EXE or
+"not installed" fallback). The TUI gained an `Entry` diagnostics line
+(`ApplicationId · manifest executable · runtime`).
+
+Machine evidence after the fix (read-only, no Desktop launched):
+`schema_version=1`, 1 record (`OpenAI.Codex 26.924.2738.0`), `applications`
+= 2 objects (`App`, `CodexCoreCommandRunner`) with null optional attributes;
+the full production pipeline (`discover_desktop_app`) now returns the
+registered `App` entry where it previously failed
+(`tests/appx_discovery.rs`, 2/2 passed on this machine). Stage-1 manual TUI
+confirmation (App/Entry/Process lines, no `APPX_DISCOVERY_INVALID`) and all
+stage-2 launch acceptance remain for the user; the 2026-09-27 round-1 and
+2026-09-26 NOT RUN rows below are unchanged.
+
 ## 2026-09-27 round: native application activation remediation
 
 The 2026-09-27 round (`0.4.1-rc.4`) replaced the experimental

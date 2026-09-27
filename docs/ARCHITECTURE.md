@@ -140,7 +140,20 @@ Codex CLI 与 Desktop 是独立产品；修复路径的对象是“已解析 Cod
 
 `codex.executable_override` 会与已注册包比对；PowerShell 查询固定使用系统目录下 Windows
 PowerShell 的绝对路径（不解析 PATH，不接受工作目录同名文件），超时 15 秒、输出上限
-64/128 KiB。发现阶段只从同一产品内选择最高版本；选择阶段固定优先当前 ChatGPT Desktop，
+64/128 KiB。
+
+发现脚本源码位于 `resources/appx-discovery.ps1`（`include_str!` 嵌入），生产启动、
+Windows 集成测试与人工诊断（`powershell -File resources/appx-discovery.ps1`）执行同一份
+源码。其 JSON 契约是固定 envelope：`{"schema_version":1,"records":[...]}`，顶层结构在
+0/1/N 个包时完全一致；`ConvertTo-Json` 显式 `-Depth 8`（默认深度 2 会截断嵌套的
+applications 对象）；可选清单属性（RuntimeBehavior/TrustLevel）缺失时输出 JSON `null`，
+Rust 侧建模为 `Option<String>`——"缺失"是合法协议语义。脚本输出严格 UTF-8，Rust 用
+严格解码解析（字节损坏是协议错误，不做替换字符继续）。成功执行但 stdout 为空同样是
+`APPX_DISCOVERY_PROTOCOL_INVALID`（"没有安装包"由 `records: []` 表达，与脚本失败严格
+分离）；schema 版本不匹配返回 `APPX_DISCOVERY_PROTOCOL_UNSUPPORTED`；任何解析失败
+fail closed，绝不退化为无包推断或裸 EXE 启动。
+
+发现阶段只从同一产品内选择最高版本；选择阶段固定优先当前 ChatGPT Desktop，
 Classic 仅作后备。Rust 端校验包名，要求清单入口为相对路径，并在 canonicalize 后仍位于
 安装目录内（该 containment 校验与路径身份比较是两回事，不互相替代）。发现保留
 PackageFullName、FamilyName、Application.Id 和 AUMID；当前包只选已核对的 `App` /

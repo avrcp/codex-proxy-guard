@@ -165,7 +165,9 @@ winget install --id 9PLM9XGG6VKS -s msstore
 
 自动发现读取已注册包的 FullName、FamilyName 与 Application.Id，并选择可证明的桌面
 主入口；多个无法区分的入口会报错。入口解析后必须仍位于包安装目录内，缺失的清单
-入口不会退化为包内 EXE 路径猜测。
+入口不会退化为包内 EXE 路径猜测。发现脚本源码是 `resources/appx-discovery.ps1`
+（固定 `schema_version=1` envelope、显式序列化深度、可选清单属性允许为 null），
+生产与测试执行同一份文件，可用 `powershell -File` 手工核对。
 
 ## 配置
 

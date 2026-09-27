@@ -15,54 +15,22 @@ use serde::Deserialize;
 use tokio::{io::AsyncReadExt, process::Command};
 use tokio_util::sync::CancellationToken;
 
+/// The production discovery script lives in `resources/appx-discovery.ps1`
+/// and is shared verbatim by the production launch path, the Windows
+/// integration tests, and manual diagnosis (`powershell -File
+/// resources/appx-discovery.ps1`), so hand-written probes can never drift
+/// from what Guard actually executes.
 #[cfg(windows)]
-const APPX_DISCOVERY_SCRIPT: &str = r#"
-$ErrorActionPreference = 'Stop'
-function Read-ManifestAttribute($element, [string]$name) {
-  $attribute = @($element.Attributes | Where-Object { $_.LocalName -eq $name })
-  if ($attribute.Count -gt 1) { throw "APPX_DISCOVERY_INVALID: ambiguous manifest attribute $name" }
-  if ($attribute.Count -eq 1) { return [string]$attribute[0].Value }
-  return $null
-}
-$records = @(
-  foreach ($name in @('OpenAI.Codex', 'OpenAI.ChatGPT-Desktop')) {
-    $package = Get-AppxPackage -Name $name | Sort-Object Version -Descending | Select-Object -First 1
-    if ($null -ne $package) {
-      $manifest = Get-AppxPackageManifest -Package $package.PackageFullName
-      $applications = @(
-        $manifest.Package.Applications.Application | ForEach-Object {
-          [PSCustomObject]@{
-            application_id = [string]$_.Id
-            manifest_executable = [string]$_.Executable
-            entry_point = [string]$_.EntryPoint
-            runtime_behavior = Read-ManifestAttribute $_ 'RuntimeBehavior'
-            trust_level = Read-ManifestAttribute $_ 'TrustLevel'
-          }
-        }
-      )
-      if ($applications.Count -gt 16) { throw 'APPX_DISCOVERY_INVALID: package has too many applications' }
-      [PSCustomObject]@{
-        package_name = [string]$package.Name
-        package_full_name = [string]$package.PackageFullName
-        package_family_name = [string]$package.PackageFamilyName
-        package_version = [string]$package.Version
-        architecture = [string]$package.Architecture
-        install_location = [string]$package.InstallLocation
-        applications = $applications
-      }
-    }
-  }
-)
-if ($records.Count -gt 0) {
-  $records | ConvertTo-Json -Compress
-}
-"#;
+const APPX_DISCOVERY_SCRIPT: &str = include_str!("../../../resources/appx-discovery.ps1");
 #[cfg(windows)]
 const APPX_TIMEOUT: Duration = Duration::from_secs(15);
 #[cfg(windows)]
 const MAX_APPX_STDOUT_BYTES: u64 = 64 * 1024;
 #[cfg(windows)]
 const MAX_APPX_STDERR_BYTES: u64 = 128 * 1024;
+
+/// Schema version of the discovery envelope the PowerShell script emits.
+const APPX_DISCOVERY_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Deserialize)]
 struct AppxRecord {
@@ -87,17 +55,29 @@ struct AppxApplicationRecord {
     manifest_executable: String,
     #[serde(default)]
     entry_point: String,
+    /// Optional manifest attributes. The PowerShell contract emits JSON null
+    /// when the manifest omits them: absence is legal protocol state, and a
+    /// null must deserialize cleanly instead of failing the whole record.
     #[serde(default)]
-    runtime_behavior: String,
+    runtime_behavior: Option<String>,
     #[serde(default)]
-    trust_level: String,
+    trust_level: Option<String>,
 }
 
+/// Fixed-shape discovery envelope. Whatever the package count (0, 1, many),
+/// the top level is always the same object — never a bare record and never a
+/// bare array, which is what the old untagged enum had to guess between.
 #[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum AppxRecords {
-    One(AppxRecord),
-    Many(Vec<AppxRecord>),
+struct AppxDiscoveryEnvelope {
+    schema_version: u32,
+    #[serde(default)]
+    records: Vec<AppxRecord>,
+}
+
+/// Optional manifest attribute text: `None` and empty strings mean the same
+/// thing — the attribute is absent.
+fn optional_manifest_text(value: &Option<String>) -> &str {
+    value.as_deref().unwrap_or("").trim()
 }
 
 pub async fn discover_desktop_app(
@@ -200,10 +180,12 @@ pub async fn discover_desktop_app(
                 stderr.trim()
             ));
         }
-        desktop_info_from_discovery_output(
-            &String::from_utf8_lossy(&stdout),
-            &config.codex.executable_override,
-        )
+        // Identity metadata must not survive silent character replacement:
+        // corrupted bytes are a protocol error, not mojibake package names.
+        let stdout_text = String::from_utf8(stdout).map_err(|_| {
+            "APPX_DISCOVERY_PROTOCOL_INVALID: PowerShell output was not valid UTF-8".to_string()
+        })?;
+        desktop_info_from_discovery_output(&stdout_text, &config.codex.executable_override)
     }
 }
 
@@ -229,20 +211,30 @@ pub fn parse_appx_json(input: &str) -> Result<DesktopAppInfo, String> {
     desktop_info_from_records(parse_appx_records(input)?)
 }
 
-/// A successful discovery helper emits no JSON when no supported package is
-/// installed. That is distinct from a failed helper: the caller has already
-/// checked its exit status before reaching here. A native executable override
-/// remains usable in that specific no-package case only.
+/// The exact discovery script the production path executes. Public so the
+/// Windows integration tests (and external diagnostics) exercise the same
+/// source instead of a hand-rewritten copy.
+#[cfg(windows)]
+pub fn discovery_script() -> &'static str {
+    APPX_DISCOVERY_SCRIPT
+}
+
+/// A successful helper always emits one envelope document (even with zero
+/// records). Empty stdout after a zero exit status is therefore a broken
+/// protocol, never "no package installed"; the caller has already checked
+/// the exit status before reaching here. A native executable override
+/// remains usable in the specific zero-record case only.
 #[cfg(windows)]
 fn desktop_info_from_discovery_output(
     input: &str,
     executable_override: &Path,
 ) -> Result<DesktopAppInfo, String> {
-    let records = if input.trim().is_empty() {
-        Vec::new()
-    } else {
-        parse_appx_records(input)?
-    };
+    if input.trim().is_empty() {
+        return Err(
+            "APPX_DISCOVERY_PROTOCOL_INVALID: the discovery script produced no envelope".into(),
+        );
+    }
+    let records = parse_appx_records(input)?;
     if records.is_empty() {
         return if executable_override.as_os_str().is_empty() {
             Err(no_supported_package_error())
@@ -257,23 +249,21 @@ fn desktop_info_from_discovery_output(
     }
 }
 
+/// Parses the fixed discovery envelope and checks its schema version. Zero
+/// records is a valid, parseable result; the business layer decides what it
+/// means. A parse failure never falls back to a package-less or bare-EXE
+/// launch.
 fn parse_appx_records(input: &str) -> Result<Vec<AppxRecord>, String> {
-    if input.trim().is_empty() {
-        return Err(
-            "CODEX_NOT_INSTALLED: ChatGPT Desktop was not found. Install the current app from https://chatgpt.com/download/ (Microsoft Store ID 9PLM9XGG6VKS), or set codex.executable_override"
-                .into(),
-        );
+    let envelope: AppxDiscoveryEnvelope = serde_json::from_str(input).map_err(|error| {
+        format!("APPX_DISCOVERY_PROTOCOL_INVALID: malformed discovery envelope: {error}")
+    })?;
+    if envelope.schema_version != APPX_DISCOVERY_SCHEMA_VERSION {
+        return Err(format!(
+            "APPX_DISCOVERY_PROTOCOL_UNSUPPORTED: schema version {}; expected {}",
+            envelope.schema_version, APPX_DISCOVERY_SCHEMA_VERSION
+        ));
     }
-    let records: AppxRecords = serde_json::from_str(input)
-        .map_err(|error| format!("APPX_DISCOVERY_INVALID: malformed PowerShell JSON: {error}"))?;
-    let records = match records {
-        AppxRecords::One(record) => vec![record],
-        AppxRecords::Many(records) => records,
-    };
-    if records.is_empty() {
-        return Err(no_supported_package_error());
-    }
-    Ok(records)
+    Ok(envelope.records)
 }
 
 fn no_supported_package_error() -> String {
@@ -411,8 +401,8 @@ fn package_runtime_kind(application: &AppxApplicationRecord) -> PackageRuntimeKi
     {
         PackageRuntimeKind::FullTrustDesktop
     } else if application.entry_point.trim().is_empty()
-        && application.runtime_behavior.trim().is_empty()
-        && application.trust_level.trim().is_empty()
+        && optional_manifest_text(&application.runtime_behavior).is_empty()
+        && optional_manifest_text(&application.trust_level).is_empty()
     {
         PackageRuntimeKind::Unknown
     } else {
@@ -567,39 +557,194 @@ mod tests {
         root
     }
 
-    #[test]
-    fn parses_path_with_spaces() {
-        let root = temp_install();
-        let input = serde_json::json!({
-            "package_name": "OpenAI.ChatGPT-Desktop",
-            "package_full_name": "OpenAI.ChatGPT-Desktop_1.2.3.4_x64__fixture",
-            "package_family_name": "OpenAI.ChatGPT-Desktop_fixture",
-            "package_version": "1.2.3.4",
-            "architecture": "X64",
-            "install_location": root,
-            "applications": [{
-                "application_id": "Desktop",
-                "manifest_executable": "app/ChatGPT.exe",
-                "entry_point": "Windows.FullTrustApplication"
-            }]
+    /// Wraps record JSON in the fixed envelope the production script emits.
+    fn envelope(records: serde_json::Value) -> String {
+        serde_json::json!({
+            "schema_version": APPX_DISCOVERY_SCHEMA_VERSION,
+            "records": records,
         })
-        .to_string();
+        .to_string()
+    }
+
+    /// The application object shape the real manifest produces, including the
+    /// JSON nulls PowerShell emits for omitted optional attributes.
+    fn application_record(application_id: &str, manifest_executable: &str) -> serde_json::Value {
+        serde_json::json!({
+            "application_id": application_id,
+            "manifest_executable": manifest_executable,
+            "entry_point": "Windows.FullTrustApplication",
+            "runtime_behavior": null,
+            "trust_level": null,
+        })
+    }
+
+    /// Fixture A: the typical current OpenAI.Codex shape (two applications,
+    /// null optional attributes, backslash executable separators) parses and
+    /// selects the registered Desktop entry.
+    #[test]
+    fn fixture_a_current_codex_shape_parses_with_nulls_and_two_entries() {
+        let root = temp_install();
+        let input = envelope(serde_json::json!([{
+            "package_name": "OpenAI.Codex",
+            "package_full_name": "OpenAI.Codex_26.924.2738.0_x64__2p2nqsd0c76g0",
+            "package_family_name": "OpenAI.Codex_2p2nqsd0c76g0",
+            "package_version": "26.924.2738.0",
+            "architecture": "X64",
+            "install_location": root.clone(),
+            "applications": [
+                application_record("App", r"app\ChatGPT.exe"),
+                application_record(
+                    "CodexCoreCommandRunner",
+                    r"app\resources\codex-command-runner.exe",
+                ),
+            ]
+        }]));
         let result = parse_appx_json(&input).unwrap();
-        assert_eq!(result.product, DesktopProduct::ChatGptClassic);
-        assert_eq!(result.package_name, "OpenAI.ChatGPT-Desktop");
-        assert_eq!(result.architecture, "X64");
+        assert_eq!(result.product, DesktopProduct::ChatGpt);
+        assert_eq!(result.package_name, "OpenAI.Codex");
+        assert_eq!(result.package_version, "26.924.2738.0");
+        let DesktopTargetKind::RegisteredPackage(application) = result.target_kind else {
+            panic!("manifest discovery must retain registered package identity");
+        };
+        assert_eq!(application.application_id, "App");
+        assert_eq!(application.manifest_executable, r"app\ChatGPT.exe");
         assert_eq!(
-            result.discovery_source,
-            DesktopDiscoverySource::AppxManifest
+            application.app_user_model_id,
+            "OpenAI.Codex_2p2nqsd0c76g0!App"
         );
-        fs::remove_dir_all(result.install_location).unwrap();
+        assert_eq!(
+            application.runtime_kind,
+            PackageRuntimeKind::FullTrustDesktop
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Fixture B: zero records is a valid, parseable envelope. The parse
+    /// layer succeeds; only the business layer turns it into
+    /// CODEX_NOT_INSTALLED.
+    #[test]
+    fn fixture_b_empty_records_parse_but_mean_not_installed() {
+        let records = parse_appx_records(&envelope(serde_json::json!([]))).unwrap();
+        assert!(records.is_empty());
+        let error = desktop_info_from_records(records).unwrap_err();
+        assert!(error.contains("CODEX_NOT_INSTALLED"), "{error}");
+    }
+
+    /// Fixture C: null optional attributes deserialize; absent and empty
+    /// strings behave identically in the runtime classification.
+    #[test]
+    fn fixture_c_null_optional_attributes_deserialize() {
+        for (runtime_behavior, trust_level) in [
+            (serde_json::Value::Null, serde_json::Value::Null),
+            (serde_json::json!(""), serde_json::json!("")),
+        ] {
+            let root = temp_install();
+            let input = envelope(serde_json::json!([{
+                "package_name": "OpenAI.ChatGPT-Desktop",
+                "package_full_name": "OpenAI.ChatGPT-Desktop_1.0.0.0_x64__fixture",
+                "package_family_name": "OpenAI.ChatGPT-Desktop_fixture",
+                "package_version": "1.0.0.0",
+                "architecture": "X64",
+                "install_location": root.clone(),
+                "applications": [{
+                    "application_id": "Desktop",
+                    "manifest_executable": "app/ChatGPT.exe",
+                    "entry_point": "Windows.FullTrustApplication",
+                    "runtime_behavior": runtime_behavior,
+                    "trust_level": trust_level,
+                }]
+            }]));
+            let result = parse_appx_json(&input)
+                .unwrap_or_else(|error| panic!("{runtime_behavior}/{trust_level}: {error}"));
+            let DesktopTargetKind::RegisteredPackage(application) = result.target_kind else {
+                panic!("registered package expected");
+            };
+            assert_eq!(
+                application.runtime_kind,
+                PackageRuntimeKind::FullTrustDesktop
+            );
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    /// Fixture D: two packages in one envelope still prefer OpenAI.Codex over
+    /// Classic regardless of versions, and the top-level shape is identical
+    /// for one or many records.
+    #[test]
+    fn fixture_d_multiple_packages_keep_one_shape_and_prefer_codex() {
+        let current = temp_install();
+        let classic = temp_install();
+        let input = envelope(serde_json::json!([
+            {
+                "package_name": "OpenAI.ChatGPT-Desktop",
+                "package_full_name": "OpenAI.ChatGPT-Desktop_99.0.0.0_x64__fixture",
+                "package_family_name": "OpenAI.ChatGPT-Desktop_fixture",
+                "package_version": "99.0.0.0",
+                "architecture": "X64",
+                "install_location": classic.clone(),
+                "applications": [application_record("Classic", "app/ChatGPT.exe")]
+            },
+            {
+                "package_name": "OpenAI.Codex",
+                "package_full_name": "OpenAI.Codex_1.0.0.0_arm64__fixture",
+                "package_family_name": "OpenAI.Codex_fixture",
+                "package_version": "1.0.0.0",
+                "architecture": "Arm64",
+                "install_location": current.clone(),
+                "applications": [application_record("App", "app/ChatGPT.exe")]
+            }
+        ]));
+        let result = parse_appx_json(&input).unwrap();
+        assert_eq!(result.product, DesktopProduct::ChatGpt);
+        assert_eq!(result.package_name, "OpenAI.Codex");
+        assert_eq!(result.architecture, "Arm64");
+        // Single record: same envelope shape, same code path.
+        let single = envelope(serde_json::json!([{
+            "package_name": "OpenAI.Codex",
+            "package_full_name": "OpenAI.Codex_1.0.0.0_arm64__fixture",
+            "package_family_name": "OpenAI.Codex_fixture",
+            "package_version": "1.0.0.0",
+            "architecture": "Arm64",
+            "install_location": current.clone(),
+            "applications": [application_record("App", "app/ChatGPT.exe")]
+        }]));
+        let single_result = parse_appx_json(&single).unwrap();
+        assert_eq!(single_result.package_name, result.package_name);
+        fs::remove_dir_all(current).unwrap();
+        fs::remove_dir_all(classic).unwrap();
+    }
+
+    /// Fixture E: an unknown schema version is an unsupported protocol, not a
+    /// guess, and never falls back to a bare-EXE launch.
+    #[test]
+    fn fixture_e_unknown_schema_version_is_refused() {
+        let input = r#"{"schema_version":999,"records":[]}"#;
+        let error = parse_appx_records(input).unwrap_err();
+        assert!(
+            error.starts_with("APPX_DISCOVERY_PROTOCOL_UNSUPPORTED:"),
+            "{error}"
+        );
+        assert!(error.contains("999"));
+        // A bare record or bare array is a malformed envelope now — the old
+        // untagged-enum guessing is gone.
+        for legacy in [
+            r#"{"package_name":"OpenAI.Codex"}"#,
+            r#"[{"package_name":"OpenAI.Codex"}]"#,
+        ] {
+            assert!(
+                parse_appx_records(legacy)
+                    .unwrap_err()
+                    .starts_with("APPX_DISCOVERY_PROTOCOL_INVALID:"),
+                "{legacy}"
+            );
+        }
     }
 
     #[test]
     fn rejects_ambiguous_classic_desktop_entries() {
         let root = temp_install();
         fs::write(root.join("app").join("ChatGPT-copy.exe"), b"test").unwrap();
-        let input = serde_json::json!({
+        let input = envelope(serde_json::json!([{
             "package_name": "OpenAI.ChatGPT-Desktop",
             "package_full_name": "OpenAI.ChatGPT-Desktop_1.0.0.0_x64__fixture",
             "package_family_name": "OpenAI.ChatGPT-Desktop_fixture",
@@ -607,11 +752,10 @@ mod tests {
             "architecture": "X64",
             "install_location": root.clone(),
             "applications": [
-                {"application_id": "One", "manifest_executable": "app/ChatGPT.exe", "entry_point": "Windows.FullTrustApplication"},
-                {"application_id": "Two", "manifest_executable": "other/ChatGPT.exe", "entry_point": "Windows.FullTrustApplication"}
+                application_record("One", "app/ChatGPT.exe"),
+                application_record("Two", "other/ChatGPT.exe"),
             ]
-        })
-        .to_string();
+        }]));
         let error = parse_appx_json(&input).unwrap_err();
         assert!(error.contains("APPX_APPLICATION_AMBIGUOUS"), "{error}");
         fs::remove_dir_all(root).unwrap();
@@ -620,18 +764,13 @@ mod tests {
     #[test]
     fn rejects_missing_registered_identity_metadata() {
         let root = temp_install();
-        let input = serde_json::json!({
+        let input = envelope(serde_json::json!([{
             "package_name": "OpenAI.Codex",
             "package_version": "1.0.0.0",
             "architecture": "X64",
             "install_location": root.clone(),
-            "applications": [{
-                "application_id": "App",
-                "manifest_executable": "app/ChatGPT.exe",
-                "entry_point": "Windows.FullTrustApplication"
-            }]
-        })
-        .to_string();
+            "applications": [application_record("App", "app/ChatGPT.exe")]
+        }]));
         let error = parse_appx_json(&input).unwrap_err();
         assert!(error.contains("APPX_METADATA_INCOMPLETE"), "{error}");
         fs::remove_dir_all(root).unwrap();
@@ -655,8 +794,8 @@ mod tests {
                     application_id: "App".into(),
                     manifest_executable: "app/ChatGPT.exe".into(),
                     entry_point: "Windows.FullTrustApplication".into(),
-                    runtime_behavior: String::new(),
-                    trust_level: String::new(),
+                    runtime_behavior: None,
+                    trust_level: None,
                 }],
             }],
         )
@@ -670,65 +809,33 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn empty_successful_discovery_allows_a_native_override() {
+    fn zero_records_with_override_allows_a_native_override_but_empty_stdout_does_not() {
         let root = temp_install();
         let executable = root.join("app").join("ChatGPT.exe");
-        let info = desktop_info_from_discovery_output("", &executable).unwrap();
+        // A well-formed zero-record envelope plus an override stays usable.
+        let info =
+            desktop_info_from_discovery_output(&envelope(serde_json::json!([])), &executable)
+                .unwrap();
         assert_eq!(info.target_kind, DesktopTargetKind::UnpackagedExecutable);
         assert_eq!(
             info.discovery_source,
             DesktopDiscoverySource::ExecutableOverride
         );
         assert_eq!(info.executable, fs::canonicalize(&executable).unwrap());
+        // A silent success is a protocol break, not "no package".
+        let error = desktop_info_from_discovery_output("", &executable).unwrap_err();
+        assert!(
+            error.starts_with("APPX_DISCOVERY_PROTOCOL_INVALID:"),
+            "{error}"
+        );
         fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn prefers_current_chatgpt_when_classic_has_a_higher_version() {
-        let current = temp_install();
-        let classic = temp_install();
-        let input = serde_json::json!([
-            {
-                "package_name": "OpenAI.ChatGPT-Desktop",
-                "package_full_name": "OpenAI.ChatGPT-Desktop_99.0.0.0_x64__fixture",
-                "package_family_name": "OpenAI.ChatGPT-Desktop_fixture",
-                "package_version": "99.0.0.0",
-                "architecture": "X64",
-                "install_location": classic.clone(),
-                "applications": [{
-                    "application_id": "Classic",
-                    "manifest_executable": "app/ChatGPT.exe",
-                    "entry_point": "Windows.FullTrustApplication"
-                }]
-            },
-            {
-                "package_name": "OpenAI.Codex",
-                "package_full_name": "OpenAI.Codex_1.0.0.0_arm64__fixture",
-                "package_family_name": "OpenAI.Codex_fixture",
-                "package_version": "1.0.0.0",
-                "architecture": "Arm64",
-                "install_location": current,
-                "applications": [{
-                    "application_id": "App",
-                    "manifest_executable": "app/ChatGPT.exe",
-                    "entry_point": "Windows.FullTrustApplication"
-                }]
-            }
-        ])
-        .to_string();
-        let result = parse_appx_json(&input).unwrap();
-        assert_eq!(result.product, DesktopProduct::ChatGpt);
-        assert_eq!(result.package_name, "OpenAI.Codex");
-        assert_eq!(result.architecture, "Arm64");
-        fs::remove_dir_all(result.install_location).unwrap();
-        fs::remove_dir_all(classic).unwrap();
     }
 
     #[test]
     fn manifest_executable_is_preferred_and_recorded() {
         let root = temp_install();
         fs::write(root.join("app").join("Codex.exe"), b"test").unwrap();
-        let input = serde_json::json!({
+        let input = envelope(serde_json::json!([{
             "package_name": "OpenAI.Codex",
             "package_full_name": "OpenAI.Codex_26.727.6591.0_x64__fixture",
             "package_family_name": "OpenAI.Codex_fixture",
@@ -736,19 +843,13 @@ mod tests {
             "architecture": "X64",
             "install_location": root.clone(),
             "applications": [
-                {
-                    "application_id": "App",
-                    "manifest_executable": "app/ChatGPT.exe",
-                    "entry_point": "Windows.FullTrustApplication"
-                },
-                {
-                    "application_id": "CodexCoreCommandRunner",
-                    "manifest_executable": "app/resources/codex-command-runner.exe",
-                    "entry_point": "Windows.FullTrustApplication"
-                }
+                application_record("App", "app/ChatGPT.exe"),
+                application_record(
+                    "CodexCoreCommandRunner",
+                    "app/resources/codex-command-runner.exe",
+                ),
             ]
-        })
-        .to_string();
+        }]));
         let result = parse_appx_json(&input).unwrap();
         assert_eq!(result.product, DesktopProduct::ChatGpt);
         assert!(result.executable.ends_with("app/ChatGPT.exe"));
@@ -777,10 +878,12 @@ mod tests {
     }
 
     #[test]
-    fn empty_output_is_actionable() {
+    fn empty_output_is_a_protocol_error() {
         let error = parse_appx_json("").unwrap_err();
-        assert!(error.contains("CODEX_NOT_INSTALLED"));
-        assert!(error.contains("9PLM9XGG6VKS"));
+        assert!(
+            error.starts_with("APPX_DISCOVERY_PROTOCOL_INVALID:"),
+            "empty output must not be reported as CODEX_NOT_INSTALLED: {error}"
+        );
     }
 
     #[test]
@@ -788,5 +891,16 @@ mod tests {
         assert!(validate_appx_output_lengths(64 * 1024, 128 * 1024).is_ok());
         assert!(validate_appx_output_lengths(64 * 1024 + 1, 0).is_err());
         assert!(validate_appx_output_lengths(0, 128 * 1024 + 1).is_err());
+    }
+
+    /// The production constant, the integration tests, and manual diagnosis
+    /// must all execute this same source file.
+    #[cfg(windows)]
+    #[test]
+    fn production_script_is_the_shared_resource_file() {
+        assert!(APPX_DISCOVERY_SCRIPT.contains("schema_version = 1"));
+        assert!(APPX_DISCOVERY_SCRIPT.contains("ConvertTo-Json -Depth 8 -Compress"));
+        assert!(APPX_DISCOVERY_SCRIPT.contains("OpenAI.Codex"));
+        assert!(!APPX_DISCOVERY_SCRIPT.contains("if ($records.Count -gt 0)"));
     }
 }

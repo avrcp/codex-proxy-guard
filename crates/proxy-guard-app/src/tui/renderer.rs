@@ -118,6 +118,7 @@ fn draw_status(lines: &mut Vec<Line<'static>>, state: &AppState) {
         Style::default(),
     ));
     lines.push(key_value("App", desktop_label(state), Style::default()));
+    lines.push(key_value("Entry", entry_label(state), theme::muted()));
     lines.push(key_value(
         "Process",
         process_label(state),
@@ -454,6 +455,32 @@ fn desktop_label(state: &AppState) -> String {
     }
 }
 
+/// rc-stage discovery diagnostics (see the remediation manual §21): show the
+/// exact registered application entry so a wrong or missing selection is
+/// visible without a launch. Only relative manifest text is displayed —
+/// never a full WindowsApps path.
+fn entry_label(state: &AppState) -> String {
+    match &state.desktop_app {
+        DesktopAppDiscovery::Found(info) => match &info.target_kind {
+            DesktopTargetKind::RegisteredPackage(application) => {
+                let runtime = match application.runtime_kind {
+                    proxy_guard_core::PackageRuntimeKind::FullTrustDesktop => "FullTrust",
+                    proxy_guard_core::PackageRuntimeKind::AppContainer => "AppContainer",
+                    proxy_guard_core::PackageRuntimeKind::Unknown => "Unknown",
+                };
+                format!(
+                    "{} · {} · {}",
+                    application.application_id, application.manifest_executable, runtime
+                )
+            }
+            DesktopTargetKind::UnpackagedExecutable => "—".into(),
+        },
+        DesktopAppDiscovery::Unknown
+        | DesktopAppDiscovery::Searching
+        | DesktopAppDiscovery::NotFound(_) => "—".into(),
+    }
+}
+
 fn process_label(state: &AppState) -> String {
     match state.desktop_process {
         DesktopProcessState::Unknown => "Unknown".into(),
@@ -625,6 +652,8 @@ mod tests {
         assert!(text.contains("Chromium proxy arguments on activation"));
         assert!(text.contains("NOT proxied yet"));
         assert!(text.contains("press B"));
+        // rc-stage discovery diagnostics: the selected entry is visible.
+        assert!(text.contains("App · app/ChatGPT.exe · FullTrust"));
         // No experimental candidate hint remains.
         assert!(!text.contains("package-context"));
         assert!(!text.contains("press P"));

@@ -4,7 +4,7 @@ use std::{os::windows::ffi::OsStringExt, path::PathBuf};
 
 use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
 
-pub(crate) fn system_powershell() -> Result<PathBuf, String> {
+pub fn system_powershell() -> Result<PathBuf, String> {
     // The directory is OS-owned metadata. WINDIR and SYSTEMROOT are inherited
     // process variables and are not suitable for authenticating an executable.
     let required = unsafe { GetSystemDirectoryW(std::ptr::null_mut(), 0) };

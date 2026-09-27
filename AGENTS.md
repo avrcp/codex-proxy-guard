@@ -14,7 +14,7 @@ stale or unhealthy index.
 - `proxy-guard-core`: minimal configuration, domain state (including
   `DaemonPreparation`), reducer, capabilities, and redaction; no terminal,
   network, process, or Windows dependencies.
-- `proxy-guard-windows`: bounded APPX discovery, Desktop-root detection, elevation
+- `proxy-guard-windows`: bounded APPX discovery (schema-versioned envelope from `resources/appx-discovery.ps1`, explicit serialization depth, null-tolerant optional manifest attributes, fail-closed parsing), Desktop-root detection, elevation
   check, cross-process startup locking, Codex CLI resolution, the public daemon
   stop compatibility step, native application-model activation, environment
   injection, the consented `.env` proxy block, and process launch.

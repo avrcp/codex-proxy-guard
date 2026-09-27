@@ -20,6 +20,11 @@
 - [ ] 当前 ChatGPT Desktop、ChatGPT Classic 与显式 override 发现均可用；两者并存时优先当前应用。
 - [ ] APPX 清单入口被优先使用，且解析路径不能逃逸安装目录；APPX 查询使用系统目录 PowerShell 绝对路径。
 - [ ] FullName、FamilyName、Application.Id、AUMID 来自同一注册快照；多 Application 不任选首个，包内 override 不降级成普通 EXE。
+- [ ] discovery payload 使用 schema_version=1 固定 envelope（resources/appx-discovery.ps1 与生产同源）。
+- [ ] ConvertTo-Json 显式 Depth >= 6；单包与多包顶层 JSON 形状一致；records=[] 可正常解析。
+- [ ] runtime_behavior=null / trust_level=null 可解析（Option<String>）；身份字段仍严格必填。
+- [ ] 成功但空 stdout 是 APPX_DISCOVERY_PROTOCOL_INVALID；schema 不匹配是 APPX_DISCOVERY_PROTOCOL_UNSUPPORTED；解析失败 fail closed。
+- [ ] Windows 集成测试对当前机器执行生产 discovery（tests/appx_discovery.rs）；TUI 启动无 APPX_DISCOVERY_INVALID 且 Entry 行显示选定入口。
 - [ ] 已注册包只走原生应用激活（AO_NONE），绝不裸 EXE/调试上下文/提权；激活后核验目标 PackageFullName、AUMID、映像路径、创建时间与提升状态，不符或查询失败不返回成功回执。
 - [ ] 激活 worker 有界协议（16 KiB 请求/64 KiB 回执）、提交前取消不激活、提交后按 outcome-unknown 报告；worker 超时/取消被有界回收，绝不终止 Desktop。
 - [ ] TUI 与 `launch --json` 均显示产品类型、包名、版本、架构、发现来源与 `daemon_preparation`（skipped/stopped/not_needed），不输出安装路径或认证信息。
