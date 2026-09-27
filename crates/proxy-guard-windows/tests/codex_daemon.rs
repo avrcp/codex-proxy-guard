@@ -139,6 +139,18 @@ async fn normal_launch_never_invokes_the_codex_cli() {
             .await
             .unwrap();
             assert_eq!(receipt.daemon_preparation, DaemonPreparation::Skipped);
+            assert_eq!(
+                receipt.launch_method,
+                proxy_guard_core::LaunchMethod::NativeProcess
+            );
+            assert_eq!(
+                receipt.proxy_delivery,
+                proxy_guard_core::ProxyDelivery::ProcessEnvironment
+            );
+            assert_eq!(
+                receipt.backend_proxy_config,
+                proxy_guard_core::BackendProxyConfig::NotApplicable
+            );
             assert!(
                 !stop_marker.exists(),
                 "normal launch must not run any daemon command"
@@ -146,6 +158,35 @@ async fn normal_launch_never_invokes_the_codex_cli() {
             wait_for_file(&desktop_marker).await;
         },
     )
+    .await;
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn activation_only_is_refused_for_unpackaged_targets_without_spawning() {
+    let root = temp_dir("activation-only");
+    let desktop_marker = root.join("desktop-spawned");
+    with_fixture_env(&desktop_marker, &[], async {
+        let config = config_with_cli_override(&fake_cli_exe());
+        let info = desktop_info(&fake_cli_exe());
+        let error = launch_codex_with(
+            &info,
+            &config,
+            LaunchOptions {
+                refresh_codex_daemon: false,
+                activation_only: true,
+            },
+            &CancellationToken::new(),
+            &launch_hooks(&real_resolver),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.starts_with("ACTIVATION_ONLY_UNSUPPORTED:"), "{error}");
+        assert!(
+            !desktop_marker.exists(),
+            "an activation-only request must never spawn an unpackaged EXE"
+        );
+    })
     .await;
     fs::remove_dir_all(root).unwrap();
 }

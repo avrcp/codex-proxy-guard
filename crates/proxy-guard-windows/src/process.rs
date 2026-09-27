@@ -378,6 +378,17 @@ pub async fn launch_codex_with(
             .await
         }
         DesktopTargetKind::UnpackagedExecutable => {
+            // activation-only is the registered-application identity
+            // diagnostic; an unpackaged spawn has no activation to compare,
+            // and silently injecting the proxy environment under that flag
+            // would make the receipt's "not_established" a lie.
+            if options.activation_only {
+                return Err(
+                    "ACTIVATION_ONLY_UNSUPPORTED: --activation-only compares the registered \
+                     application activation path and requires a registered Desktop application"
+                        .into(),
+                );
+            }
             let environment = proxy_environment(config);
             let mut command = Command::new(&info.executable);
             apply_proxy_environment(&mut command, &environment);
@@ -401,11 +412,7 @@ pub async fn launch_codex_with(
                 instance: proxy_guard_core::InstanceObservation::Created,
                 package_identity: PackageIdentityObservation::NotApplicable,
                 aumid: AumidObservation::NotApplicable,
-                proxy_delivery: if options.activation_only {
-                    ProxyDelivery::NotEstablished
-                } else {
-                    ProxyDelivery::ProcessEnvironment
-                },
+                proxy_delivery: ProxyDelivery::ProcessEnvironment,
                 backend_proxy_config: BackendProxyConfig::NotApplicable,
                 target_elevation,
                 desktop: info.into(),

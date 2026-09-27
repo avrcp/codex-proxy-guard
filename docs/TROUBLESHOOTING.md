@@ -36,6 +36,11 @@ executable_override = "D:\\Path\\To\\ChatGPT.exe"
 现有 ChatGPT Desktop 进程无法事后继承新环境。请从系统托盘完全退出 ChatGPT，然后在
 Guard 中按 `R` 刷新并重新启动。Guard 不提供强制终止。
 
+## `ACTIVATION_ONLY_UNSUPPORTED`
+
+`launch --activation-only` 是注册应用激活路径的身份对照诊断；普通未打包 EXE 没有激活可对照。
+该标志不会静默退化为带环境的普通启动。
+
 ## `APPX_ACTIVATION_FAILED`（含 HRESULT）
 
 Windows 拒绝了应用激活请求（错误中带十六进制 HRESULT）。Guard 不会退回到裸 EXE、
