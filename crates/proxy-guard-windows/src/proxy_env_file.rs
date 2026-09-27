@@ -7,8 +7,9 @@
 //!
 //! * every other byte of the file is preserved verbatim — the file is never
 //!   re-serialized as a whole, and its full contents are never echoed;
-//! * conflicting proxy keys outside the block (including `ALL_PROXY` and
-//!   case variants) are reported by key name and never overridden;
+//! * conflicting proxy keys outside the block (including `ALL_PROXY`, case
+//!   variants, and `export KEY=...` spellings) are reported by key name and
+//!   never overridden;
 //! * duplicate, truncated, or unknown-version Guard blocks refuse edits;
 //! * writes go through a same-directory temporary file plus an atomic
 //!   replace, with the original content re-verified immediately before;
@@ -321,6 +322,39 @@ fn parse_block_body(body: &[&str]) -> Result<ProxyEnvValues, String> {
     }
 }
 
+/// The assigned key of one dotenv line, for conflict detection only.
+///
+/// Understands the two spellings Codex's dotenv loader actually applies —
+/// `KEY=value` and `export KEY=value` (a lowercase `export` followed by
+/// whitespace) — and deliberately nothing more: no case variants of `export`,
+/// no shell syntax, no variable expansion. Guard is not a dotenv parser;
+/// it only needs the key name of a proxy assignment. Comment lines and
+/// lines without an assignment yield no key.
+fn assignment_key(line: &str) -> Option<&str> {
+    let line = line.trim_start();
+
+    if line.is_empty() || line.starts_with('#') {
+        return None;
+    }
+
+    let before_equal = line.split_once('=')?.0.trim();
+
+    if let Some(rest) = before_equal.strip_prefix("export")
+        && rest.chars().next().is_some_and(char::is_whitespace)
+    {
+        let key = rest.trim();
+        if !key.is_empty() {
+            return Some(key);
+        }
+    }
+
+    if before_equal.is_empty() {
+        None
+    } else {
+        Some(before_equal)
+    }
+}
+
 fn build_inspection(parts: &[String], block: Option<&ManagedBlock>) -> EnvFileInspection {
     let mut conflicting_keys: Vec<String> = Vec::new();
     let mut inside = false;
@@ -337,18 +371,16 @@ fn build_inspection(parts: &[String], block: Option<&ManagedBlock>) -> EnvFileIn
         if inside {
             continue;
         }
-        if let Some((key, _)) = line.split_once('=') {
-            let key = key.trim();
-            if CONFLICTING_KEYS
+        if let Some(key) = assignment_key(line)
+            && CONFLICTING_KEYS
                 .iter()
                 .any(|managed| key.eq_ignore_ascii_case(managed))
-                && !conflicting_keys
-                    .iter()
-                    .any(|existing| existing.eq_ignore_ascii_case(key))
-            {
-                // Report the key as written; never the value.
-                conflicting_keys.push(key.to_string());
-            }
+            && !conflicting_keys
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(key))
+        {
+            // Report the key as written; never the value.
+            conflicting_keys.push(key.to_string());
         }
     }
     let stripped = strip_block(parts);
@@ -629,6 +661,62 @@ mod tests {
         );
         assert_eq!(read(&path), original);
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn assignment_key_understands_the_dotenv_export_prefix() {
+        assert_eq!(assignment_key("HTTP_PROXY=x"), Some("HTTP_PROXY"));
+        assert_eq!(assignment_key("  HTTP_PROXY = x"), Some("HTTP_PROXY"));
+        assert_eq!(assignment_key("export HTTP_PROXY=x"), Some("HTTP_PROXY"));
+        assert_eq!(
+            assignment_key("\texport\tHTTPS_PROXY=x"),
+            Some("HTTPS_PROXY")
+        );
+        assert_eq!(assignment_key("# export HTTP_PROXY=x"), None);
+        assert_eq!(assignment_key("#HTTP_PROXY=x"), None);
+        assert_eq!(assignment_key("no assignment here"), None);
+        // Only the exact lowercase `export` + whitespace form is honored —
+        // the loader treats everything else as the literal key.
+        assert_eq!(assignment_key("export"), None);
+        assert_eq!(assignment_key("export =x"), Some("export"));
+        assert_eq!(assignment_key("exporter KEY=x"), Some("exporter KEY"));
+        assert_eq!(
+            assignment_key("EXPORT HTTP_PROXY=x"),
+            Some("EXPORT HTTP_PROXY")
+        );
+    }
+
+    #[test]
+    fn export_prefixed_proxy_keys_are_conflicts_for_every_managed_key() {
+        for key in CONFLICTING_KEYS {
+            let dir = temp_dir();
+            let path = dir.join(".env");
+            let original = format!("export {key}=http://127.0.0.1:7890\n");
+            fs::write(&path, &original).unwrap();
+
+            let error = prepare(&path, &values(10808)).unwrap_err();
+
+            assert!(
+                error.starts_with("BACKEND_PROXY_CONFIG_CONFLICT:"),
+                "{key}: {error}"
+            );
+            assert!(error.contains(key), "{key}: {error}");
+            assert!(
+                !error.contains("7890"),
+                "{key}: conflicting values must not be echoed: {error}"
+            );
+            assert_eq!(
+                read(&path),
+                original,
+                "{key}: the file must stay untouched and no block may be appended"
+            );
+            assert_eq!(
+                inspect(&path).unwrap().conflicting_keys,
+                [key],
+                "{key}: inspection must report the same conflict"
+            );
+            fs::remove_dir_all(&dir).unwrap();
+        }
     }
 
     #[test]
