@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use crate::{
     DesktopAppInfo, DesktopProcessState, GuardConfig, LaunchOptions, LaunchReceipt, ProxyField,
 };
@@ -5,12 +7,12 @@ use crate::{
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UserIntent {
     Launch,
-    RequestPackageContextLaunch,
-    ConfirmPackageContextLaunch,
-    CancelPackageContextLaunch,
     RequestDaemonRepairLaunch,
     ConfirmDaemonRepairLaunch,
     CancelDaemonRepairLaunch,
+    RequestBackendProxyConsent,
+    ConfirmBackendProxyConsent,
+    CancelBackendProxyConsent,
     Refresh,
     EditProxy,
     UpdateProxyField { field: ProxyField, value: String },
@@ -33,6 +35,15 @@ pub enum AppEffect {
     RefreshLocalState,
     LaunchDesktop(LaunchOptions),
     SaveConfig(GuardConfig),
+    /// Enable or disable the explicitly authorized Codex Home `.env` proxy
+    /// block. Disabling additionally removes Guard's own managed block from
+    /// the bound home; enabling only records the consent — the block itself is
+    /// prepared by the next launch, never at consent time.
+    UpdateBackendProxyConsent {
+        enable: bool,
+        /// Absolute Codex Home whose `.env` the consent is bound to.
+        home: PathBuf,
+    },
     Shutdown,
 }
 
@@ -44,6 +55,7 @@ pub enum TaskResult {
     },
     LaunchCompleted(Result<(DesktopAppInfo, LaunchReceipt), String>),
     ConfigSaved(Result<GuardConfig, String>),
+    BackendProxyConsentUpdated(Result<GuardConfig, String>),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -69,6 +81,9 @@ impl Capabilities {
             AppEffect::RefreshLocalState => true,
             AppEffect::LaunchDesktop(_) => self.launch_process,
             AppEffect::SaveConfig(_) => self.save_config,
+            // Managing the consent flag is a configuration change; the `.env`
+            // block itself is only written for a launch under this consent.
+            AppEffect::UpdateBackendProxyConsent { .. } => self.save_config,
             AppEffect::Shutdown => self.quit,
         };
         allowed
@@ -98,7 +113,7 @@ mod tests {
             capabilities
                 .authorize(&AppEffect::LaunchDesktop(LaunchOptions {
                     refresh_codex_daemon: true,
-                    package_context_compat: false,
+                    activation_only: false,
                 }))
                 .is_err()
         );
@@ -106,6 +121,23 @@ mod tests {
             capabilities
                 .authorize(&AppEffect::RefreshLocalState)
                 .is_ok()
+        );
+    }
+
+    #[test]
+    fn backend_consent_requires_save_capability() {
+        let capabilities = Capabilities {
+            launch_process: true,
+            save_config: false,
+            quit: true,
+        };
+        assert!(
+            capabilities
+                .authorize(&AppEffect::UpdateBackendProxyConsent {
+                    enable: true,
+                    home: PathBuf::from(r"C:\Users\example\.codex"),
+                })
+                .is_err()
         );
     }
 }

@@ -6,7 +6,7 @@ use clap::{Parser, Subcommand};
 #[command(
     name = "codex-proxy-guard",
     version,
-    about = "Launch ChatGPT Desktop (Chat, Work, and Codex) with a process-scoped loopback HTTP proxy"
+    about = "Launch ChatGPT Desktop (Chat, Work, and Codex) with a loopback HTTP proxy: registered apps are activated through Windows application activation, plain executables get a process-scoped environment"
 )]
 pub struct Cli {
     /// Use a specific Guard configuration file.
@@ -31,18 +31,20 @@ pub enum Command {
         /// same Codex Home.
         #[arg(long)]
         refresh_codex_daemon: bool,
-        /// One-shot package-context candidate for a registered FullTrust Desktop.
-        /// Its real Desktop and sandbox behavior still needs machine acceptance.
+        /// Diagnostic identity check: activate a registered Desktop without
+        /// proxy arguments and without touching the Codex Home `.env`. The
+        /// receipt reports proxy_delivery = not_established; this is never a
+        /// silent downgrade of a normal proxy launch.
         #[arg(long)]
-        package_context_compat: bool,
+        activation_only: bool,
     },
+    /// Print embedded build provenance (version, commit, dirty, exe path).
+    BuildInfo,
     #[command(hide = true)]
-    PackageHelper {
-        #[arg(long, hide = true)]
-        pipe: String,
-        #[arg(long, hide = true)]
-        nonce: String,
-    },
+    /// Internal one-shot native activation worker. Reads one bounded JSON
+    /// request on stdin, performs the activation, and writes one receipt line
+    /// to stdout. Not a public entry point.
+    InternalActivatePackage,
     /// Create the minimal configuration file.
     InitConfig {
         /// Replace an existing configuration file.
@@ -73,7 +75,7 @@ mod tests {
             Some(Command::Launch {
                 json: true,
                 refresh_codex_daemon: false,
-                package_context_compat: false,
+                activation_only: false,
             })
         ));
         assert!(matches!(
@@ -83,17 +85,27 @@ mod tests {
             Some(Command::Launch {
                 json: true,
                 refresh_codex_daemon: true,
-                package_context_compat: false,
+                activation_only: false,
             })
         ));
         assert!(matches!(
-            Cli::try_parse_from(["cpg", "launch", "--package-context-compat"])
+            Cli::try_parse_from(["cpg", "launch", "--activation-only"])
                 .unwrap()
                 .command,
             Some(Command::Launch {
-                package_context_compat: true,
+                activation_only: true,
                 ..
             })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["cpg", "build-info"]).unwrap().command,
+            Some(Command::BuildInfo)
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["cpg", "internal-activate-package"])
+                .unwrap()
+                .command,
+            Some(Command::InternalActivatePackage)
         ));
         assert!(matches!(
             Cli::try_parse_from(["cpg", "init-config", "--proxy-port", "7890"])
@@ -104,9 +116,12 @@ mod tests {
                 ..
             })
         ));
+        // The removed experimental surfaces must stay gone.
         assert!(Cli::try_parse_from(["cpg", "usage"]).is_err());
         assert!(Cli::try_parse_from(["cpg", "node-test"]).is_err());
         assert!(Cli::try_parse_from(["cpg", "daemon-stop"]).is_err());
         assert!(Cli::try_parse_from(["cpg", "launch", "--auto-stop-daemon"]).is_err());
+        assert!(Cli::try_parse_from(["cpg", "launch", "--package-context-compat"]).is_err());
+        assert!(Cli::try_parse_from(["cpg", "package-helper", "--pipe", "x"]).is_err());
     }
 }

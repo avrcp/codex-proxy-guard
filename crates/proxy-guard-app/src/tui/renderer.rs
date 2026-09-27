@@ -1,6 +1,6 @@
 use proxy_guard_core::{
-    AppState, ConfigReadiness, DesktopAppDiscovery, DesktopProcessState, LaunchState, ProxyEditor,
-    ProxyField,
+    AppState, ConfigReadiness, DesktopAppDiscovery, DesktopProcessState, DesktopTargetKind,
+    LaunchState, ProxyEditor, ProxyField,
 };
 use ratatui::{
     Frame,
@@ -79,16 +79,9 @@ fn draw_content(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     if let Some(editor) = &state.proxy_editor {
         draw_proxy_editor(&mut lines, editor.clone(), state.foreground.is_some());
     } else if state.daemon_repair_prompt {
-        draw_daemon_repair_prompt(
-            &mut lines,
-            matches!(
-                &state.desktop_app,
-                DesktopAppDiscovery::Found(info)
-                    if matches!(info.target_kind, proxy_guard_core::DesktopTargetKind::RegisteredPackage(_))
-            ),
-        );
-    } else if state.package_context_prompt {
-        draw_package_context_prompt(&mut lines);
+        draw_daemon_repair_prompt(&mut lines);
+    } else if state.backend_proxy_prompt {
+        draw_backend_proxy_prompt(&mut lines, state);
     } else if let Some(error) = &state.error_message {
         lines.push(Line::styled("Launch unavailable", theme::error()));
         lines.push(Line::raw(error.clone()));
@@ -100,30 +93,65 @@ fn draw_content(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         };
         lines.push(Line::styled(hint, theme::muted()));
     } else {
-        lines.push(key_value(
-            "Proxy",
-            state.config.proxy_url(),
-            theme::accent(),
-        ));
-        lines.push(key_value("App", desktop_label(state), Style::default()));
-        lines.push(key_value(
-            "Source",
-            desktop_source_label(state),
+        draw_status(&mut lines, state);
+    }
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
+}
+
+fn draw_status(lines: &mut Vec<Line<'static>>, state: &AppState) {
+    let registered = matches!(
+        &state.desktop_app,
+        DesktopAppDiscovery::Found(info) if matches!(info.target_kind, DesktopTargetKind::RegisteredPackage(_))
+    );
+    lines.push(key_value(
+        "Proxy",
+        state.config.proxy_url(),
+        theme::accent(),
+    ));
+    lines.push(key_value(
+        "Backend",
+        if registered {
+            "Windows registered app activation".into()
+        } else {
+            "process environment injection".into()
+        },
+        Style::default(),
+    ));
+    lines.push(key_value("App", desktop_label(state), Style::default()));
+    lines.push(key_value(
+        "Process",
+        process_label(state),
+        process_style(state),
+    ));
+    lines.push(key_value(
+        "Home cfg",
+        backend_config_label(state),
+        backend_config_style(state),
+    ));
+    if let DesktopAppDiscovery::NotFound(message) = &state.desktop_app {
+        lines.push(Line::styled(message.clone(), theme::error()));
+        lines.push(Line::styled(
+            "Install: https://chatgpt.com/download/ (Store ID 9PLM9XGG6VKS)",
             theme::muted(),
         ));
-        lines.push(key_value(
-            "Process",
-            process_label(state),
-            process_style(state),
-        ));
-        if let DesktopAppDiscovery::NotFound(message) = &state.desktop_app {
-            lines.push(Line::styled(message.clone(), theme::error()));
-            lines.push(Line::styled(
-                "Install: https://chatgpt.com/download/ (Store ID 9PLM9XGG6VKS)",
+    }
+    lines.push(Line::raw(""));
+    if registered {
+        lines.push(Line::from(vec![
+            Span::styled("Delivers  ", theme::muted()),
+            Span::raw("Chromium proxy arguments on activation"),
+        ]));
+        match backend_config_state(state) {
+            BackendConfigState::Authorized => lines.push(Line::styled(
+                "Plus the authorized HTTP(S)_PROXY/NO_PROXY block in the confirmed Codex Home",
                 theme::muted(),
-            ));
+            )),
+            BackendConfigState::NotAuthorized => lines.push(Line::styled(
+                "Backend Codex traffic is NOT proxied yet — press B to authorize the home .env",
+                theme::warning(),
+            )),
         }
-        lines.push(Line::raw(""));
+    } else {
         lines.push(Line::from(vec![
             Span::styled("Injects  ", theme::muted()),
             Span::raw("HTTP_PROXY · HTTPS_PROXY · NO_PROXY; removes ALL_PROXY"),
@@ -132,25 +160,56 @@ fn draw_content(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
             "This sets process environment only; it does not enforce all traffic.",
             theme::muted(),
         ));
-        lines.push(Line::styled(
-            "Press D for a shared-daemon repair launch (asks first).",
-            theme::muted(),
-        ));
-        lines.push(Line::styled(
-            "Press P for the one-shot package-context candidate (asks first).",
-            theme::muted(),
-        ));
-        lines.push(Line::raw(""));
-        lines.push(Line::styled(primary_action(state), theme::accent()));
-        lines.push(Line::styled(
-            "Press C to change the proxy host or port.",
-            theme::muted(),
-        ));
     }
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
+    lines.push(Line::styled(
+        "Press D for a shared-daemon repair launch (asks first).",
+        theme::muted(),
+    ));
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(primary_action(state), theme::accent()));
+    lines.push(Line::styled(
+        "Press C to change the proxy host or port.",
+        theme::muted(),
+    ));
 }
 
-fn draw_daemon_repair_prompt(lines: &mut Vec<Line<'static>>, packaged: bool) {
+enum BackendConfigState {
+    Authorized,
+    NotAuthorized,
+}
+
+fn backend_config_state(state: &AppState) -> BackendConfigState {
+    if state.config.codex.manage_codex_proxy_env {
+        BackendConfigState::Authorized
+    } else {
+        BackendConfigState::NotAuthorized
+    }
+}
+
+fn backend_config_label(state: &AppState) -> String {
+    if !matches!(
+        &state.desktop_app,
+        DesktopAppDiscovery::Found(info) if matches!(info.target_kind, DesktopTargetKind::RegisteredPackage(_))
+    ) {
+        return "—".into();
+    }
+    match backend_config_state(state) {
+        BackendConfigState::Authorized => format!(
+            "authorized ({})",
+            proxy_guard_core::display_path(&state.config.codex.proxy_env_home)
+        ),
+        BackendConfigState::NotAuthorized => "not authorized (press B)".into(),
+    }
+}
+
+fn backend_config_style(state: &AppState) -> Style {
+    match backend_config_state(state) {
+        BackendConfigState::Authorized => theme::success(),
+        BackendConfigState::NotAuthorized => theme::warning(),
+    }
+}
+
+fn draw_daemon_repair_prompt(lines: &mut Vec<Line<'static>>) {
     lines.push(Line::styled("Repair launch", theme::title()));
     lines.push(Line::raw(""));
     lines.push(Line::raw(
@@ -160,11 +219,6 @@ fn draw_daemon_repair_prompt(lines: &mut Vec<Line<'static>>, packaged: bool) {
         "This may interrupt tasks of other CLI / IDE / remote clients",
     ));
     lines.push(Line::raw("sharing the same Codex Home."));
-    if packaged {
-        lines.push(Line::raw(
-            "This also uses the unverified package-context candidate.",
-        ));
-    }
     lines.push(Line::raw(""));
     lines.push(Line::styled(
         "Y  Confirm and launch      N / Esc  Cancel",
@@ -172,22 +226,57 @@ fn draw_daemon_repair_prompt(lines: &mut Vec<Line<'static>>, packaged: bool) {
     ));
 }
 
-fn draw_package_context_prompt(lines: &mut Vec<Line<'static>>) {
-    lines.push(Line::styled("Package-context candidate", theme::title()));
-    lines.push(Line::raw(""));
-    lines.push(Line::raw(
-        "Launch with the registered FullTrust package context?",
+fn draw_backend_proxy_prompt(lines: &mut Vec<Line<'static>>, state: &AppState) {
+    let enabled = state.config.codex.manage_codex_proxy_env;
+    let bound = &state.config.codex.proxy_env_home;
+    let home = if bound.as_os_str().is_empty() {
+        proxy_guard_core::GuardConfig::default_codex_home()
+            .map(|home| proxy_guard_core::display_path(&home))
+            .unwrap_or_else(|| "<cannot resolve>".into())
+    } else {
+        proxy_guard_core::display_path(bound)
+    };
+    lines.push(Line::styled(
+        if enabled {
+            "Revoke backend proxy consent"
+        } else {
+            "Authorize backend proxy consent"
+        },
+        theme::title(),
     ));
     lines.push(Line::raw(""));
-    lines.push(Line::raw(
-        "This uses a Windows debugging command. Its real Desktop",
-    ));
-    lines.push(Line::raw(
-        "and sandbox behavior has not passed machine acceptance.",
-    ));
+    if enabled {
+        lines.push(Line::raw(
+            "Stop managing HTTP_PROXY / HTTPS_PROXY / NO_PROXY in this",
+        ));
+        lines.push(Line::raw("Codex Home .env?"));
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(home, theme::accent()));
+        lines.push(Line::raw(""));
+        lines.push(Line::raw(
+            "Guard removes only its own unmodified block; the rest of the",
+        ));
+        lines.push(Line::raw("file is left as-is."));
+    } else {
+        lines.push(Line::raw(
+            "Allow Guard to manage HTTP_PROXY / HTTPS_PROXY /",
+        ));
+        lines.push(Line::raw("NO_PROXY inside this Codex Home .env?"));
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(home, theme::accent()));
+        lines.push(Line::raw(""));
+        lines.push(Line::raw(
+            "It affects later Codex processes using the same Home, not just",
+        ));
+        lines.push(Line::raw("this Desktop. No system proxy, auth, or model"));
+        lines.push(Line::raw(
+            "changes. The block is prepared by the next launch",
+        ));
+        lines.push(Line::raw("and removed when you revoke."));
+    }
     lines.push(Line::raw(""));
     lines.push(Line::styled(
-        "Y  Launch once      N / Esc  Cancel",
+        "Y  Confirm      N / Esc  Cancel",
         theme::accent(),
     ));
 }
@@ -257,7 +346,9 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect) {
         Line::raw(""),
         Line::from(vec![
             Span::styled("Enter / L  ", theme::accent()),
-            Span::raw("Launch ChatGPT Desktop through the configured proxy"),
+            Span::raw(
+                "Launch ChatGPT Desktop through the configured proxy (registered apps activate natively)",
+            ),
         ]),
         Line::from(vec![
             Span::styled("D          ", theme::accent()),
@@ -266,8 +357,8 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect) {
             ),
         ]),
         Line::from(vec![
-            Span::styled("P          ", theme::accent()),
-            Span::raw("Test the package-context candidate once (asks for confirmation)"),
+            Span::styled("B          ", theme::accent()),
+            Span::raw("Authorize or revoke the Codex Home .env proxy block (asks first)"),
         ]),
         Line::from(vec![
             Span::styled("R          ", theme::accent()),
@@ -285,19 +376,37 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect) {
             Span::styled("Q / Ctrl-C ", theme::accent()),
             Span::raw("Quit Guard; ChatGPT Desktop keeps running"),
         ]),
+        Line::raw(""),
+        Line::styled(
+            format!(
+                "Build {} · commit {}{}",
+                crate::build_info::VERSION,
+                crate::build_info::COMMIT,
+                if crate::build_info::dirty() {
+                    " (dirty)"
+                } else {
+                    ""
+                }
+            ),
+            theme::muted(),
+        ),
+        Line::styled(
+            "Run `codex-proxy-guard build-info` for the exact executable and provenance.",
+            theme::muted(),
+        ),
     ];
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
 }
 
 fn draw_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
-    let shortcuts = if state.daemon_repair_prompt {
+    let shortcuts = if state.daemon_repair_prompt || state.backend_proxy_prompt {
         "Y  Confirm     N / Esc  Cancel"
     } else if state.proxy_editor.is_some() {
         "Ctrl-U  Clear     Tab / Up/Down  Field     Enter  Save     Esc  Cancel"
     } else if state.show_help {
         "? / Esc  Back     Q  Quit"
     } else {
-        "Enter  Launch     D  Repair     R  Refresh     ?  Help     Q  Quit"
+        "Enter  Launch     D  Repair     B  Home .env     R  Refresh     ?  Help     Q  Quit"
     };
     frame.render_widget(
         Paragraph::new(vec![
@@ -345,19 +454,6 @@ fn desktop_label(state: &AppState) -> String {
     }
 }
 
-fn desktop_source_label(state: &AppState) -> String {
-    match &state.desktop_app {
-        DesktopAppDiscovery::Found(info) => format!(
-            "{} · {}",
-            info.discovery_source.display_name(),
-            info.product.selection_reason()
-        ),
-        DesktopAppDiscovery::Unknown
-        | DesktopAppDiscovery::Searching
-        | DesktopAppDiscovery::NotFound(_) => "—".into(),
-    }
-}
-
 fn process_label(state: &AppState) -> String {
     match state.desktop_process {
         DesktopProcessState::Unknown => "Unknown".into(),
@@ -380,13 +476,7 @@ fn primary_action(state: &AppState) -> &'static str {
     } else if matches!(state.desktop_process, DesktopProcessState::Running { .. }) {
         "ChatGPT Desktop is already running — exit it fully before relaunching"
     } else if matches!(state.launch, LaunchState::Running(_)) {
-        "ChatGPT Desktop process created with the proxy environment"
-    } else if matches!(
-        &state.desktop_app,
-        DesktopAppDiscovery::Found(info)
-            if matches!(info.target_kind, proxy_guard_core::DesktopTargetKind::RegisteredPackage(_))
-    ) {
-        "Press P to test the package-context candidate (asks first)"
+        "ChatGPT Desktop was launched through the configured proxy"
     } else {
         "Press Enter to launch ChatGPT Desktop through this proxy"
     }
@@ -473,20 +563,53 @@ mod tests {
         assert!(text.contains("may interrupt tasks"));
         assert!(text.contains("Y  Confirm and launch"));
         assert!(!text.contains("Press Enter to launch"));
+        assert!(
+            !text.contains("package-context"),
+            "the experimental candidate wording must be gone"
+        );
     }
 
     #[test]
-    fn discovered_app_explains_product_version_architecture_and_source() {
-        let backend = TestBackend::new(110, 24);
+    fn backend_proxy_prompt_names_the_home_and_scope() {
+        let backend = TestBackend::new(100, 26);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = AppState::new(GuardConfig::default(), "config.toml".into());
+        state.config.codex.proxy_env_home = PathBuf::from(r"C:\Users\fixture\.codex");
+        state.backend_proxy_prompt = true;
+        terminal.draw(|frame| draw(frame, &state)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("Authorize backend proxy consent"));
+        assert!(text.contains("same Home, not just"));
+        assert!(text.contains("Y  Confirm"));
+    }
+
+    #[test]
+    fn registered_desktop_shows_native_activation_and_missing_backend_layer() {
+        let backend = TestBackend::new(110, 26);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut state = AppState::new(GuardConfig::default(), "config.toml".into());
         state.desktop_app = DesktopAppDiscovery::Found(Box::new(DesktopAppInfo {
             product: DesktopProduct::ChatGpt,
             package_name: "OpenAI.Codex".into(),
-            package_version: "26.727.6591.0".into(),
+            package_version: "26.924.2738.0".into(),
             architecture: "X64".into(),
             discovery_source: DesktopDiscoverySource::AppxManifest,
-            target_kind: DesktopTargetKind::UnpackagedExecutable,
+            target_kind: DesktopTargetKind::RegisteredPackage(
+                proxy_guard_core::PackageApplication {
+                    package_full_name: "OpenAI.Codex_26.924.2738.0_x64__2p2nqsd0c76g0".into(),
+                    package_family_name: "OpenAI.Codex_2p2nqsd0c76g0".into(),
+                    application_id: "App".into(),
+                    app_user_model_id: "OpenAI.Codex_2p2nqsd0c76g0!App".into(),
+                    manifest_executable: "app/ChatGPT.exe".into(),
+                    runtime_kind: proxy_guard_core::PackageRuntimeKind::FullTrustDesktop,
+                },
+            ),
             install_location: PathBuf::from("app"),
             executable: PathBuf::from("app/ChatGPT.exe"),
         }));
@@ -498,7 +621,33 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
-        assert!(text.contains("ChatGPT Desktop · 26.727.6591.0 · X64"));
-        assert!(text.contains("APPX manifest · current ChatGPT desktop app"));
+        assert!(text.contains("Windows registered app activation"));
+        assert!(text.contains("Chromium proxy arguments on activation"));
+        assert!(text.contains("NOT proxied yet"));
+        assert!(text.contains("press B"));
+        // No experimental candidate hint remains.
+        assert!(!text.contains("package-context"));
+        assert!(!text.contains("press P"));
+    }
+
+    #[test]
+    fn help_page_lists_current_keys_and_build_provenance() {
+        let backend = TestBackend::new(110, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = AppState::new(GuardConfig::default(), "config.toml".into());
+        state.show_help = true;
+        terminal.draw(|frame| draw(frame, &state)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("B  "));
+        assert!(text.contains(".env proxy block"));
+        assert!(text.contains("Build "));
+        assert!(text.contains("commit "));
+        assert!(!text.contains("package-context candidate"));
     }
 }

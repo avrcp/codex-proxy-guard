@@ -36,13 +36,22 @@ executable_override = "D:\\Path\\To\\ChatGPT.exe"
 现有 ChatGPT Desktop 进程无法事后继承新环境。请从系统托盘完全退出 ChatGPT，然后在
 Guard 中按 `R` 刷新并重新启动。Guard 不提供强制终止。
 
-## `APPX_PROXY_LAUNCH_UNSUPPORTED`
+## `APPX_ACTIVATION_FAILED`（含 HRESULT）
 
-已注册的 ChatGPT Desktop 需要包身份，而普通路径尚无经真实应用验收的身份加代理
-启动后端。Guard 会阻断裸 EXE 启动；这不是端口错误，也不应先按 `D` 停止共享服务。
-本轮提供单次包上下文候选：TUI 按 `P` 再按 `Y`，或 CLI 使用
-`launch --package-context-compat`。它使用 Windows 调试命令，真实 Desktop、网络和
-沙箱行为仍需按 [验收记录](PACKAGE_IDENTITY_ACCEPTANCE.md) 完成验证。
+Windows 拒绝了应用激活请求（错误中带十六进制 HRESULT）。Guard 不会退回到裸 EXE、
+调试上下文或管理员方式。先用 `scripts/inspect-package-launch.ps1` 只读核对注册入口；
+若最近刚升级包，按 `R` 刷新后重试。
+
+## `APPX_ACTIVATION_OUTCOME_UNKNOWN`
+
+激活请求已提交但结果未知（取消、超时或 worker 未回执）。Windows 可能已经启动应用；
+Guard 不会自动重试，也不会杀掉目标。先按 `R` 刷新查看 Desktop 是否在运行，再决定
+是否需要下一次显式启动。
+
+## `APPX_TARGET_EXITED_EARLY`
+
+激活曾返回 PID，但目标在观察窗口内退出（错误中含退出码）。保留该退出码；这通常是
+应用自身初始化失败，不是身份缺失。
 
 ## `APPX_METADATA_INCOMPLETE` / `APPX_APPLICATION_AMBIGUOUS`
 
@@ -50,16 +59,32 @@ Guard 中按 `R` 刷新并重新启动。Guard 不提供强制终止。
 EXE。可用 `scripts/inspect-package-launch.ps1` 只读检查本机包与 Application；该脚本
 不会启动应用或读认证内容。不要把包目录、家庭目录等本机路径原样贴到公开报告。
 
-## `APPX_IDENTITY_MISSING` / `APPX_IDENTITY_MISMATCH` / `APPX_IDENTITY_QUERY_FAILED`
+## `APPX_IDENTITY_MISSING` / `APPX_IDENTITY_MISMATCH` / `APPX_AUMID_MISSING` / `APPX_AUMID_MISMATCH` / `*_QUERY_FAILED`
 
-分别表示实际目标进程没有包身份、身份与本轮所选包不一致、或 Windows 查询未能确认。
-即使进程曾被创建，这些结果都不是启动成功。不要自动再次启动，也不要以修改代理端口
-代替身份排查；记录错误码、目标 PID 与包版本后再定位。
+分别表示实际目标进程没有包身份/应用身份、身份与本轮所选注册条目不一致、或 Windows
+查询未能确认（查询失败与"没有身份"是不同的事实）。即使进程曾被创建，这些结果都不是
+启动成功。不要自动再次启动，也不要以修改代理端口代替身份排查；记录错误码、目标 PID
+与包版本后再定位。若身份正确但仍见"无程序包标识符"弹窗，用
+`scripts/inspect-package-launch.ps1 -ProcessId <弹窗进程PID>` 定位弹窗归属——它可能
+来自另一个进程（应用内部重启的子进程、旧实例），不能把根进程身份结论套用到所有
+后代进程。
 
-## `APPX_PACKAGE_LAUNCH_OUTCOME_UNKNOWN` / `APPX_LAUNCH_EARLY_EXIT_OR_UNQUERYABLE` / `APPX_TARGET_VERIFY_FAILED`
+## `PROXY_BYPASS_UNSUPPORTED`
 
-启动许可可能已经提交、目标在启动期退出，或目标句柄查询失败。Guard 不会自动重复拉起或结束 Desktop。
-先查看目标应用是否仍在运行，再决定是否需要刷新和下一次显式启动。
+`proxy.no_proxy` 中存在无法等价映射到 Chromium bypass 列表的条目（域名、通配符、
+CIDR 等）。Guard 拒绝静默丢弃规则。请把该条目从 `no_proxy` 中移除（默认的
+`localhost`、`127.0.0.1`、`::1` 会自动映射）。
+
+## `BACKEND_PROXY_CONSENT_REQUIRED` / `BACKEND_PROXY_SCOPE_UNCONFIRMED`
+
+后端 `.env` 代理块未授权，或启用了授权但没有绑定已确认的绝对 Codex Home。在 TUI
+按 `B` 查看确切 Home 并确认（默认取消）。Guard 不会猜测 Home，也不会用自己的
+`CODEX_HOME` 代替确认。
+
+## `BACKEND_PROXY_CONFIG_CONFLICT`
+
+`.env` 中 Guard 标记块之外已有 `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`（含大小写变体）
+或 `ALL_PROXY`。Guard 绝不抢占：错误只列出键名（不回显值），请手工整理后再授权。
 
 ## `LAUNCH_BUSY`
 
@@ -85,11 +110,12 @@ Guard 无法查询自身的权限状态（Win32 token 查询失败）。查询�
 ## 普通启动与修复启动的区别
 
 普通启动（`Enter` / `launch`）不解析 Codex CLI、不执行任何 daemon 命令：它对共享
-后台服务零副作用，也不会因为本机没有 Codex CLI 而失败。它仍会对未经验收的已注册
-包明确阻断。只有你显式授权的修复启动
+后台服务零副作用，也不会因为本机没有 Codex CLI 而失败。已注册应用通过 Windows
+注册入口原生激活。只有你显式授权的修复启动
 （TUI 按 `D` 再按 `Y`，或 `launch --refresh-codex-daemon`）才会执行
 `codex app-server daemon stop`——该命令可能中断同一 Codex Home 下其他 CLI / IDE /
-远程客户端正在执行的任务，因此必须逐次确认，授权不会保存。
+远程客户端正在执行的任务，因此必须逐次确认，授权不会保存。包身份问题不需要也不
+应该先停止 daemon。
 
 ## `CODEX_CLI_UNAVAILABLE` / `CODEX_CLI_OVERRIDE_INVALID` / `CODEX_HOME_INVALID`
 
@@ -146,8 +172,10 @@ Desktop 注入的代理环境不会影响它。需要丢弃旧环境时，使用
    也可能存在不同 Codex Home 或非共享后端）。修复启动针对的是“已解析 Codex Home 中的
    共享服务”；若修复后流量仍走旧端口，问题可能在别处，按下一节的网络排查处理。
 2. Codex CLI 启动时可能用 Codex Home 下 `.env` 中的非 `CODEX_` 键（例如写死的
-   `HTTP_PROXY`）覆盖继承的环境变量。Guard 不读取、不修改该文件；请在本地自行检查
-   其中的代理键。不要把 `.env` 或任何认证文件的内容粘贴到 issue 里。
+   `HTTP_PROXY`）覆盖继承的环境变量。让后端走代理的受管方式是在 TUI 按 `B` 授权
+   Guard 的 `.env` 代理块（只管理自己的标记块）；若你想手工维护，请自行检查其中的
+   代理键——若手工键与 Guard 块并存，Guard 会报告 `BACKEND_PROXY_CONFIG_CONFLICT`
+   并拒绝写入。不要把 `.env` 或任何认证文件的内容粘贴到 issue 里。
 
 ## Desktop 启动后无法联网
 

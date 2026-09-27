@@ -1,14 +1,20 @@
+pub mod appmodel_activation;
 pub mod appx;
 pub mod codex_daemon;
 pub mod elevation;
 pub mod environment;
 #[cfg(windows)]
 pub mod package_identity;
-pub mod packaged_launch;
 pub mod process;
+pub mod proxy_env_file;
+pub mod proxy_launch_plan;
 #[cfg(windows)]
 mod system_tools;
 
+pub use appmodel_activation::{
+    ActivationOutcome, ActivationWorkerReceipt, ActivationWorkerRequest, PROTOCOL_VERSION,
+    run_activation_worker,
+};
 pub use appx::discover_desktop_app;
 pub use codex_daemon::{
     CodexCli, CodexHomeInput, DaemonStopBudget, resolve_codex_cli, resolve_codex_cli_from,
@@ -19,4 +25,9 @@ pub use elevation::{
     query_elevation,
 };
 pub use environment::{apply_proxy_environment, proxy_environment};
-pub use process::{LaunchHooks, desktop_process_state, launch_codex, launch_codex_with};
+pub use process::{
+    BackendProxyScope, LaunchHooks, backend_proxy_scope, desktop_process_state, launch_codex,
+    launch_codex_with,
+};
+pub use proxy_env_file::{ProxyEnvValues, env_path, inspect, prepare, revoke};
+pub use proxy_launch_plan::proxy_launch_plan;

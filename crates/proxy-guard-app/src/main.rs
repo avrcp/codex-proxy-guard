@@ -1,3 +1,4 @@
+mod build_info;
 mod cli;
 mod dispatcher;
 mod tui;
@@ -17,19 +18,24 @@ use tokio_util::sync::CancellationToken;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    if let Some(Command::PackageHelper { pipe, nonce }) = &cli.command {
-        // This hidden, one-shot path runs before user configuration, the TUI,
-        // and all daemon code. The Windows adapter validates its package
-        // context and accepts only the bounded launch protocol.
-        return proxy_guard_windows::packaged_launch::run_package_helper(pipe, nonce)
-            .await
-            .map_err(|error| anyhow::anyhow!(redact_text(&error)));
+    if matches!(&cli.command, Some(Command::InternalActivatePackage)) {
+        // This hidden, one-shot worker path runs before user configuration,
+        // the TUI, and all daemon code. It only performs the bounded native
+        // activation protocol on stdin/stdout.
+        return run_internal_activation_worker().await;
     }
     let config_path = cli.config.unwrap_or(GuardConfig::config_path()?);
 
     match cli.command {
         Some(Command::ConfigPath) => {
             println!("{}", config_path.display());
+            Ok(())
+        }
+        Some(Command::BuildInfo) => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&build_info::build_info())?
+            );
             Ok(())
         }
         Some(Command::InitConfig {
@@ -40,32 +46,72 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Launch {
             json,
             refresh_codex_daemon,
-            package_context_compat,
+            activation_only,
         }) => {
             let (config, _) = GuardConfig::load_or_create(&config_path)
                 .with_context(|| format!("load configuration {}", config_path.display()))?;
             let options = LaunchOptions {
                 refresh_codex_daemon,
-                package_context_compat,
+                activation_only,
             };
             let (_, receipt) = launch_command(&config, options).await?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&receipt)?);
             } else {
-                println!(
-                    "{} process created through {} (PID {})",
-                    receipt.desktop.product.display_name(),
-                    receipt.proxy_endpoint,
-                    receipt.pid
-                );
-                if !receipt.daemon_preparation.status_detail().is_empty() {
-                    println!("{}", receipt.daemon_preparation.status_detail());
-                }
+                print_receipt_summary(&receipt);
             }
             Ok(())
         }
-        Some(Command::PackageHelper { .. }) => unreachable!("handled before configuration"),
+        Some(Command::InternalActivatePackage) => unreachable!("handled before configuration"),
         None => tui::run(with_elevation_hint(tui_state(&config_path))).await,
+    }
+}
+
+/// The hidden activation worker: plain stdio, no configuration, no TUI, no
+/// daemon code. Exit status carries the protocol outcome: zero when a receipt
+/// was produced (including a failed activation — that is a result, not an
+/// error of the worker), non-zero only for pre-activation rejections, which
+/// never activated anything.
+async fn run_internal_activation_worker() -> anyhow::Result<()> {
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    let mut input = stdin.lock();
+    let mut output = stdout.lock();
+    proxy_guard_windows::run_activation_worker(&mut input, &mut output)
+        .map_err(|error| anyhow::anyhow!(redact_text(&error)))
+}
+
+fn print_receipt_summary(receipt: &LaunchReceipt) {
+    match receipt.launch_method {
+        proxy_guard_core::LaunchMethod::AppmodelActivation => println!(
+            "{} activated through Windows registered application activation (PID {})",
+            receipt.desktop.product.display_name(),
+            receipt.pid
+        ),
+        proxy_guard_core::LaunchMethod::NativeProcess => println!(
+            "{} process created through {} (PID {})",
+            receipt.desktop.product.display_name(),
+            receipt
+                .proxy_endpoint
+                .as_deref()
+                .unwrap_or("<no proxy plan>"),
+            receipt.pid
+        ),
+    }
+    match receipt.proxy_delivery {
+        proxy_guard_core::ProxyDelivery::ProcessEnvironment => {}
+        proxy_guard_core::ProxyDelivery::ActivationArguments => {
+            println!("Chromium proxy arguments submitted; backend Codex Home config not authorized")
+        }
+        proxy_guard_core::ProxyDelivery::ActivationArgumentsAndHomeConfig => {
+            println!("Chromium proxy arguments submitted; backend Codex Home config prepared")
+        }
+        proxy_guard_core::ProxyDelivery::NotEstablished => {
+            println!("no proxy delivered (activation-only)")
+        }
+    }
+    if !receipt.daemon_preparation.status_detail().is_empty() {
+        println!("{}", receipt.daemon_preparation.status_detail());
     }
 }
 
@@ -215,5 +261,51 @@ mod tests {
         assert_eq!(state.config_readiness, ConfigReadiness::RepairRequired);
         assert!(state.status_message.contains("Managed (v3)"));
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn receipt_summary_separates_the_proxy_layers() {
+        let receipt = |delivery| LaunchReceipt {
+            pid: 42,
+            proxy_endpoint: if matches!(delivery, proxy_guard_core::ProxyDelivery::NotEstablished) {
+                None
+            } else {
+                Some("http://127.0.0.1:10808".into())
+            },
+            daemon_preparation: proxy_guard_core::DaemonPreparation::Skipped,
+            launch_method: proxy_guard_core::LaunchMethod::AppmodelActivation,
+            activation_state: proxy_guard_core::ActivationState::Returned,
+            instance: proxy_guard_core::InstanceObservation::Created,
+            package_identity: proxy_guard_core::PackageIdentityObservation::Matched,
+            aumid: proxy_guard_core::AumidObservation::Matched,
+            proxy_delivery: delivery,
+            backend_proxy_config: match delivery {
+                proxy_guard_core::ProxyDelivery::ActivationArgumentsAndHomeConfig => {
+                    proxy_guard_core::BackendProxyConfig::Prepared
+                }
+                proxy_guard_core::ProxyDelivery::ActivationArguments => {
+                    proxy_guard_core::BackendProxyConfig::NotAuthorized
+                }
+                _ => proxy_guard_core::BackendProxyConfig::NotApplicable,
+            },
+            target_elevation: Some(false),
+            desktop: proxy_guard_core::DesktopLaunchInfo {
+                product: proxy_guard_core::DesktopProduct::ChatGpt,
+                package_name: "OpenAI.Codex".into(),
+                package_version: "1".into(),
+                architecture: "X64".into(),
+                discovery_source: proxy_guard_core::DesktopDiscoverySource::AppxManifest,
+            },
+        };
+        let activation_only = receipt(proxy_guard_core::ProxyDelivery::NotEstablished);
+        assert!(
+            activation_only.proxy_endpoint.is_none(),
+            "activation-only must never imply a delivered proxy plan"
+        );
+        let layered = receipt(proxy_guard_core::ProxyDelivery::ActivationArgumentsAndHomeConfig);
+        assert_eq!(
+            layered.backend_proxy_config,
+            proxy_guard_core::BackendProxyConfig::Prepared
+        );
     }
 }

@@ -16,18 +16,22 @@
 
 ## 程序包身份边界
 
-已注册 Desktop 不能以包目录内裸 EXE 的创建成功充当启动成功。普通 Enter/L 对尚未
-验收的打包后端返回 `APPX_PROXY_LAUNCH_UNSUPPORTED`。只有 TUI `P`+`Y` 或 CLI
-`--package-context-compat` 的本次选择才能使用包上下文候选；选择不写入配置。
-该路线使用 Windows 的 `Invoke-CommandInDesktopPackage` 调试命令，仅限已确认的
-FullTrust 桌面 Application。其 token 与正常激活不同，真实应用和沙箱尚未验收。
+已注册 Desktop 只能通过 Windows 注册入口原生激活：以动态解析的 AUMID 调用
+`IApplicationActivationManager::ActivateApplication`（`AO_NONE`）。绝不裸启动包目录内
+EXE，不使用 `Invoke-CommandInDesktopPackage`、`IPackageDebugSettings` 调试模式、
+`--no-sandbox`、调试端口或任何提权/降权技巧充当身份修复。
 
-Guard 查询 OS 分配给**实际目标进程**的 PackageFullName，并与本轮注册元数据精确
-比较；无身份、版本不匹配和查询失败分别报告。一次性本地命名管道有随机 nonce、
-有界消息和对端 PID/路径/包身份校验。helper 只接收已注册目标、loopback HTTP 代理
-和本轮允许的 Home 作用域；它不是 Codex 私有 IPC、通用命令执行器或常驻服务。
-启动许可发出后结果未知时，不自动重试，不终止 Desktop。只清理 Guard 自己的短命
-PowerShell/helper 进程。
+COM 调用由 Guard 自己的短命 worker 进程执行（同一 EXE 的隐藏
+`internal-activate-package` 子命令；16 KiB stdin 请求 / 64 KiB stdout 回执，无命名管道、
+无 nonce、无监听端口）。worker 不需要 OpenAI 包身份，也从不运行在包上下文中；它只接收
+由本轮发现结果构建的 AUMID、预期包身份与白名单参数，拒绝其他任何字段。提交前取消
+保证不发起激活；提交后取消/超时按 `APPX_ACTIVATION_OUTCOME_UNKNOWN` 报告，不自动重试，
+不终止 Desktop。超时或取消只回收 Guard 自己的 worker。
+
+Guard 持有句柄查询**实际目标进程**的 PackageFullName 与 AUMID，与本轮注册元数据精确
+比较；缺失（`APPMODEL_ERROR_NO_PACKAGE/NO_APPLICATION`）、不匹配与查询失败分别报告，
+Win32 状态码不冒充 HRESULT。映像路径、创建时间（区分新建/复用实例）与 TokenElevation
+作为附加观测记录。返回的 PID 只是激活事实，不代表界面就绪或业务代理已生效。
 
 ## Codex daemon 兼容边界
 
@@ -52,7 +56,28 @@ codex app-server daemon stop
 
 注意：官方 stop 命令本身也是破坏性操作——会中断同一 Codex Home 下其他 CLI / IDE /
 远程客户端正在执行的任务；stop 成功也不代表新进程一定使用新代理（Codex CLI 启动时
-可能用 Codex Home 下 `.env` 的值覆盖继承环境，Guard 不读取也不修改该文件）。
+可能用 Codex Home 下 `.env` 的值覆盖继承环境）。让后端走代理的唯一受管入口是下节的
+授权代理块。
+
+## Codex Home `.env` 授权代理块
+
+默认关闭。仅当用户在 TUI `B` 确认页对显示的确切 Home 按下 `Y` 后，Guard 才会在该
+Home 的 `.env` 中维护一个 BEGIN/END 标记的 `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` 块。
+该块影响之后从同一 Home 启动的所有 Codex 客户端，不只本次 Desktop；确认文案必须说明
+这一作用域。块的编辑规则：
+
+- 只操作精确匹配的当前版本标记块；重复块、缺损块、未知版本、非 UTF-8、超过 1 MiB
+  的文件拒绝自动编辑；
+- 块外字节逐字保留（含 CRLF），文件从不被整体重写，文件内容从不回显；
+- 块外已有代理键（含大小写变体与 `ALL_PROXY`）按名报告冲突（`BACKEND_PROXY_CONFIG_CONFLICT`），
+  绝不抢占或追加覆盖；
+- 写入经同目录临时文件原子替换，替换前复核原内容未变；
+- 撤销只删除 Guard 自己未被外部修改的块；仅当文件除该块外无实质内容时才删除文件；
+- 未授权（包括仅展示、取消、刷新配置）时绝不创建、修改或删除 `.env`；
+- Guard 绝不从自己的 `CODEX_HOME` 推断 Desktop 的 Home；自定义 Home 未确认时返回
+  `BACKEND_PROXY_SCOPE_UNCONFIRMED`，不写任何文件；
+- 准备成功只是文件事实（`backend_proxy_config_prepared`），不是网络验证；实际内置
+  后端不读取该文件时记录 `BACKEND_PROXY_DELIVERY_UNSUPPORTED`，不扩大手段。
 
 禁止：
 
@@ -63,8 +88,8 @@ codex app-server daemon stop
 - 读取 daemon 私有状态或任何认证数据；
 - 直接终止共享 Codex 进程或 Desktop（`TerminateProcess` / `taskkill` / PID 强杀 /
   Job Object）；
-- 修改 `~/.codex/config.toml`、`~/.codex/.env`，或写入 `features.daemon_auto_start` 之类
-  的开关来对抗 daemon 架构。
+- 修改 `~/.codex/config.toml`，或在授权块之外写入 `~/.codex/.env`
+  （包括 `features.daemon_auto_start` 之类对抗 daemon 架构的开关）。
 
 ## 权限边界
 

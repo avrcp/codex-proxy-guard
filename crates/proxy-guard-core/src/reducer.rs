@@ -17,91 +17,87 @@ fn reduce_intent(state: &mut AppState, intent: UserIntent) -> Vec<AppEffect> {
         return vec![AppEffect::Shutdown];
     }
 
-    if state.package_context_prompt {
+    // The backend proxy consent is modal: only Y / N / Esc act on it, and
+    // refresh or proxy editing simply closes it. Y authorizes exactly the
+    // displayed home.
+    if state.backend_proxy_prompt {
         match intent {
-            UserIntent::ConfirmPackageContextLaunch => {
-                state.package_context_prompt = false;
+            UserIntent::ConfirmBackendProxyConsent => {
+                state.backend_proxy_prompt = false;
+                let Some(home) = consent_home(state) else {
+                    state.status_message =
+                        "Cannot resolve the Codex Home to bind; set an absolute path first".into();
+                    return Vec::new();
+                };
                 if state.config_readiness != ConfigReadiness::Ready {
                     state.status_message =
                         "Configuration must be repaired before launch (press C)".into();
                     return Vec::new();
                 }
                 if state.foreground.is_some() {
-                    state.status_message = "A launch operation is already in progress".into();
+                    state.status_message =
+                        "A configuration operation is already in progress".into();
                     return Vec::new();
                 }
-                state.foreground = Some(ForegroundOperation::Launch);
-                state.launch = LaunchState::Launching;
-                state.status_message = "Launching the package-context candidate…".into();
-                return vec![AppEffect::LaunchDesktop(LaunchOptions {
-                    refresh_codex_daemon: false,
-                    package_context_compat: true,
-                })];
+                let enable = !state.config.codex.manage_codex_proxy_env;
+                state.foreground = Some(ForegroundOperation::UpdateBackendProxyConsent);
+                state.status_message = if enable {
+                    "Recording the backend proxy consent…".into()
+                } else {
+                    "Revoking the backend proxy consent and removing Guard's block…".into()
+                };
+                return vec![AppEffect::UpdateBackendProxyConsent { enable, home }];
             }
-            UserIntent::CancelPackageContextLaunch => {
-                state.package_context_prompt = false;
-                state.status_message = "Package-context launch cancelled".into();
+            UserIntent::CancelBackendProxyConsent => {
+                state.backend_proxy_prompt = false;
+                state.status_message =
+                    "Backend proxy consent unchanged; no Codex Home file was touched".into();
                 return Vec::new();
             }
             UserIntent::Refresh | UserIntent::EditProxy => {
-                state.package_context_prompt = false;
+                state.backend_proxy_prompt = false;
             }
             _ => return Vec::new(),
         }
-    }
-
-    // The repair confirmation is modal: only Y / N / Esc act on it, and refresh
-    // or proxy editing simply closes it. Y authorizes exactly one launch.
-    if state.daemon_repair_prompt {
-        match intent {
-            UserIntent::ConfirmDaemonRepairLaunch => {
-                state.daemon_repair_prompt = false;
-                if state.config_readiness != ConfigReadiness::Ready {
+    } else {
+        // The repair confirmation is modal: only Y / N / Esc act on it, and
+        // refresh or proxy editing simply closes it. Y authorizes exactly one
+        // launch. Package identity problems are never a reason to stop the
+        // shared daemon; the stop only happens for its own sake.
+        if state.daemon_repair_prompt {
+            match intent {
+                UserIntent::ConfirmDaemonRepairLaunch => {
+                    state.daemon_repair_prompt = false;
+                    if state.config_readiness != ConfigReadiness::Ready {
+                        state.status_message =
+                            "Configuration must be repaired before launch (press C)".into();
+                        return Vec::new();
+                    }
+                    if state.foreground.is_some() {
+                        state.status_message = "A launch operation is already in progress".into();
+                        return Vec::new();
+                    }
+                    state.foreground = Some(ForegroundOperation::Launch);
+                    state.launch = LaunchState::Launching;
+                    state.status_message = "Stopping the shared Codex background server, then launching… (you can cancel)".into();
+                    return vec![AppEffect::LaunchDesktop(LaunchOptions {
+                        refresh_codex_daemon: true,
+                        activation_only: false,
+                    })];
+                }
+                UserIntent::CancelDaemonRepairLaunch => {
+                    state.daemon_repair_prompt = false;
                     state.status_message =
-                        "Configuration must be repaired before launch (press C)".into();
+                        "Repair launch cancelled; the shared Codex background server was not touched"
+                            .into();
                     return Vec::new();
                 }
-                if state.foreground.is_some() {
-                    state.status_message = "A launch operation is already in progress".into();
-                    return Vec::new();
+                UserIntent::RequestDaemonRepairLaunch => return Vec::new(),
+                UserIntent::Refresh | UserIntent::EditProxy => {
+                    state.daemon_repair_prompt = false;
                 }
-                state.foreground = Some(ForegroundOperation::Launch);
-                state.launch = LaunchState::Launching;
-                let package_context_compat = matches!(
-                    &state.desktop_app,
-                    DesktopAppDiscovery::Found(info)
-                        if matches!(info.target_kind, crate::DesktopTargetKind::RegisteredPackage(_))
-                );
-                state.status_message =
-                    "Stopping the shared Codex background server, then launching… (you can cancel)"
-                        .into();
-                return vec![AppEffect::LaunchDesktop(LaunchOptions {
-                    refresh_codex_daemon: true,
-                    package_context_compat,
-                })];
+                _ => return Vec::new(),
             }
-            UserIntent::CancelDaemonRepairLaunch => {
-                state.daemon_repair_prompt = false;
-                state.status_message =
-                    "Repair launch cancelled; the shared Codex background server was not touched"
-                        .into();
-                return Vec::new();
-            }
-            UserIntent::RequestDaemonRepairLaunch => return Vec::new(),
-            UserIntent::Refresh | UserIntent::EditProxy => {
-                state.daemon_repair_prompt = false;
-            }
-            UserIntent::Launch
-            | UserIntent::RequestPackageContextLaunch
-            | UserIntent::ConfirmPackageContextLaunch
-            | UserIntent::CancelPackageContextLaunch
-            | UserIntent::UpdateProxyField { .. }
-            | UserIntent::ToggleProxyField
-            | UserIntent::SaveProxy
-            | UserIntent::CancelProxyEdit
-            | UserIntent::ToggleHelp
-            | UserIntent::Dismiss
-            | UserIntent::Quit => return Vec::new(),
         }
     }
 
@@ -161,18 +157,7 @@ fn reduce_intent(state: &mut AppState, intent: UserIntent) -> Vec<AppEffect> {
                 state.status_message = "Saving proxy configuration…".into();
                 return vec![AppEffect::SaveConfig(updated)];
             }
-            UserIntent::Launch
-            | UserIntent::RequestPackageContextLaunch
-            | UserIntent::ConfirmPackageContextLaunch
-            | UserIntent::CancelPackageContextLaunch
-            | UserIntent::RequestDaemonRepairLaunch
-            | UserIntent::ConfirmDaemonRepairLaunch
-            | UserIntent::CancelDaemonRepairLaunch
-            | UserIntent::Refresh
-            | UserIntent::ToggleHelp
-            | UserIntent::Dismiss
-            | UserIntent::Quit
-            | UserIntent::EditProxy => {}
+            _ => {}
         }
         return Vec::new();
     }
@@ -196,8 +181,8 @@ fn reduce_intent(state: &mut AppState, intent: UserIntent) -> Vec<AppEffect> {
         && matches!(
             intent,
             UserIntent::Launch
-                | UserIntent::RequestPackageContextLaunch
                 | UserIntent::RequestDaemonRepairLaunch
+                | UserIntent::RequestBackendProxyConsent
         )
     {
         state.status_message = "Configuration must be repaired before launch (press C)".into();
@@ -216,17 +201,25 @@ fn reduce_intent(state: &mut AppState, intent: UserIntent) -> Vec<AppEffect> {
         UserIntent::Launch => {
             state.foreground = Some(ForegroundOperation::Launch);
             state.launch = LaunchState::Launching;
-            state.status_message = "Launching Desktop with the proxy environment…".into();
+            state.status_message = if registered_package_found(state) {
+                "Activating the registered Desktop application…".into()
+            } else {
+                "Launching Desktop with the proxy environment…".into()
+            };
             vec![AppEffect::LaunchDesktop(LaunchOptions::default())]
-        }
-        UserIntent::RequestPackageContextLaunch => {
-            state.package_context_prompt = true;
-            state.status_message = "Confirm the package-context candidate launch".into();
-            Vec::new()
         }
         UserIntent::RequestDaemonRepairLaunch => {
             state.daemon_repair_prompt = true;
             state.status_message = "Confirm the shared-daemon repair launch".into();
+            Vec::new()
+        }
+        UserIntent::RequestBackendProxyConsent => {
+            if consent_home(state).is_none() {
+                state.status_message = "Cannot resolve a Codex Home candidate to ask about".into();
+                return Vec::new();
+            }
+            state.backend_proxy_prompt = true;
+            state.status_message = "Confirm the backend proxy configuration consent".into();
             Vec::new()
         }
         UserIntent::Refresh => {
@@ -246,9 +239,31 @@ fn reduce_intent(state: &mut AppState, intent: UserIntent) -> Vec<AppEffect> {
         // A stale confirmation may arrive after its modal was consumed.
         UserIntent::ConfirmDaemonRepairLaunch
         | UserIntent::CancelDaemonRepairLaunch
-        | UserIntent::ConfirmPackageContextLaunch
-        | UserIntent::CancelPackageContextLaunch => Vec::new(),
+        | UserIntent::ConfirmBackendProxyConsent
+        | UserIntent::CancelBackendProxyConsent => Vec::new(),
     }
+}
+
+/// The home the consent prompt binds to: an already-bound absolute home, or
+/// the default `.codex` candidate under the user profile. Guard never derives
+/// this from its own CODEX_HOME.
+fn consent_home(state: &AppState) -> Option<std::path::PathBuf> {
+    let bound = &state.config.codex.proxy_env_home;
+    if bound.as_os_str().is_empty() {
+        crate::GuardConfig::default_codex_home()
+    } else if bound.is_absolute() {
+        Some(bound.clone())
+    } else {
+        None
+    }
+}
+
+fn registered_package_found(state: &AppState) -> bool {
+    matches!(
+        &state.desktop_app,
+        DesktopAppDiscovery::Found(info)
+            if matches!(info.target_kind, crate::DesktopTargetKind::RegisteredPackage(_))
+    )
 }
 
 fn reduce_result(state: &mut AppState, result: TaskResult) -> Vec<AppEffect> {
@@ -269,17 +284,9 @@ fn reduce_result(state: &mut AppState, result: TaskResult) -> Vec<AppEffect> {
             state.desktop_process = process;
             match desktop_app {
                 Ok(info) => {
-                    let packaged = matches!(
-                        &info.target_kind,
-                        crate::DesktopTargetKind::RegisteredPackage(_)
-                    );
                     state.desktop_app = DesktopAppDiscovery::Found(Box::new(info));
                     state.status_message = match state.desktop_process {
                         DesktopProcessState::Running { .. } => "Desktop is already running".into(),
-                        _ if packaged => {
-                            "Registered Desktop: press P for the one-shot candidate; Enter blocks"
-                                .into()
-                        }
                         _ => "Ready to launch through the configured proxy".into(),
                     };
                 }
@@ -330,26 +337,88 @@ fn reduce_result(state: &mut AppState, result: TaskResult) -> Vec<AppEffect> {
                 }
             }
         }
+        TaskResult::BackendProxyConsentUpdated(result) => {
+            if state.foreground != Some(ForegroundOperation::UpdateBackendProxyConsent) {
+                return Vec::new();
+            }
+            state.foreground = None;
+            match result {
+                Ok(config) => {
+                    state.config = config;
+                    if state.config.codex.manage_codex_proxy_env {
+                        state.status_message =
+                            "Backend proxy consent recorded for the bound Codex Home; the block is prepared by the next launch"
+                                .into();
+                    } else {
+                        state.status_message =
+                            "Backend proxy consent revoked; Guard's managed block was removed when it was unmodified"
+                                .into();
+                    }
+                }
+                Err(message) => {
+                    let message = redact_text(&message);
+                    state.status_message = "Backend proxy consent was not changed".into();
+                    state.error_message = Some(message);
+                }
+            }
+        }
     }
     Vec::new()
 }
 
-/// Reports only the creation and identity facts observed by Guard.
+/// Reports only the facts Guard actually observed: activation, identity,
+/// and each proxy layer separately.
 fn launch_status_message(receipt: &LaunchReceipt) -> String {
-    let base = match receipt.package_identity {
-        crate::PackageIdentityObservation::Verified => format!(
-            "Desktop created; package identity verified; proxy environment supplied (PID {})",
-            receipt.pid
-        ),
-        crate::PackageIdentityObservation::NotApplicable => format!(
-            "Desktop process created with the proxy environment (PID {})",
-            receipt.pid
-        ),
-    };
-    match receipt.daemon_preparation.status_detail() {
-        "" => base,
-        detail => format!("{base}; {detail}"),
+    let mut parts = Vec::new();
+    match receipt.launch_method {
+        crate::LaunchMethod::AppmodelActivation => {
+            let instance = match receipt.instance {
+                crate::InstanceObservation::Created => "new instance activated",
+                crate::InstanceObservation::Reused => "existing instance returned",
+                crate::InstanceObservation::Unknown => "instance returned",
+            };
+            parts.push(format!(
+                "Registered application activation returned PID {}; {instance}",
+                receipt.pid
+            ));
+            match receipt.package_identity {
+                crate::PackageIdentityObservation::Matched => {
+                    parts.push("package identity matched".into())
+                }
+                crate::PackageIdentityObservation::NotApplicable => {}
+                observation => parts.push(format!("package identity: {observation:?}")),
+            }
+            match receipt.aumid {
+                crate::AumidObservation::Matched => {
+                    parts.push("application identity matched".into())
+                }
+                crate::AumidObservation::NotApplicable => {}
+                observation => parts.push(format!("application identity: {observation:?}")),
+            }
+        }
+        crate::LaunchMethod::NativeProcess => {
+            parts.push(format!(
+                "Desktop process created with the proxy environment (PID {})",
+                receipt.pid
+            ));
+        }
     }
+    match receipt.proxy_delivery {
+        crate::ProxyDelivery::ProcessEnvironment => {}
+        crate::ProxyDelivery::ActivationArguments => parts
+            .push("Chromium proxy arguments submitted; backend home config not authorized".into()),
+        crate::ProxyDelivery::ActivationArgumentsAndHomeConfig => {
+            parts.push("Chromium proxy arguments submitted; backend home config prepared".into())
+        }
+        crate::ProxyDelivery::NotEstablished => {
+            parts.push("no proxy delivered (activation-only)".into())
+        }
+    }
+    let detail = receipt.daemon_preparation.status_detail();
+    if !detail.is_empty() {
+        parts.push(detail.into());
+    }
+    parts.join("; ")
 }
 
 #[cfg(test)]
@@ -397,7 +466,8 @@ mod tests {
             .is_empty()
         );
         assert!(!state.daemon_repair_prompt);
-        // Y only acts while the prompt is shown; exactly one authorized launch.
+        // Y only acts while the prompt is shown; exactly one authorized launch
+        // that never carries activation-only semantics.
         reduce(
             &mut state,
             AppAction::Intent(UserIntent::RequestDaemonRepairLaunch),
@@ -409,58 +479,14 @@ mod tests {
             ),
             vec![AppEffect::LaunchDesktop(LaunchOptions {
                 refresh_codex_daemon: true,
-                package_context_compat: false,
+                activation_only: false,
             })]
         );
         assert!(!state.daemon_repair_prompt);
     }
 
     #[test]
-    fn package_context_candidate_requires_single_use_confirmation() {
-        let mut state = state();
-        assert!(
-            reduce(
-                &mut state,
-                AppAction::Intent(UserIntent::RequestPackageContextLaunch)
-            )
-            .is_empty()
-        );
-        assert!(state.package_context_prompt);
-        assert!(reduce(&mut state, AppAction::Intent(UserIntent::Launch)).is_empty());
-        assert!(
-            reduce(
-                &mut state,
-                AppAction::Intent(UserIntent::CancelPackageContextLaunch)
-            )
-            .is_empty()
-        );
-        assert!(!state.package_context_prompt);
-        assert!(
-            reduce(
-                &mut state,
-                AppAction::Intent(UserIntent::ConfirmPackageContextLaunch)
-            )
-            .is_empty()
-        );
-        reduce(
-            &mut state,
-            AppAction::Intent(UserIntent::RequestPackageContextLaunch),
-        );
-        assert_eq!(
-            reduce(
-                &mut state,
-                AppAction::Intent(UserIntent::ConfirmPackageContextLaunch)
-            ),
-            vec![AppEffect::LaunchDesktop(LaunchOptions {
-                refresh_codex_daemon: false,
-                package_context_compat: true,
-            })]
-        );
-        assert!(!state.package_context_prompt);
-    }
-
-    #[test]
-    fn registered_package_repair_confirmation_includes_package_context_choice() {
+    fn repair_confirmation_no_longer_carries_a_package_context_choice() {
         let mut state = state();
         state.desktop_app = DesktopAppDiscovery::Found(Box::new(crate::DesktopAppInfo {
             product: DesktopProduct::ChatGpt,
@@ -490,9 +516,96 @@ mod tests {
             ),
             vec![AppEffect::LaunchDesktop(LaunchOptions {
                 refresh_codex_daemon: true,
-                package_context_compat: true,
+                activation_only: false,
             })]
         );
+    }
+
+    #[test]
+    fn backend_proxy_consent_is_modal_and_binds_the_displayed_home() {
+        let mut state = state();
+        state.config.codex.proxy_env_home = PathBuf::from(r"C:\Users\fixture\.codex");
+        assert!(
+            reduce(
+                &mut state,
+                AppAction::Intent(UserIntent::RequestBackendProxyConsent)
+            )
+            .is_empty()
+        );
+        assert!(state.backend_proxy_prompt);
+        assert!(reduce(&mut state, AppAction::Intent(UserIntent::Launch)).is_empty());
+        // Esc cancels without touching any Codex Home file.
+        assert!(
+            reduce(
+                &mut state,
+                AppAction::Intent(UserIntent::CancelBackendProxyConsent)
+            )
+            .is_empty()
+        );
+        assert!(!state.backend_proxy_prompt);
+        // A stale confirm after the modal closed does nothing.
+        assert!(
+            reduce(
+                &mut state,
+                AppAction::Intent(UserIntent::ConfirmBackendProxyConsent)
+            )
+            .is_empty()
+        );
+        reduce(
+            &mut state,
+            AppAction::Intent(UserIntent::RequestBackendProxyConsent),
+        );
+        assert_eq!(
+            reduce(
+                &mut state,
+                AppAction::Intent(UserIntent::ConfirmBackendProxyConsent)
+            ),
+            vec![AppEffect::UpdateBackendProxyConsent {
+                enable: true,
+                home: PathBuf::from(r"C:\Users\fixture\.codex"),
+            }]
+        );
+        assert!(!state.backend_proxy_prompt);
+        // Deliver the consent task result, then confirm again (now enabled):
+        // the same prompt revokes instead.
+        let mut updated = state.config.clone();
+        updated.codex.manage_codex_proxy_env = true;
+        updated.codex.proxy_env_home = PathBuf::from(r"C:\Users\fixture\.codex");
+        reduce(
+            &mut state,
+            AppAction::TaskComplete(Box::new(TaskResult::BackendProxyConsentUpdated(Ok(
+                updated,
+            )))),
+        );
+        assert!(state.config.codex.manage_codex_proxy_env);
+        reduce(
+            &mut state,
+            AppAction::Intent(UserIntent::RequestBackendProxyConsent),
+        );
+        assert_eq!(
+            reduce(
+                &mut state,
+                AppAction::Intent(UserIntent::ConfirmBackendProxyConsent)
+            ),
+            vec![AppEffect::UpdateBackendProxyConsent {
+                enable: false,
+                home: PathBuf::from(r"C:\Users\fixture\.codex"),
+            }]
+        );
+    }
+
+    #[test]
+    fn backend_proxy_consent_needs_a_resolvable_home() {
+        let mut state = state();
+        state.config.codex.proxy_env_home = PathBuf::from("relative/.codex");
+        assert!(
+            reduce(
+                &mut state,
+                AppAction::Intent(UserIntent::RequestBackendProxyConsent)
+            )
+            .is_empty()
+        );
+        assert!(!state.backend_proxy_prompt);
     }
 
     #[test]
@@ -529,6 +642,13 @@ mod tests {
             )
             .is_empty()
         );
+        assert!(
+            reduce(
+                &mut state,
+                AppAction::Intent(UserIntent::RequestBackendProxyConsent)
+            )
+            .is_empty()
+        );
         assert!(reduce(&mut state, AppAction::Intent(UserIntent::Dismiss)).is_empty());
         assert!(reduce(&mut state, AppAction::Intent(UserIntent::Launch)).is_empty());
         assert_eq!(state.config_readiness, ConfigReadiness::RepairRequired);
@@ -555,6 +675,38 @@ mod tests {
     }
 
     #[test]
+    fn backend_consent_result_updates_config_and_lifts_the_operation() {
+        let mut state = state();
+        state.foreground = Some(ForegroundOperation::UpdateBackendProxyConsent);
+        let mut updated = GuardConfig::default();
+        updated.codex.manage_codex_proxy_env = true;
+        updated.codex.proxy_env_home = PathBuf::from(r"C:\Users\fixture\.codex");
+        assert!(
+            reduce(
+                &mut state,
+                AppAction::TaskComplete(Box::new(TaskResult::BackendProxyConsentUpdated(Ok(
+                    updated
+                ))))
+            )
+            .is_empty()
+        );
+        assert_eq!(state.foreground, None);
+        assert!(state.config.codex.manage_codex_proxy_env);
+        assert!(state.status_message.contains("next launch"));
+        // A late result without the operation in flight is ignored.
+        assert!(
+            reduce(
+                &mut state,
+                AppAction::TaskComplete(Box::new(TaskResult::BackendProxyConsentUpdated(Ok(
+                    GuardConfig::default()
+                ))))
+            )
+            .is_empty()
+        );
+        assert!(state.config.codex.manage_codex_proxy_env);
+    }
+
+    #[test]
     fn launch_completion_updates_process_without_extra_effects() {
         let mut state = state();
         reduce(&mut state, AppAction::Intent(UserIntent::Launch));
@@ -570,10 +722,16 @@ mod tests {
         };
         let receipt = LaunchReceipt {
             pid: 42,
-            proxy_endpoint: "http://127.0.0.1:10808".into(),
+            proxy_endpoint: Some("http://127.0.0.1:10808".into()),
             daemon_preparation: DaemonPreparation::Skipped,
             launch_method: crate::LaunchMethod::NativeProcess,
+            activation_state: crate::ActivationState::NotSubmitted,
+            instance: crate::InstanceObservation::Created,
             package_identity: crate::PackageIdentityObservation::NotApplicable,
+            aumid: crate::AumidObservation::NotApplicable,
+            proxy_delivery: crate::ProxyDelivery::ProcessEnvironment,
+            backend_proxy_config: crate::BackendProxyConfig::NotApplicable,
+            target_elevation: None,
             desktop: DesktopLaunchInfo::from(&info),
         };
         assert!(
@@ -605,10 +763,16 @@ mod tests {
         };
         let receipt = LaunchReceipt {
             pid: 42,
-            proxy_endpoint: "http://127.0.0.1:10808".into(),
+            proxy_endpoint: Some("http://127.0.0.1:10808".into()),
             daemon_preparation: DaemonPreparation::NotNeeded,
             launch_method: crate::LaunchMethod::NativeProcess,
+            activation_state: crate::ActivationState::NotSubmitted,
+            instance: crate::InstanceObservation::Created,
             package_identity: crate::PackageIdentityObservation::NotApplicable,
+            aumid: crate::AumidObservation::NotApplicable,
+            proxy_delivery: crate::ProxyDelivery::ProcessEnvironment,
+            backend_proxy_config: crate::BackendProxyConfig::NotApplicable,
+            target_elevation: None,
             desktop: DesktopLaunchInfo::from(&info),
         };
         assert!(
@@ -622,13 +786,19 @@ mod tests {
     }
 
     #[test]
-    fn launch_status_reports_the_daemon_preparation_outcome() {
-        let receipt = |preparation| LaunchReceipt {
+    fn launch_status_reports_each_layer_separately() {
+        let base = || LaunchReceipt {
             pid: 7,
-            proxy_endpoint: "http://127.0.0.1:10808".into(),
-            daemon_preparation: preparation,
-            launch_method: crate::LaunchMethod::NativeProcess,
-            package_identity: crate::PackageIdentityObservation::NotApplicable,
+            proxy_endpoint: Some("http://127.0.0.1:10808".into()),
+            daemon_preparation: DaemonPreparation::Skipped,
+            launch_method: crate::LaunchMethod::AppmodelActivation,
+            activation_state: crate::ActivationState::Returned,
+            instance: crate::InstanceObservation::Created,
+            package_identity: crate::PackageIdentityObservation::Matched,
+            aumid: crate::AumidObservation::Matched,
+            proxy_delivery: crate::ProxyDelivery::ActivationArguments,
+            backend_proxy_config: crate::BackendProxyConfig::NotAuthorized,
+            target_elevation: Some(false),
             desktop: DesktopLaunchInfo {
                 product: DesktopProduct::ChatGpt,
                 package_name: "OpenAI.Codex".into(),
@@ -637,19 +807,32 @@ mod tests {
                 discovery_source: DesktopDiscoverySource::AppxManifest,
             },
         };
+        let mut receipt = base();
         assert_eq!(
-            launch_status_message(&receipt(DaemonPreparation::Skipped)),
+            launch_status_message(&receipt),
+            "Registered application activation returned PID 7; new instance activated; \
+             package identity matched; application identity matched; \
+             Chromium proxy arguments submitted; backend home config not authorized"
+        );
+        receipt.proxy_delivery = crate::ProxyDelivery::NotEstablished;
+        assert!(
+            launch_status_message(&receipt).contains("no proxy delivered (activation-only)"),
+            "activation-only must not imply delivered proxying"
+        );
+        receipt.daemon_preparation = DaemonPreparation::NotNeeded;
+        assert!(
+            launch_status_message(&receipt)
+                .contains("the shared Codex background server was not running")
+        );
+        let mut native = base();
+        native.launch_method = crate::LaunchMethod::NativeProcess;
+        native.activation_state = crate::ActivationState::NotSubmitted;
+        native.package_identity = crate::PackageIdentityObservation::NotApplicable;
+        native.aumid = crate::AumidObservation::NotApplicable;
+        native.proxy_delivery = crate::ProxyDelivery::ProcessEnvironment;
+        assert_eq!(
+            launch_status_message(&native),
             "Desktop process created with the proxy environment (PID 7)"
-        );
-        assert_eq!(
-            launch_status_message(&receipt(DaemonPreparation::NotNeeded)),
-            "Desktop process created with the proxy environment (PID 7); \
-             the shared Codex background server was not running"
-        );
-        assert_eq!(
-            launch_status_message(&receipt(DaemonPreparation::Stopped)),
-            "Desktop process created with the proxy environment (PID 7); \
-             the shared Codex background server was stopped before launch"
         );
     }
 

@@ -15,6 +15,7 @@ tokio-util.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true }
+windows = { workspace = true }
 
 [[bin]]
 name = "child-env-probe"

@@ -109,10 +109,10 @@ fn key_to_intent(state: &AppState, key: KeyEvent) -> Option<UserIntent> {
             _ => None,
         };
     }
-    if state.package_context_prompt {
+    if state.backend_proxy_prompt {
         return match key.code {
-            KeyCode::Char('y' | 'Y') => Some(UserIntent::ConfirmPackageContextLaunch),
-            KeyCode::Char('n' | 'N') | KeyCode::Esc => Some(UserIntent::CancelPackageContextLaunch),
+            KeyCode::Char('y' | 'Y') => Some(UserIntent::ConfirmBackendProxyConsent),
+            KeyCode::Char('n' | 'N') | KeyCode::Esc => Some(UserIntent::CancelBackendProxyConsent),
             _ => None,
         };
     }
@@ -131,8 +131,8 @@ fn key_to_intent(state: &AppState, key: KeyEvent) -> Option<UserIntent> {
     }
     match key.code {
         KeyCode::Enter | KeyCode::Char('l' | 'L') => Some(UserIntent::Launch),
-        KeyCode::Char('p' | 'P') => Some(UserIntent::RequestPackageContextLaunch),
         KeyCode::Char('d' | 'D') => Some(UserIntent::RequestDaemonRepairLaunch),
+        KeyCode::Char('b' | 'B') => Some(UserIntent::RequestBackendProxyConsent),
         KeyCode::Char('r' | 'R') => Some(UserIntent::Refresh),
         KeyCode::Char('c' | 'C') => Some(UserIntent::EditProxy),
         KeyCode::Char('?') => Some(UserIntent::ToggleHelp),
@@ -258,22 +258,29 @@ mod tests {
     }
 
     #[test]
-    fn package_context_confirmation_is_modal() {
-        let mut state = AppState::new(GuardConfig::default(), "config.toml".into());
+    fn backend_proxy_consent_is_modal_and_bound_to_b() {
+        let state = AppState::new(GuardConfig::default(), "config.toml".into());
         assert_eq!(
-            handle_intent_key(&state, KeyCode::Char('p')),
-            Some(UserIntent::RequestPackageContextLaunch)
+            handle_intent_key(&state, KeyCode::Char('b')),
+            Some(UserIntent::RequestBackendProxyConsent)
         );
-        state.package_context_prompt = true;
-        assert_eq!(handle_intent_key(&state, KeyCode::Enter), None);
+        let mut prompting = state;
+        prompting.backend_proxy_prompt = true;
+        assert_eq!(handle_intent_key(&prompting, KeyCode::Enter), None);
         assert_eq!(
-            handle_intent_key(&state, KeyCode::Char('y')),
-            Some(UserIntent::ConfirmPackageContextLaunch)
+            handle_intent_key(&prompting, KeyCode::Char('y')),
+            Some(UserIntent::ConfirmBackendProxyConsent)
         );
         assert_eq!(
-            handle_intent_key(&state, KeyCode::Esc),
-            Some(UserIntent::CancelPackageContextLaunch)
+            handle_intent_key(&prompting, KeyCode::Esc),
+            Some(UserIntent::CancelBackendProxyConsent)
         );
+    }
+
+    #[test]
+    fn package_context_candidate_key_is_gone() {
+        let state = AppState::new(GuardConfig::default(), "config.toml".into());
+        assert_eq!(handle_intent_key(&state, KeyCode::Char('p')), None);
     }
 
     fn handle_intent_key(state: &AppState, code: KeyCode) -> Option<UserIntent> {

@@ -42,7 +42,6 @@ pub enum DesktopDiscoverySource {
 /// recreate the application's package identity; registered targets retain the
 /// exact application metadata Windows registered for that package.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
 pub enum DesktopTargetKind {
     RegisteredPackage(PackageApplication),
     UnpackagedExecutable,
@@ -161,30 +160,137 @@ impl DaemonPreparation {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LaunchOptions {
     pub refresh_codex_daemon: bool,
-    pub package_context_compat: bool,
+    /// Diagnostic activation without any proxy arguments or backend
+    /// configuration. The receipt must report `proxy_delivery = not_established`;
+    /// this is never a silent downgrade of a normal proxy launch.
+    pub activation_only: bool,
 }
 
+/// Which launch backend produced the Desktop process. Registered package
+/// applications are activated through the Windows application model
+/// (`IApplicationActivationManager::ActivateApplication`); ordinary
+/// executables are created as a new process with an injected environment.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum LaunchMethod {
     NativeProcess,
-    PackagedContextCompat,
+    AppmodelActivation,
 }
 
+impl LaunchMethod {
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::NativeProcess => "process environment injection",
+            Self::AppmodelActivation => "Windows registered application activation",
+        }
+    }
+}
+
+/// How far the activation request travelled. A successful receipt always
+/// carries `Returned`; `OutcomeUnknown` is reported as a launch error because
+/// the application may already have been created.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivationState {
+    NotSubmitted,
+    Returned,
+    OutcomeUnknown,
+}
+
+/// `ActivateApplication` returns a PID, which may belong to an existing
+/// instance; a returned PID is never on its own evidence of a fresh process.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InstanceObservation {
+    Created,
+    Reused,
+    Unknown,
+}
+
+/// Package identity of the actually observed target process, distinct from a
+/// query failure: `Missing` is an OS answer, not an error.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PackageIdentityObservation {
     NotApplicable,
-    Verified,
+    Matched,
+    Missing,
+    Mismatch,
+    QueryFailed,
+}
+
+/// Application identity (AUMID) of the observed target. Package identity
+/// matching alone does not prove the right application entry was activated.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AumidObservation {
+    NotApplicable,
+    Matched,
+    Missing,
+    Mismatch,
+    QueryFailed,
+}
+
+/// How the configured proxy was actually delivered for this launch. The layers
+/// are separate facts: Chromium arguments reach the Electron shell, the
+/// authorized home configuration reaches Codex backend processes started from
+/// that home, and neither proves the other.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProxyDelivery {
+    /// Unpackaged launch: HTTP(S)_PROXY/NO_PROXY in the process environment.
+    ProcessEnvironment,
+    /// Registered launch: validated Chromium proxy arguments submitted through
+    /// the activation arguments.
+    ActivationArguments,
+    /// Registered launch: activation arguments plus an authorized, prepared
+    /// proxy block in the confirmed Codex Home `.env`.
+    ActivationArgumentsAndHomeConfig,
+    /// No proxy was delivered (activation-only diagnostics).
+    NotEstablished,
+}
+
+/// State of the Codex Home backend proxy configuration for this launch.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BackendProxyConfig {
+    /// Unpackaged launch or activation-only diagnostics: no home configuration
+    /// is involved.
+    NotApplicable,
+    /// The user has not authorized Guard to manage the `.env` proxy block.
+    NotAuthorized,
+    /// The authorized block was prepared in the confirmed home before the
+    /// activation. Preparation is a file fact, not a network verification.
+    Prepared,
+}
+
+impl BackendProxyConfig {
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::NotApplicable => "not applicable",
+            Self::NotAuthorized => "not authorized",
+            Self::Prepared => "prepared",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct LaunchReceipt {
     pub pid: u32,
-    pub proxy_endpoint: String,
+    /// The proxy endpoint this launch planned to use. `None` for the
+    /// activation-only diagnostic path, which must not imply delivered proxying.
+    pub proxy_endpoint: Option<String>,
     pub daemon_preparation: DaemonPreparation,
     pub launch_method: LaunchMethod,
+    pub activation_state: ActivationState,
+    pub instance: InstanceObservation,
     pub package_identity: PackageIdentityObservation,
+    pub aumid: AumidObservation,
+    pub proxy_delivery: ProxyDelivery,
+    pub backend_proxy_config: BackendProxyConfig,
+    /// Token elevation of the observed target process (`None` when the query
+    /// failed). Recorded for diagnostics only; it never gates the launch.
+    pub target_elevation: Option<bool>,
     pub desktop: DesktopLaunchInfo,
 }
 
@@ -202,6 +308,7 @@ pub enum ForegroundOperation {
     Refresh,
     Launch,
     SaveConfig,
+    UpdateBackendProxyConsent,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -229,7 +336,7 @@ pub struct AppState {
     pub launch: LaunchState,
     pub foreground: Option<ForegroundOperation>,
     pub daemon_repair_prompt: bool,
-    pub package_context_prompt: bool,
+    pub backend_proxy_prompt: bool,
     pub status_message: String,
     pub error_message: Option<String>,
     pub show_help: bool,
@@ -259,7 +366,7 @@ impl AppState {
             launch: LaunchState::Idle,
             foreground: None,
             daemon_repair_prompt: false,
-            package_context_prompt: false,
+            backend_proxy_prompt: false,
             status_message: "Ready to launch through the configured proxy".into(),
             error_message: None,
             show_help: false,
@@ -273,37 +380,67 @@ impl AppState {
 mod tests {
     use super::*;
 
-    #[test]
-    fn launch_receipt_serializes_selected_desktop_metadata() {
-        let receipt = LaunchReceipt {
+    fn receipt() -> LaunchReceipt {
+        LaunchReceipt {
             pid: 42,
-            proxy_endpoint: "http://127.0.0.1:10808".into(),
-            daemon_preparation: DaemonPreparation::Stopped,
-            launch_method: LaunchMethod::PackagedContextCompat,
-            package_identity: PackageIdentityObservation::Verified,
+            proxy_endpoint: Some("http://127.0.0.1:10808".into()),
+            daemon_preparation: DaemonPreparation::Skipped,
+            launch_method: LaunchMethod::AppmodelActivation,
+            activation_state: ActivationState::Returned,
+            instance: InstanceObservation::Created,
+            package_identity: PackageIdentityObservation::Matched,
+            aumid: AumidObservation::Matched,
+            proxy_delivery: ProxyDelivery::ActivationArgumentsAndHomeConfig,
+            backend_proxy_config: BackendProxyConfig::Prepared,
+            target_elevation: Some(false),
             desktop: DesktopLaunchInfo {
                 product: DesktopProduct::ChatGpt,
                 package_name: "OpenAI.Codex".into(),
-                package_version: "26.727.6591.0".into(),
+                package_version: "26.924.2738.0".into(),
                 architecture: "X64".into(),
                 discovery_source: DesktopDiscoverySource::AppxManifest,
             },
-        };
-        let value = serde_json::to_value(receipt).unwrap();
+        }
+    }
+
+    #[test]
+    fn launch_receipt_serializes_layered_activation_and_proxy_facts() {
+        let value = serde_json::to_value(receipt()).unwrap();
         assert_eq!(value["desktop"]["product"], "chat_gpt");
-        assert_eq!(value["desktop"]["architecture"], "X64");
-        assert_eq!(value["desktop"]["discovery_source"], "appx_manifest");
-        assert_eq!(value["daemon_preparation"], "stopped");
-        assert_eq!(value["launch_method"], "packaged_context_compat");
-        assert_eq!(value["package_identity"], "verified");
+        assert_eq!(value["launch_method"], "appmodel_activation");
+        assert_eq!(value["activation_state"], "returned");
+        assert_eq!(value["instance"], "created");
+        assert_eq!(value["package_identity"], "matched");
+        assert_eq!(value["aumid"], "matched");
+        assert_eq!(
+            value["proxy_delivery"],
+            "activation_arguments_and_home_config"
+        );
+        assert_eq!(value["backend_proxy_config"], "prepared");
+        assert_eq!(value["target_elevation"], false);
         assert_eq!(
             DaemonPreparation::Skipped.status_detail(),
             "",
             "normal launches make no claim about the daemon"
         );
+    }
+
+    #[test]
+    fn identity_and_delivery_facts_stay_distinguishable() {
+        // A single boolean could not represent these separate observations;
+        // the enums make every combination explicit and serializable.
+        assert_ne!(
+            PackageIdentityObservation::Missing,
+            PackageIdentityObservation::QueryFailed
+        );
+        assert_ne!(
+            ProxyDelivery::ActivationArguments,
+            ProxyDelivery::ActivationArgumentsAndHomeConfig
+        );
+        assert_ne!(AumidObservation::Missing, AumidObservation::Mismatch);
         assert_eq!(
-            DaemonPreparation::NotNeeded.status_detail(),
-            "the shared Codex background server was not running"
+            LaunchMethod::AppmodelActivation.display_name(),
+            "Windows registered application activation"
         );
     }
 }

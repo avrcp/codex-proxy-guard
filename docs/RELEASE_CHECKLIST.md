@@ -8,8 +8,8 @@
 - [ ] `cargo test --workspace --all-targets --locked`
 - [ ] `cargo audit`
 - [ ] `scripts\build-portable.cmd`
-- [ ] Portable `--version` 与 `launch --help` smoke 通过。
-- [ ] 验证 EXE、SHA-256 与 `build-info.json` 一致。
+- [ ] Portable `--version`、`launch --help`、`build-info` 与激活 worker 拒绝畸形输入 smoke 通过。
+- [ ] 验证 EXE、SHA-256 与 `build-info.json` 一致；`build-info` 的 commit/dirty 与构建源一致。
 - [ ] `Cargo.toml` 的 repository 与 GitHub 仓库地址一致。
 
 ## 功能与安全门禁
@@ -20,10 +20,11 @@
 - [ ] 当前 ChatGPT Desktop、ChatGPT Classic 与显式 override 发现均可用；两者并存时优先当前应用。
 - [ ] APPX 清单入口被优先使用，且解析路径不能逃逸安装目录；APPX 查询使用系统目录 PowerShell 绝对路径。
 - [ ] FullName、FamilyName、Application.Id、AUMID 来自同一注册快照；多 Application 不任选首个，包内 override 不降级成普通 EXE。
-- [ ] 已注册包普通启动明确阻断裸 EXE；包上下文候选只能单次选择，真实目标 PackageFullName 不符或查询失败不返回成功回执。
-- [ ] helper 管道单次授权、消息上限、取消提交边界和 helper 清理通过受控测试；未知结果不自动重试、不终止 Desktop。
+- [ ] 已注册包只走原生应用激活（AO_NONE），绝不裸 EXE/调试上下文/提权；激活后核验目标 PackageFullName、AUMID、映像路径、创建时间与提升状态，不符或查询失败不返回成功回执。
+- [ ] 激活 worker 有界协议（16 KiB 请求/64 KiB 回执）、提交前取消不激活、提交后按 outcome-unknown 报告；worker 超时/取消被有界回收，绝不终止 Desktop。
 - [ ] TUI 与 `launch --json` 均显示产品类型、包名、版本、架构、发现来源与 `daemon_preparation`（skipped/stopped/not_needed），不输出安装路径或认证信息。
-- [ ] 普通启动：不解析 Codex CLI、不执行任何 daemon 命令；非打包 override 可正常启动；已注册包依身份验收状态阻断。
+- [ ] 普通启动：不解析 Codex CLI、不执行任何 daemon 命令；非打包 override 注入环境；已注册应用原生激活并提交经校验的 Chromium 代理参数。
+- [ ] `.env` 代理块默认关闭；仅 TUI `B`+`Y` 对显示的确切 Home 授权；未授权/作用域未确认/冲突均如实报错，块外字节逐字保留，撤销只删自己的块。
 - [ ] 修复启动：TUI `D`+`Y` 或 `launch --refresh-codex-daemon` 单次授权；取消确认（Esc/N）严格零调用；授权不持久化。
 - [ ] 修复路径错误均阻断且可行动（CLI 不可用 / override 无效 / Home 无效 / 命令不支持 / stop 失败或超时），不静默降级为普通启动。
 - [ ] 修复 stop 输出协议：超限/非法 UTF-8/多 JSON/未知状态一律失败；`stopped`/`notRunning` 才继续；总预算可注入测试。

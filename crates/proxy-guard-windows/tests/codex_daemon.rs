@@ -151,7 +151,7 @@ async fn normal_launch_never_invokes_the_codex_cli() {
 }
 
 #[tokio::test]
-async fn registered_package_without_one_shot_backend_never_spawns_or_stops_daemon() {
+async fn registered_package_launch_never_spawns_a_bare_exe_or_stops_the_daemon() {
     let root = temp_dir("package-preflight");
     let stop_marker = root.join("stop-invoked");
     let desktop_marker = root.join("desktop-spawned");
@@ -169,21 +169,31 @@ async fn registered_package_without_one_shot_backend_never_spawns_or_stops_daemo
                 manifest_executable: "app/ChatGPT.exe".into(),
                 runtime_kind: PackageRuntimeKind::FullTrustDesktop,
             });
+            // The fixture package cannot match this machine's real
+            // registration, so the pre-activation re-check must fail — before
+            // the daemon stop and before any process creation. Whatever the
+            // exact environment-dependent error, nothing may have run.
             let error = launch_codex_with(
                 &info,
                 &config,
                 LaunchOptions {
                     refresh_codex_daemon: true,
-                    package_context_compat: false,
+                    activation_only: false,
                 },
                 &CancellationToken::new(),
                 &launch_hooks(&real_resolver),
             )
             .await
             .unwrap_err();
-            assert!(error.contains("APPX_PROXY_LAUNCH_UNSUPPORTED"), "{error}");
-            assert!(!stop_marker.exists());
-            assert!(!desktop_marker.exists());
+            assert!(!error.is_empty());
+            assert!(
+                !stop_marker.exists(),
+                "a registered-package launch must never run daemon commands"
+            );
+            assert!(
+                !desktop_marker.exists(),
+                "a registered-package launch must never spawn a bare EXE"
+            );
         },
     )
     .await;
@@ -209,7 +219,7 @@ async fn repair_launch_stops_the_daemon_once_then_launches() {
                 &config,
                 LaunchOptions {
                     refresh_codex_daemon: true,
-                    package_context_compat: false,
+                    activation_only: false,
                 },
                 &CancellationToken::new(),
                 &launch_hooks(&real_resolver),
@@ -240,7 +250,7 @@ async fn repair_launch_maps_not_running_to_not_needed() {
                 &config,
                 LaunchOptions {
                     refresh_codex_daemon: true,
-                    package_context_compat: false,
+                    activation_only: false,
                 },
                 &CancellationToken::new(),
                 &launch_hooks(&real_resolver),
@@ -267,7 +277,7 @@ async fn repair_blocks_when_no_cli_is_available() {
             &config,
             LaunchOptions {
                 refresh_codex_daemon: true,
-                package_context_compat: false,
+                activation_only: false,
             },
             &CancellationToken::new(),
             &launch_hooks(&|_config| Ok(None)),
@@ -293,7 +303,7 @@ async fn repair_blocks_on_invalid_override_without_fallback() {
             &config,
             LaunchOptions {
                 refresh_codex_daemon: true,
-                package_context_compat: false,
+                activation_only: false,
             },
             &CancellationToken::new(),
             &launch_hooks(&real_resolver),
@@ -325,7 +335,7 @@ async fn repair_blocks_on_unsupported_daemon_command() {
                 &config,
                 LaunchOptions {
                     refresh_codex_daemon: true,
-                    package_context_compat: false,
+                    activation_only: false,
                 },
                 &CancellationToken::new(),
                 &launch_hooks(&real_resolver),
@@ -355,7 +365,7 @@ async fn repair_blocks_on_unknown_or_running_status() {
                 &config,
                 LaunchOptions {
                     refresh_codex_daemon: true,
-                    package_context_compat: false,
+                    activation_only: false,
                 },
                 &CancellationToken::new(),
                 &launch_hooks(&real_resolver),
@@ -387,7 +397,7 @@ async fn cancelled_token_blocks_before_any_spawn_or_stop() {
                 LaunchOptions::default(),
                 LaunchOptions {
                     refresh_codex_daemon: true,
-                    package_context_compat: false,
+                    activation_only: false,
                 },
             ] {
                 let error = launch_codex_with(
@@ -432,7 +442,7 @@ async fn cancel_during_stop_reports_unconfirmed_state_and_never_spawns() {
                     &config,
                     LaunchOptions {
                         refresh_codex_daemon: true,
-                        package_context_compat: false,
+                        activation_only: false,
                     },
                     &token,
                     &launch_hooks(&real_resolver),

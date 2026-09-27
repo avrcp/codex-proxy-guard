@@ -147,13 +147,19 @@ PackageFullName、FamilyName、Application.Id 和 AUMID；当前包只选已核�
 `app\ChatGPT.exe`，Classic 必须有唯一 FullTrust 桌面入口。缺失或歧义会阻断，不猜测
 后备 EXE。位于已注册包内的 override 仍保留包目标类型。
 
-普通已注册包启动在本轮真实 Desktop 验收前返回 `APPX_PROXY_LAUNCH_UNSUPPORTED`，避免
-无身份的裸 EXE 被当作成功。单次显式包上下文候选从 TUI `P`+`Y` 或 CLI
-`--package-context-compat` 进入。Guard 用随机一次性命名管道和短命同 EXE helper；helper
-通过 Windows 调试命令进入已选 FullTrust Application 上下文，在最终 Desktop 创建处
-覆盖代理环境。Guard 校验 helper 和目标的精确包身份与 EXE；结果未知时不自动重试，
-也不杀 Desktop。`-PreventBreakaway` 在受控测试程序中保留子进程身份，真实 Desktop/
-沙箱行为仍按 [验收记录](PACKAGE_IDENTITY_ACCEPTANCE.md) 标为未执行。
+已注册包启动通过 Windows 原生应用激活完成：以动态解析的 AUMID 调用
+`IApplicationActivationManager::ActivateApplication`（`AO_NONE`；COM 绑定来自官方
+`windows` crate，`CLSCTX_LOCAL_SERVER` 适配短命调用方）。COM 调用隔离在 Guard 自己的
+短命 worker 进程（同一 EXE 的隐藏 `internal-activate-package` 子命令）中，通过一条
+16 KiB stdin 请求与一条 64 KiB stdout 回执通信——无命名管道、无 nonce、无监听端口。
+worker 自身不需要 OpenAI 包身份，也从不进入包上下文；超时或取消时只终止并回收该
+worker，绝不触及 Desktop。提交前取消保证不会发起激活；提交后取消/超时按
+`APPX_ACTIVATION_OUTCOME_UNKNOWN` 如实报告（Windows 可能已经完成激活），不自动重试。
+激活返回的 PID 只是激活事实：worker 持有目标句柄分别核验 PackageFullName、AUMID、
+映像路径、创建时间（区分 created/reused）、TokenElevation，并在有界窗口内观察是否
+立即退出；身份不符、缺失或查询失败都是独立的阻断错误。`launch --activation-only`
+提供不带代理参数与 Home 配置的身份对照入口。真实 Desktop 业务验收仍按
+[验收记录](PACKAGE_IDENTITY_ACCEPTANCE.md) 标为未执行。
 
 进程身份比较把普通路径与 extended-length（`\\?\C:\...`、`\\?\UNC\server\share\...`）
 写法规范化后做 ASCII 忽略大小写比较，等价写法不漏检、别处同名 exe 不误认；无法读取
@@ -170,10 +176,20 @@ http_proxy / https_proxy
 NO_PROXY / no_proxy
 ```
 
-同时移除 `ALL_PROXY` / `all_proxy`。不会清空完整环境、修改 Windows 系统代理或编辑
-Codex 用户配置（包括 `~/.codex/config.toml` 与 `~/.codex/.env`）。若修复时 pin 了显式
-相对 `CODEX_HOME`，同一绝对值只传给该次 CLI helper 与 Desktop 子进程，保证两者作用域
-一致，且不修改 Guard 自身环境。
+同时移除 `ALL_PROXY` / `all_proxy`。已注册应用没有进程环境注入：激活接口没有环境块参数，
+代理经校验后以 Chromium `--proxy-server` / `--proxy-bypass-list` 激活参数提交
+（`no_proxy` 中的 `localhost` 与 loopback 字面量逐项映射，`::1` 转为 `[::1]`；无法等价
+转换的条目返回 `PROXY_BYPASS_UNSUPPORTED` 而不是被丢弃）。
 
-这只是环境注入，不是网络强制或健康判断；Guard 不检查 HTTPS、WebSocket、DNS 或 UDP 是否
-实际经过代理，也不为这些路径添加任何探测。
+唯一被授权触碰的 Codex 用户文件是一个 BEGIN/END 标记的 `.env` 代理块：默认关闭，只有
+用户在 TUI `B` 确认后按确认时显示的确切 Home 绑定启用（`codex.manage_codex_proxy_env` +
+`codex.proxy_env_home`）。块编辑是原子的（同目录临时文件 + 重命名 + 写前内容复核），
+块外字节逐字保留，块外已有的代理键（含大小写变体与 `ALL_PROXY`）按名报告冲突并拒绝
+写入，重复/缺损/未知版本块拒绝自动编辑，撤销只删除 Guard 自己未被外部修改的块；文件
+仅含该块时才允许删除整个文件。Guard 从不读取该文件中的其他内容，也绝不用自己的
+`CODEX_HOME` 推断 Desktop 的 Home。除此以外 Guard 不编辑任何 Codex 用户配置
+（`~/.codex/config.toml` 保持只读边界）。若修复时 pin 了显式相对 `CODEX_HOME`，同一
+绝对值只传给该次 CLI helper 与未打包 Desktop 子进程。
+
+这只是代理交付计划，不是网络强制或健康判断；Guard 不检查 HTTPS、WebSocket、DNS 或 UDP
+是否实际经过代理，也不为这些路径添加任何探测。

@@ -39,6 +39,16 @@ pub struct CodexConfig {
     /// CODEX_HOME packages and PATH.
     pub cli_executable_override: PathBuf,
     pub refuse_if_running: bool,
+    /// Explicit user consent for Guard to manage the HTTP_PROXY / HTTPS_PROXY /
+    /// NO_PROXY block inside one confirmed Codex Home `.env`. Default off; the
+    /// flag is meaningless without the bound `proxy_env_home` below. Changing
+    /// the home requires a new confirmation.
+    pub manage_codex_proxy_env: bool,
+    /// The absolute Codex Home whose `.env` the proxy-block consent is bound
+    /// to. Empty means no home has been confirmed yet. This is the default
+    /// user home's `.codex` unless the user explicitly confirmed another
+    /// location; Guard never infers it from its own CODEX_HOME variable.
+    pub proxy_env_home: PathBuf,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -84,6 +94,8 @@ impl Default for CodexConfig {
             executable_override: PathBuf::new(),
             cli_executable_override: PathBuf::new(),
             refuse_if_running: true,
+            manage_codex_proxy_env: false,
+            proxy_env_home: PathBuf::new(),
         }
     }
 }
@@ -107,6 +119,15 @@ impl GuardConfig {
             .ok_or_else(|| {
                 GuardError::Config("cannot resolve the user configuration directory".into())
             })
+    }
+
+    /// Candidate Codex Home for the `.env` proxy-block consent prompt: the
+    /// default `.codex` under the OS user-profile home. This is a display
+    /// candidate bound by an explicit confirmation — never a claim about the
+    /// home the activated Desktop actually uses, and never taken from Guard's
+    /// own CODEX_HOME variable.
+    pub fn default_codex_home() -> Option<PathBuf> {
+        BaseDirs::new().map(|dirs| dirs.home_dir().join(".codex"))
     }
 
     pub fn load(path: &Path) -> Result<Self, GuardError> {
@@ -285,6 +306,25 @@ mod tests {
             config.codex.cli_executable_override,
             PathBuf::from(r"D:\Tools\codex.exe")
         );
+    }
+
+    #[test]
+    fn backend_proxy_consent_defaults_off_and_stays_a_launch_time_gate() {
+        // An enabled flag without a bound home is not a global configuration
+        // error: it must only block the registered-application launch that
+        // would need the block (reported as BACKEND_PROXY_SCOPE_UNCONFIRMED
+        // by the launcher), so unrelated launches keep working.
+        let config = GuardConfig::default();
+        assert!(!config.codex.manage_codex_proxy_env);
+        assert!(config.codex.proxy_env_home.as_os_str().is_empty());
+        config.validate().unwrap();
+
+        let mut enabled = GuardConfig::default();
+        enabled.codex.manage_codex_proxy_env = true;
+        enabled.validate().unwrap();
+
+        enabled.codex.proxy_env_home = PathBuf::from(r"C:\Users\example\.codex");
+        enabled.validate().unwrap();
     }
 
     #[test]

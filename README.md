@@ -1,8 +1,10 @@
 # Codex Proxy Guard
 
 Codex Proxy Guard 是一个单一职责的 Windows 启动器：使用用户配置的本机 HTTP/Mixed 代理
-启动 ChatGPT Desktop（Chat、Work 和 Codex）；普通启动对 Codex 共享后台服务零副作用，
-仅在用户单次显式授权的修复启动中通过 Codex 官方生命周期命令停止旧共享服务。
+启动 ChatGPT Desktop（Chat、Work 和 Codex）。已注册的 Desktop 应用通过 Windows
+注册入口原生激活（`IApplicationActivationManager::ActivateApplication`，`AO_NONE`），
+普通可执行文件则注入进程环境；普通启动对 Codex 共享后台服务零副作用，仅在用户单次
+显式授权的修复启动中通过 Codex 官方生命周期命令停止旧共享服务。
 
 它不修改 Windows 系统代理，不读取认证信息，不检测代理质量，也不管理 v2rayN。
 
@@ -17,11 +19,15 @@ Codex Proxy Guard 是一个单一职责的 Windows 启动器：使用用户配�
 - 拒绝在管理员权限的 Guard（或权限查询失败）中启动；
 - 普通启动不解析 Codex CLI、不执行任何 daemon 命令；
 - 显式修复启动（单次确认）通过官方 `codex app-server daemon stop` 停止共享服务；
-- 注入大小写两套 `HTTP_PROXY`、`HTTPS_PROXY` 和 `NO_PROXY`；
-- 清除新进程树中的 `ALL_PROXY` / `all_proxy`；
+- 未打包 EXE：注入大小写两套 `HTTP_PROXY`、`HTTPS_PROXY` 和 `NO_PROXY`，并清除
+  `ALL_PROXY` / `all_proxy`；
+- 已注册应用：经校验的 Chromium `--proxy-server` / `--proxy-bypass-list` 激活参数
+  （`no_proxy` 中的 loopback 项逐项映射，无法等价转换的条目报错而不是丢弃）；
+- 可选（默认关闭、需单次显式授权）：在已确认 Codex Home 的 `.env` 中管理一个
+  BEGIN/END 标记的 `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` 块，供 Codex 后端读取；
 - 使用跨 Guard 实例的启动锁，避免并发启动竞态；
-- Guard 退出不终止 Desktop。
-- 已注册包必须核验实际目标进程的精确程序包身份；包上下文候选只可单次显式选择。
+- Guard 退出不终止 Desktop；
+- 激活后核验实际目标进程的精确程序包身份、应用身份（AUMID）、创建时间与提升状态。
 
 明确不包含：
 
@@ -30,12 +36,15 @@ Codex Proxy Guard 是一个单一职责的 Windows 启动器：使用用户配�
 - `codex doctor` 或日志扫描；
 - v2rayN 发现、启动、切换节点或进程管理；
 - 启动、重启、更新或监控 Codex daemon，连接 app-server 私有 IPC，或直接终止 Codex 进程
-  （Guard 仅终止自己创建的短命 CLI 子进程）；
+  （Guard 仅终止自己创建的短命 worker / CLI 子进程）；
 - 强制终止 Desktop；
-- 系统代理、TUN、WFP、WinDivert、Hook、Relay 或 TLS 解密。
+- 系统代理、TUN、WFP、WinDivert、Hook、Relay 或 TLS 解密；
+- 裸启动 WindowsApps 内 EXE、`Invoke-CommandInDesktopPackage` 调试上下文、包调试模式
+  或任何提权/降权技巧作为注册应用的启动方式。
 
-Guard 只设置新进程树的代理环境，不是流量强制隧道：它不会接管 DNS、UDP 或任何其他
-非 HTTP 代理路径，也不会判断应用是否真的通过代理联网。
+Guard 只交付代理启动计划，不是流量强制隧道：它不会接管 DNS、UDP 或任何其他非 HTTP
+代理路径，也不会判断应用是否真的通过代理联网。激活参数覆盖 Electron/Chromium 的
+HTTP 路径；授权的 Home 块覆盖后续从该 Home 启动的 Codex 后端——两者是分别陈述的事实。
 
 ## 快速开始
 
@@ -51,11 +60,12 @@ cargo build --release -p codex-proxy-guard
 
 | 按键 | 行为 |
 | --- | --- |
-| `Enter` / `L` | 普通启动；已注册包在真实 Desktop 验收前明确阻断，不裸启动包内 EXE |
-| `P` | 单次确认后尝试包上下文候选；需按验收文档检查真实 Desktop 与沙箱 |
+| `Enter` / `L` | 普通启动：已注册应用走 Windows 注册入口原生激活，普通 EXE 注入进程环境 |
 | `D` | 修复启动：确认后先停止共享 Codex 后台服务再启动（`Y` 确认 / `N`、`Esc` 取消） |
+| `B` | 授权或撤销 Codex Home `.env` 后端代理块（显示确切 Home 与作用范围，`Y` 确认） |
 | `R` | 刷新 Desktop 发现与运行状态 |
-| `?` | 查看帮助 |
+| `C` | 编辑代理地址和端口 |
+| `?` | 查看帮助（含构建版本与提交） |
 | `Q` / `Ctrl-C` | 退出 Guard，不终止 Desktop |
 
 脚本化启动：
@@ -63,31 +73,50 @@ cargo build --release -p codex-proxy-guard
 ```powershell
 codex-proxy-guard launch
 codex-proxy-guard launch --json
-codex-proxy-guard launch --package-context-compat
+codex-proxy-guard launch --activation-only
 codex-proxy-guard launch --refresh-codex-daemon
-codex-proxy-guard launch --refresh-codex-daemon --package-context-compat
+codex-proxy-guard build-info
 codex-proxy-guard config-path
 ```
 
-`launch --json` 的回执除了 PID 与代理端点外，还会包含所选应用的产品类型、包名、版本、
-架构、发现来源、启动方法、包身份查询结果，以及本次启动的 daemon 准备结果（`skipped` /
-`stopped` / `not_needed`）；
-不会输出本地安装路径或认证信息。回执只陈述 Guard 观测到的事实（进程已创建、环境已传入、
-共享服务已停止）；不表示已验证界面、联网、沙箱或新 daemon 已继承代理。
+`launch --json` 的回执将事实分层陈述：启动方法（`native_process` /
+`appmodel_activation`）、激活状态、实例观察（created / reused / unknown）、包身份与应用
+身份（AUMID）观测、代理交付层（进程环境 / 激活参数 / 激活参数+Home 配置 /
+未交付）、后端配置状态、目标提升状态，以及 daemon 准备结果（`skipped` / `stopped` /
+`not_needed`）。不会输出本地安装路径或认证信息。回执只陈述 Guard 观测到的事实；
+不表示已验证界面、联网、沙箱或业务流量确实走了代理。
 
-## 普通启动与显式修复启动
+`launch --activation-only` 是诊断入口：只做原生激活、不带代理参数、不触碰 `.env`，
+回执明确 `proxy_delivery = not_established`；它不是普通启动的隐藏降级。
+
+## 普通启动、原生激活与显式修复启动
 
 **普通启动（默认，`Enter` / `launch`）**：配置校验 → 权限检查 → 发现 Desktop →
-启动锁 → 确认未运行。普通非打包 override 在创建处注入代理环境；已注册包因尚未完成
-真实 Desktop 验收而返回 `APPX_PROXY_LAUNCH_UNSUPPORTED`，不把包内 EXE 当普通程序裸启动。
-普通路径不解析 Codex CLI、不执行 daemon 命令。
+启动锁 → 确认未运行。已注册应用使用动态解析的 AUMID（`PackageFamilyName!ApplicationId`）
+调用 Windows 应用激活（`AO_NONE`，正常注册入口激活），激活参数携带经校验的 Chromium
+代理项；激活返回后用持有的进程句柄核验目标 PackageFullName、AUMID、映像路径、创建时间
+与提升状态。普通未打包 override 在创建处注入代理环境。普通路径不解析 Codex CLI、
+不执行 daemon 命令。
 
-**包上下文候选（`P`+`Y` 或 `launch --package-context-compat`）**：仅针对已注册的
-FullTrust Desktop。Guard 使用 Windows 的 `Invoke-CommandInDesktopPackage` 调试工具启动
-同一 EXE 的短命 helper；helper 在最终创建目标处设置代理环境，并查询实际目标进程的
-精确 PackageFullName。该方法和正常应用激活的 token 行为不同，真实 Desktop 的界面、
-后端、沙箱与代理业务尚未验收；不能把测试程序通过当作用户故障已修复。完整状态见
-[包身份验收记录](docs/PACKAGE_IDENTITY_ACCEPTANCE.md)。
+COM 调用运行在 Guard 自己的短命 worker 进程中（同一 EXE 的隐藏
+`internal-activate-package` 子命令，16 KiB 请求 / 64 KiB 回执的有界 stdin/stdout 协议），
+worker 本身不需要 OpenAI 包身份，也不运行在包上下文中。提交前取消保证不会发起激活；
+提交后取消或超时按 `APPX_ACTIVATION_OUTCOME_UNKNOWN` 如实报告（Windows 可能已经完成
+激活），不会自动重试，也不会终止 Desktop。
+
+**后端代理配置（`B`，默认关闭）**：激活接口没有环境块参数，Chromium 参数也覆盖不了
+Codex 后端进程。若你显式授权，Guard 会在**一个已确认的 Codex Home** 的 `.env` 中维护
+自己的 `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` 标记块（原子写入、逐字节保留其他内容、
+冲突键拒绝覆盖、撤销只删自己的块）。该块会影响之后从同一 Home 启动的所有 Codex 客户端，
+不只本次 Desktop；授权与作用范围见 TUI 提示。Guard 绝不从自己的 `CODEX_HOME` 推断
+Desktop 的 Home；未授权时回执明确 `backend_proxy_config = not_authorized`，不会静默
+降级为"可能直连的代理启动"。
+
+**显式修复启动（`D` 键确认后 `Y`，或 `launch --refresh-codex-daemon`）**：Codex 0.157+
+的常驻共享 daemon 保留其启动时继承的环境变量，已运行的旧 daemon 不会因新 Desktop
+启动而更新代理环境。若你需要丢弃旧 daemon 环境，可以显式授权一次修复：Guard 先通过
+官方 `codex app-server daemon stop` 停止共享服务，再激活 Desktop，由 Codex 自行创建
+新的 daemon。
 
 **显式修复启动（`D` 键确认后 `Y`，或 `launch --refresh-codex-daemon`）**：Codex 0.157+
 的常驻共享 daemon 保留其启动时继承的环境变量，已运行的旧 daemon 不会因新 Desktop
@@ -100,14 +129,14 @@ Codex 自行创建新的 daemon。
 `D` 之后必须再按 `Y` 单次确认（默认取消）。修复路径中 stop 失败、超时（总预算 720 秒，
 期间可随时取消）或输出无法识别都会阻止本次启动，不会悄悄降级为普通启动。
 
-对 TUI 中已发现的注册包，`D` 的确认页也明确提示会使用尚未验收的包上下文候选；CLI
-若需要同时做共享服务修复和包启动，必须同时给两个标志。本次包身份弹窗本身不需要
-先停止 daemon；不要把 `D` 当成程序包身份修复步骤。
+程序包身份弹窗本身不需要停止 daemon；原生激活失败也不会自动 stop。不要把 `D` 当成
+身份修复步骤。
 
 Guard 不启动、不重启、不更新、不监控 daemon，不连接其私有 IPC。唯一例外是 Guard 自己
-创建的短命 CLI 子进程：超时或取消时会被终止并回收。注意：stop 成功也不保证新 daemon
-已继承代理——Codex CLI 启动时可能用 Codex Home 下 `.env` 中的值覆盖父进程传入的环境
-变量（Guard 不读取、不修改该文件，请在本地自行检查其中的代理键）。
+创建的短命 worker / CLI 子进程：超时或取消时会被终止并回收。注意：stop 成功也不保证
+新 daemon 已继承代理——若需要后端也走代理，请使用上面 `B` 授权的 `.env` 代理块（这是
+Codex 官方 CLI 文档化的 `.env` 读取行为；Guard 只管理自己的标记块，不读取也不改动
+其中其他内容）。
 
 Codex CLI 解析顺序（仅显式修复时）：`codex.cli_executable_override`（必须是现存绝对
 路径的 native `.exe`，失效即报错不换源）→ `%CODEX_HOME%\packages\app-server-daemon\current\bin\codex.exe`
@@ -155,6 +184,8 @@ no_proxy = ["localhost", "127.0.0.1", "::1"]
 executable_override = ""
 cli_executable_override = ""
 refuse_if_running = true
+manage_codex_proxy_env = false
+proxy_env_home = ""
 
 [tui]
 alternate_screen = "auto"
@@ -162,8 +193,10 @@ alternate_screen = "auto"
 
 `10808` 只是首次生成配置的默认示例端口；请替换为实际代理软件的 HTTP/Mixed 端口。
 `executable_override` 指 ChatGPT Desktop 可执行文件；`cli_executable_override` 指官方
-Codex CLI 可执行文件（仅用于 daemon 生命周期命令，留空时自动解析）。`cli_executable_override`
-是 V2 schema 的可选扩展，已有的 V2 配置无需修改即可继续使用。
+Codex CLI 可执行文件（仅用于 daemon 生命周期命令，留空时自动解析）。
+`manage_codex_proxy_env` 与 `proxy_env_home` 是 V2 schema 的可选扩展（默认关闭）：
+`.env` 代理块只在通过 TUI `B` 单次确认后才会启用，且绑定确认时显示的确切 Home；
+已有 V2 配置无需修改即可继续使用。
 
 这是唯一支持的配置结构：旧版配置不会迁移或忽略字段，而是会被拒绝。需要重置时执行
 `codex-proxy-guard init-config --force`。

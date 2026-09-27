@@ -1,6 +1,54 @@
-# Package identity launch acceptance (2026-09-26)
+# Package identity launch acceptance (2026-09-26, updated 2026-09-27)
 
-## Delivery plan and progress
+## 2026-09-27 round: native application activation remediation
+
+The 2026-09-27 round (`0.4.1-rc.4`) replaced the experimental
+`Invoke-CommandInDesktopPackage -PreventBreakaway` candidate with the Windows
+**registered-entry native activation** backend, per the native-activation
+remediation manual:
+
+- Registered Desktop applications are activated through the OS-provided
+  `IApplicationActivationManager::ActivateApplication` with `AO_NONE`, run in a
+  short-lived Guard-owned worker process (`internal-activate-package`, one
+  bounded stdin request and one bounded stdout receipt — no named pipes or
+  nonces). The worker holds no OpenAI package identity and never runs in the
+  package context. The `windows` crate supplies the official COM bindings
+  (`CLSCTX_LOCAL_SERVER`, per Microsoft's guidance for short-lived launchers).
+- Ordinary Enter/L now routes a registered Desktop to that backend directly.
+  The `P` key, `package_context_compat`, the `package-helper` subcommand, and
+  the named-pipe protocol were **deleted** from the release path.
+- The proxy delivery is layered and reported separately: Chromium
+  `--proxy-server` / `--proxy-bypass-list` activation arguments (loopback
+  entries map one-to-one; non-mappable `no_proxy` entries are actionable
+  errors, never silently dropped), plus a default-off, explicitly consented
+  `.env` proxy block bound to one confirmed Codex Home (`codex.manage_codex_proxy_env`
+  + `codex.proxy_env_home`; TUI `B`). Guard's own `CODEX_HOME` is never
+  inferred as the Desktop's home.
+- The receipt separates activation, instance (created/reused), package
+  identity, application identity (AUMID), proxy delivery, backend
+  configuration, and target elevation facts; no single boolean claims
+  "verified".
+- `launch --activation-only` and `codex-proxy-guard build-info` were added for
+  identity comparisons and provenance verification. The build script embeds
+  and smoke-verifies commit/dirty.
+
+Machine evidence gathered read-only this round (no Desktop launched):
+
+| Item | Observation |
+| --- | --- |
+| OS | Windows 11 Pro, build 26200 (10.0.26200.0), PowerShell 5.1.26100.9444 |
+| Registered package | `OpenAI.Codex 26.924.2738.0`, entries `App` (AUMID `OpenAI.Codex_2p2nqsd0c76g0!App`, `Windows.FullTrustApplication`, executable present) and `CodexCoreCommandRunner` |
+| Worker pre-COM rejection | `internal-activate-package` with malformed stdin exits non-zero with `APPX_ACTIVATION_PROTOCOL_INVALID` and activates nothing |
+
+All 2026-09-26 rows below are preserved unchanged; their A/B/C acceptance
+remains **NOT RUN**. The 2026-09-27 real-machine acceptance (start-menu
+baseline, activation-only comparison, normal Enter, Chromium/backend proxy
+verification, port-change comparison, Guard-exit lifetime, sandbox, package
+update) was **not run** in this session either — the interactive Desktop
+launches belong to the user. The rows in §11.2 of the remediation manual are
+the acceptance checklist; do not mark them PASS without their evidence.
+
+## Delivery plan and progress (2026-09-26 round)
 
 | Stage | Scope | Status |
 | --- | --- | --- |
