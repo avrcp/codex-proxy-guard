@@ -193,9 +193,16 @@ try {
         }
 
         # The hidden activation worker must reject malformed input before COM
-        # is ever initialized — proven here without activating anything.
+        # is ever initialized — proven here without activating anything. The
+        # rejection is written to stderr, which must not abort this script.
         Write-Host "Running side-effect-free smoke test: worker rejects malformed requests"
-        $WorkerOutput = "not json" | & $Destination internal-activate-package 2>&1
+        $PreviousEap = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            $WorkerOutput = "not json" | & $Destination internal-activate-package 2>&1
+        } finally {
+            $ErrorActionPreference = $PreviousEap
+        }
         $WorkerExitCode = $LASTEXITCODE
         if ($WorkerExitCode -eq 0) {
             throw "The activation worker accepted malformed stdin; it must refuse before any activation"
