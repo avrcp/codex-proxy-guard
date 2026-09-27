@@ -37,10 +37,13 @@ BEGIN/END-marked `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` block inside one
 explicitly authorized Codex Home (`codex.manage_codex_proxy_env` bound to an
 absolute `codex.proxy_env_home`; default off; consent granted or revoked only
 through an explicit single-use prompt). Outside that block nothing is written:
-existing keys are reported as conflicts, other bytes are preserved verbatim,
-edits are atomic with content re-verification, revocation removes only Guard's
-own unmodified block, and the scope is never inferred from Guard's own
-`CODEX_HOME`. The block affects later Codex processes sharing that Home and is
+existing keys (including `export KEY=...` dotenv spellings) are reported as
+conflicts, other bytes are preserved verbatim, edits are atomic with content
+re-verification, and the scope is never inferred from Guard's own
+`CODEX_HOME`. Revocation removes only Guard's own unmodified block, and the
+revoked consent is persisted only after the block is safely gone — a failed
+revoke leaves the consent, the bound Home, and the file untouched (retryable),
+so an orphan block Guard can no longer locate is impossible. The block affects later Codex processes sharing that Home and is
 a file fact (`backend_proxy_config_prepared`), never a network verification.
 `~/.codex/config.toml` remains untouched in all cases.
 

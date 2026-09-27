@@ -1,13 +1,13 @@
 # Package identity acceptance
 
-Sections are split into **Current acceptance** (the rc.4 → rc.5 native
+Sections are split into **Current acceptance** (the rc.4 → rc.6 native
 activation architecture) and **Historical experiments** (retired). The old
 `Invoke-CommandInDesktopPackage -PreventBreakaway` package-context candidate
 is **retired**: it used a debugging context whose token differs from normal
 activation, never passed real Desktop acceptance, and must not be
 reintroduced or re-tested.
 
-## Current acceptance (rc.4 → rc.5)
+## Current acceptance (rc.4 → rc.6)
 
 Current architecture: schema-versioned APPX discovery envelope
 (`resources/appx-discovery.ps1`), native registered-entry activation
@@ -16,7 +16,7 @@ Guard worker), layered proxy delivery (validated Chromium activation
 arguments plus the default-off, B-authorized Codex Home `.env` block), and a
 disk-truth `BackendProxyRuntimeState` shown as the TUI Coverage line. The
 acceptance matrix for this architecture lives in
-`docs/RELEASE_CHECKLIST.md` (rows A–F).
+`docs/RELEASE_CHECKLIST.md` (rows A–H).
 
 User-confirmed on the review machine (2026-09-27, rc.4): the TUI discovers
 and displays the registered `OpenAI.Codex 26.924.2738.0` (`App` /
@@ -122,6 +122,22 @@ prepare-`.env`-then-stop-daemon (a failed prepare never wastes a daemon stop;
 locked by integration test), and `--activation-only` conflicts with
 `--refresh-codex-daemon` at both the CLI and the domain layer
 (`INVALID_LAUNCH_OPTIONS`).
+
+### 2026-09-27 round 4 (rc.6): consent revoke transaction + export conflict detection
+
+The final freeze fixes, both locked by unit regression tests and requiring no
+real Desktop launch: (1) disabling the backend proxy consent now removes the
+managed `.env` block **first** and persists the revoked consent only after the
+block is safely gone — a failed revoke (`BACKEND_PROXY_REVOKE_FAILED`) leaves
+the consent, the bound Home, and the file byte-identical and retryable, so an
+orphan block Guard can no longer locate is impossible, and a failed
+post-revoke config save (`BACKEND_PROXY_CONSENT_SAVE_FAILED`) honestly leaves
+the authorization enabled with the block reported `pending` on the next
+refresh; (2) the block-outside conflict scan now understands the
+`export KEY=value` spelling Codex's dotenv loader applies, for all four
+managed keys, reporting `BACKEND_PROXY_CONFIG_CONFLICT` by key name only with
+the file untouched. The interactive revoke/export smoke rows (G/H in the
+release checklist) still belong to the user.
 
 ## Historical experiments — do not reintroduce
 

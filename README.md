@@ -107,7 +107,9 @@ worker 本身不需要 OpenAI 包身份，也不运行在包上下文中。提�
 **后端代理配置（`B`，默认关闭）**：激活接口没有环境块参数，Chromium 参数也覆盖不了
 Codex 后端进程。若你显式授权，Guard 会在**一个已授权绑定的 Codex Home** 的 `.env` 中维护
 自己的 `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` 标记块（原子写入、逐字节保留其他内容、
-冲突键拒绝覆盖、撤销只删自己的块）。该块会影响之后从同一 Home 启动的所有 Codex 客户端，
+冲突键——含 `export KEY=...` dotenv 写法——拒绝覆盖）。撤销先安全移除 Guard 自己的块、
+成功后才关闭授权：revoke 失败时授权、绑定 Home 与文件原样保留，可直接重试，不会留下
+Guard 无法再定位的孤儿块。该块会影响之后从同一 Home 启动的所有 Codex 客户端，
 不只本次 Desktop；授权与作用范围见 TUI 提示。Guard 绝不从自己的 `CODEX_HOME` 推断
 Desktop 的 Home；未授权时回执明确 `backend_proxy_config = not_authorized`，不会静默
 降级为"可能直连的代理启动"。

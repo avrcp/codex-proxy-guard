@@ -210,9 +210,11 @@ NO_PROXY / no_proxy
 唯一被授权触碰的 Codex 用户文件是一个 BEGIN/END 标记的 `.env` 代理块：默认关闭，只有
 用户在 TUI `B` 确认后按确认时显示的确切 Home 绑定启用（`codex.manage_codex_proxy_env` +
 `codex.proxy_env_home`）。块编辑是原子的（同目录临时文件 + 重命名 + 写前内容复核），
-块外字节逐字保留，块外已有的代理键（含大小写变体与 `ALL_PROXY`）按名报告冲突并拒绝
-写入，重复/缺损/未知版本块拒绝自动编辑，撤销只删除 Guard 自己未被外部修改的块；文件
-仅含该块时才允许删除整个文件。Guard 从不读取该文件中的其他内容，也绝不用自己的
+块外字节逐字保留，块外已有的代理键（含大小写变体、`export KEY=...` dotenv 写法与
+`ALL_PROXY`）按名报告冲突并拒绝写入，重复/缺损/未知版本块拒绝自动编辑；撤销先安全
+移除自己的块、成功后才落盘关闭授权（revoke 失败时授权、绑定 Home 与文件原样保留，
+可重试，不产生孤儿块；块已移除而配置保存失败时，下次刷新如实报告 `pending`），且
+仅当文件只含该块时才删除整个文件。Guard 从不读取该文件中的其他内容，也绝不用自己的
 `CODEX_HOME` 推断 Desktop 的 Home。除此以外 Guard 不编辑任何 Codex 用户配置
 （`~/.codex/config.toml` 保持只读边界）。若修复时 pin 了显式相对 `CODEX_HOME`，同一
 绝对值只传给该次 CLI helper 与未打包 Desktop 子进程。

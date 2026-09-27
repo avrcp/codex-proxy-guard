@@ -7,6 +7,9 @@
 # CodeGraph local indexes
 .codegraph/
 
+# Local ZCode harness ignore rules (machine-local, synced from .gitignore)
+.zcodeignore
+
 # Temporary scratch docs
 docs/tmp/
 

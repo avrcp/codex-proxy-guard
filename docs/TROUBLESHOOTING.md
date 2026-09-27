@@ -100,6 +100,20 @@ CIDR 等）。Guard 拒绝静默丢弃规则。请把该条目从 `no_proxy` 中
 应用激活无法给 Codex 后端注入环境变量，未授权就停止共享服务只会中断任务而建立不了
 任何新配置。先按 `B` 授权（或改用普通启动）。未打包目标不受影响。共享服务未被触碰。
 
+## `BACKEND_PROXY_REVOKE_FAILED`（或 `BACKEND_PROXY_REVOKE_TASK_FAILED`）
+
+撤销授权（`B` → `Y`）时 Guard 未能安全移除自己的 `.env` 标记块——通常是块被外部手工
+修改、结构损坏或文件 IO 失败。此时**什么都没有改变**：授权保持启用、绑定的 Home 原样
+保留、`.env` 原样保留，不会产生 Guard 无法再定位的"孤儿块"。排除文件占用或权限问题、
+或手工整理好 Guard 块后，再按 `B` 重试即可。
+
+## `BACKEND_PROXY_CONSENT_SAVE_FAILED`
+
+Guard 已成功移除自己的 `.env` 标记块，但随后写配置文件失败，撤销授权没有落盘。配置
+仍处于"已授权"状态，而块已不存在——下一次 `R` 刷新会如实显示 `pending`（授权仍在、
+块待写入），这不是分叉。修复配置文件的写入问题（路径权限、磁盘、占用）后再按 `B`
+重试：对不存在的块撤销会直接成功。
+
 ## `INVALID_LAUNCH_OPTIONS`
 
 `--activation-only` 与 `--refresh-codex-daemon` 互斥：为一个明确不提交代理的诊断而
@@ -108,8 +122,9 @@ CIDR 等）。Guard 拒绝静默丢弃规则。请把该条目从 `no_proxy` 中
 
 ## `BACKEND_PROXY_CONFIG_CONFLICT`
 
-`.env` 中 Guard 标记块之外已有 `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`（含大小写变体）
-或 `ALL_PROXY`。Guard 绝不抢占：错误只列出键名（不回显值），请手工整理后再授权。
+`.env` 中 Guard 标记块之外已有 `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`（含大小写变体、
+`export KEY=...` dotenv 写法）或 `ALL_PROXY`。Guard 绝不抢占：错误只列出键名
+（不回显值），请手工整理后再授权。
 
 ## Coverage 状态行的含义
 

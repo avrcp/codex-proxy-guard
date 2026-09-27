@@ -69,10 +69,13 @@ Home 的 `.env` 中维护一个 BEGIN/END 标记的 `HTTP_PROXY`/`HTTPS_PROXY`/`
 - 只操作精确匹配的当前版本标记块；重复块、缺损块、未知版本、非 UTF-8、超过 1 MiB
   的文件拒绝自动编辑；
 - 块外字节逐字保留（含 CRLF），文件从不被整体重写，文件内容从不回显；
-- 块外已有代理键（含大小写变体与 `ALL_PROXY`）按名报告冲突（`BACKEND_PROXY_CONFIG_CONFLICT`），
-  绝不抢占或追加覆盖；
+- 块外已有代理键（含大小写变体、`export KEY=...` dotenv 写法与 `ALL_PROXY`）按名报告
+  冲突（`BACKEND_PROXY_CONFIG_CONFLICT`），绝不抢占或追加覆盖；
 - 写入经同目录临时文件原子替换，替换前复核原内容未变；
-- 撤销只删除 Guard 自己未被外部修改的块；仅当文件除该块外无实质内容时才删除文件；
+- 撤销只删除 Guard 自己未被外部修改的块；仅当文件除该块外无实质内容时才删除文件。
+  撤销顺序是先安全移除块、成功后才落盘关闭授权——revoke 失败时授权、绑定 Home 与
+  文件原样保留（可重试），绝不会留下 Guard 无法再定位的孤儿块；若块已移除而配置
+  保存失败，仍启用的授权会在下次刷新时如实报告 `pending`；
 - 未授权（包括仅展示、取消、刷新配置）时绝不创建、修改或删除 `.env`；
 - Guard 绝不从自己的 `CODEX_HOME` 推断 Desktop 的 Home；自定义 Home 未确认时返回
   `BACKEND_PROXY_SCOPE_UNCONFIRMED`，不写任何文件；

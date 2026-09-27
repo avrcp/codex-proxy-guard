@@ -29,7 +29,7 @@
 - [ ] 激活 worker 有界协议（16 KiB 请求/64 KiB 回执）、提交前取消不激活、提交后按 outcome-unknown 报告；worker 超时/取消被有界回收，绝不终止 Desktop。
 - [ ] TUI 与 `launch --json` 均显示产品类型、包名、版本、架构、发现来源与 `daemon_preparation`（skipped/stopped/not_needed），不输出安装路径或认证信息。
 - [ ] 普通启动：不解析 Codex CLI、不执行任何 daemon 命令；非打包 override 注入环境；已注册应用原生激活并提交经校验的 Chromium 代理参数。
-- [ ] `.env` 代理块默认关闭；仅 TUI `B`+`Y` 对显示的确切 Home 授权；未授权/作用域未确认/冲突均如实报错，块外字节逐字保留，撤销只删自己的块。
+- [ ] `.env` 代理块默认关闭；仅 TUI `B`+`Y` 对显示的确切 Home 授权；未授权/作用域未确认/冲突（含 `export KEY=...` 写法）均如实报错，块外字节逐字保留；撤销先安全移除块、成功后才落盘关闭授权，revoke 失败时授权与绑定 Home 原样保留。
 - [ ] 修复启动：TUI `D`+`Y` 或 `launch --refresh-codex-daemon` 单次授权；取消确认（Esc/N）严格零调用；授权不持久化。
 - [ ] 修复路径错误均阻断且可行动（CLI 不可用 / override 无效 / Home 无效 / 命令不支持 / stop 失败或超时），不静默降级为普通启动。
 - [ ] 修复 stop 输出协议：超限/非法 UTF-8/多 JSON/未知状态一律失败；`stopped`/`notRunning` 才继续；总预算可注入测试。
@@ -55,6 +55,11 @@
 - [ ] F 显式 daemon 修复（维护窗口）：未授权时 `D` 被 `BACKEND_PROXY_REQUIRED_FOR_REPAIR` 阻止；
       授权且 `.env` 可 prepare 时按"先 prepare 后 stop"顺序执行；故意制造 `.env` 冲突时
       daemon 必须未被 stop（已由集成测试锁定，实机复核一次）。
+- [ ] G `B` 撤销事务（rc.6）：正常撤销后块删除、`manage=false`、`proxy_env_home=""`、
+      Coverage 回到 `setup required`；手工在 Guard 块内加入额外键后再撤销，必须报
+      `BACKEND_PROXY_REVOKE_FAILED` 且授权、绑定 Home 与 `.env` 完全不变（重试语义）。
+- [ ] H `export` 冲突（rc.6）：`.env` 写入 `export HTTP_PROXY=...` 后启动/刷新，必须报告
+      `BACKEND_PROXY_CONFIG_CONFLICT`（只含键名），文件不被修改、不追加 Guard 块。
 - [ ] Guard 退出后 Desktop 仍运行；普通 Enter 不停止共享服务；包更新、带空格/中文路径的发行 EXE 完成 smoke。
 
 - [ ] Windows 10 与 Windows 11 各完成一次 portable 双击启动。
