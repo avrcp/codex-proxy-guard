@@ -120,11 +120,14 @@ impl EffectDispatcher {
 /// Applies one explicit consent decision.
 ///
 /// Enabling records the bound home only — the `.env` block itself is prepared
-/// by the next authorized launch, never at consent time. Disabling always
-/// saves the restricted configuration first (turning Guard off can never be
-/// blocked by a file problem), then removes Guard's own managed block; if the
-/// block could not be removed — because it was externally modified — the
-/// result reports that leftover honestly instead of pretending it is gone.
+/// by the next authorized launch, never at consent time. Disabling removes
+/// Guard's own managed block first and persists the restricted configuration
+/// only after the block is safely gone: while the revoke fails, the consent,
+/// the bound home, and the file all stay untouched and the user can simply
+/// retry, so a block can never be orphaned in a home Guard no longer records.
+/// If the block is gone but the configuration save fails, the still-enabled
+/// authorization honestly reports the missing block as pending on the next
+/// refresh.
 async fn update_backend_proxy_consent(
     config: &GuardConfig,
     config_path: &std::path::Path,
@@ -140,24 +143,43 @@ async fn update_backend_proxy_consent(
             .map(|()| updated)
             .map_err(|error| error.to_string())
     } else {
+        // The saved configuration is the only durable record of which Home
+        // the block belongs to, so the block must be gone before that record
+        // is dropped — the reverse order could strand an orphan block no
+        // later Guard run could even locate.
+        let revoke_home = home;
+        tokio::task::spawn_blocking(move || {
+            proxy_guard_windows::revoke(&proxy_guard_windows::env_path(&revoke_home))
+        })
+        .await
+        .map_err(|error| {
+            format!(
+                "BACKEND_PROXY_REVOKE_TASK_FAILED: {error}; the managed block was not \
+                 removed, so the consent remains enabled and the bound Home is unchanged"
+            )
+        })?
+        .map_err(|error| {
+            format!(
+                "BACKEND_PROXY_REVOKE_FAILED: {error}; the managed block was not safely \
+                 removed, so the consent remains enabled and the bound Home is unchanged"
+            )
+        })?;
+        // The block is gone (or never existed); revoking an absent block
+        // succeeds, so retrying after a failed save below is always safe.
         let mut updated = config.clone();
         updated.codex.manage_codex_proxy_env = false;
         updated.codex.proxy_env_home = PathBuf::new();
         updated
             .save(config_path)
-            .map_err(|error| error.to_string())?;
-        match tokio::task::spawn_blocking(move || {
-            proxy_guard_windows::revoke(&proxy_guard_windows::env_path(&home))
-        })
-        .await
-        {
-            Ok(Ok(_)) => Ok(updated),
-            Ok(Err(error)) => Err(format!(
-                "{error}; the consent was revoked in Guard's configuration, but the managed \
-                 block was not removed — resolve it manually"
-            )),
-            Err(error) => Err(format!("backend proxy revoke task failed: {error}")),
-        }
+            .map(|()| updated)
+            .map_err(|error| {
+                format!(
+                    "BACKEND_PROXY_CONSENT_SAVE_FAILED: Guard removed its managed .env \
+                     block but could not persist the revoked consent: {error}; the \
+                     configuration still authorizes management — retry after fixing the \
+                     configuration write problem"
+                )
+            })
     }
 }
 
@@ -210,5 +232,184 @@ mod tests {
         let kept = canonical_home(&future).unwrap();
         assert_eq!(kept, future);
         assert!(canonical_home(std::path::Path::new("relative")).is_err());
+    }
+
+    /// A Guard block someone edited (here: an unknown extra key) — `revoke`
+    /// refuses to tear it out, which is exactly the failure under test.
+    const CORRUPTED_BLOCK: &str = "# BEGIN CODEX PROXY GUARD: proxy-v1\n\
+         HTTP_PROXY=http://127.0.0.1:10808\n\
+         EXTRA=1\n\
+         # END CODEX PROXY GUARD: proxy-v1\n";
+
+    fn temp_root(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "cpg-consent-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn authorized_config(home: &std::path::Path) -> GuardConfig {
+        let mut config = GuardConfig::default();
+        config.codex.manage_codex_proxy_env = true;
+        config.codex.proxy_env_home = home.to_path_buf();
+        config
+    }
+
+    #[tokio::test]
+    async fn failed_revoke_keeps_the_config_and_the_env_untouched() {
+        let dir = temp_root("revoke-fail");
+        let config_path = dir.join("config.toml");
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let env = proxy_guard_windows::env_path(&home);
+        std::fs::write(&env, CORRUPTED_BLOCK).unwrap();
+        let config = authorized_config(&home);
+        config.save(&config_path).unwrap();
+        let saved_config = std::fs::read_to_string(&config_path).unwrap();
+
+        let error = update_backend_proxy_consent(&config, &config_path, false, home.clone())
+            .await
+            .unwrap_err();
+
+        assert!(error.starts_with("BACKEND_PROXY_REVOKE_FAILED:"), "{error}");
+        assert!(error.contains("consent remains enabled"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(&config_path).unwrap(),
+            saved_config,
+            "a failed revoke must not touch config.toml"
+        );
+        let reloaded = GuardConfig::load(&config_path).unwrap();
+        assert!(reloaded.codex.manage_codex_proxy_env);
+        assert_eq!(reloaded.codex.proxy_env_home, home);
+        assert_eq!(
+            std::fs::read(&env).unwrap(),
+            CORRUPTED_BLOCK.as_bytes(),
+            "a failed revoke must not touch the .env file"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn successful_revoke_removes_the_block_before_disabling_consent() {
+        let dir = temp_root("revoke-ok");
+        let config_path = dir.join("config.toml");
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let env = proxy_guard_windows::env_path(&home);
+        std::fs::write(&env, "KEEP=1\n").unwrap();
+        let config = authorized_config(&home);
+        config.save(&config_path).unwrap();
+        proxy_guard_windows::prepare(
+            &env,
+            &proxy_guard_windows::ProxyEnvValues::from_config(&config),
+        )
+        .unwrap();
+
+        let updated = update_backend_proxy_consent(&config, &config_path, false, home)
+            .await
+            .unwrap();
+
+        assert!(!updated.codex.manage_codex_proxy_env);
+        assert!(updated.codex.proxy_env_home.as_os_str().is_empty());
+        let on_disk = GuardConfig::load(&config_path).unwrap();
+        assert!(!on_disk.codex.manage_codex_proxy_env);
+        assert!(on_disk.codex.proxy_env_home.as_os_str().is_empty());
+        assert_eq!(
+            std::fs::read_to_string(&env).unwrap(),
+            "KEEP=1\n",
+            "only Guard's block disappears; user content survives"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn revoke_without_a_block_still_disables_the_consent() {
+        let dir = temp_root("revoke-absent");
+        let config_path = dir.join("config.toml");
+        // A home whose .env exists but holds no Guard block…
+        let with_file = dir.join("home-with-file");
+        std::fs::create_dir_all(&with_file).unwrap();
+        std::fs::write(with_file.join(".env"), "KEEP=1\n").unwrap();
+        let updated = update_backend_proxy_consent(
+            &authorized_config(&with_file),
+            &config_path,
+            false,
+            with_file.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(!updated.codex.manage_codex_proxy_env);
+        assert_eq!(
+            std::fs::read_to_string(with_file.join(".env")).unwrap(),
+            "KEEP=1\n"
+        );
+
+        // …and a home whose .env does not exist at all.
+        let missing = dir.join("home-missing-env");
+        std::fs::create_dir_all(&missing).unwrap();
+        let updated = update_backend_proxy_consent(
+            &authorized_config(&missing),
+            &config_path,
+            false,
+            missing,
+        )
+        .await
+        .unwrap();
+        assert!(!updated.codex.manage_codex_proxy_env);
+        assert!(updated.codex.proxy_env_home.as_os_str().is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn unsaveable_config_reports_the_removed_block_honestly() {
+        let dir = temp_root("save-fail");
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let env = proxy_guard_windows::env_path(&home);
+        let config = authorized_config(&home);
+        proxy_guard_windows::prepare(
+            &env,
+            &proxy_guard_windows::ProxyEnvValues::from_config(&config),
+        )
+        .unwrap();
+        // A regular file where the config directory should be makes the save
+        // fail after the block was already removed.
+        let blocker = dir.join("blocker");
+        std::fs::write(&blocker, "not a directory").unwrap();
+
+        let error = update_backend_proxy_consent(
+            &config,
+            &blocker.join("config.toml"),
+            false,
+            home.clone(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error.starts_with("BACKEND_PROXY_CONSENT_SAVE_FAILED:"),
+            "{error}"
+        );
+        assert!(error.contains("still authorizes management"), "{error}");
+        assert!(
+            !env.exists(),
+            "the block itself was already removed; only the consent save failed"
+        );
+        // The authorized config is still intact on the in-memory side, and a
+        // retry against a writable path now succeeds end to end.
+        let retry_path = dir.join("real-config.toml");
+        let updated = update_backend_proxy_consent(&config, &retry_path, false, home)
+            .await
+            .unwrap();
+        assert!(!updated.codex.manage_codex_proxy_env);
+        let on_disk = GuardConfig::load(&retry_path).unwrap();
+        assert!(!on_disk.codex.manage_codex_proxy_env);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

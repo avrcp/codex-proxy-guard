@@ -402,7 +402,8 @@ fn reduce_result(state: &mut AppState, result: TaskResult) -> Vec<AppEffect> {
                     } else {
                         state.backend_proxy_state = crate::BackendProxyRuntimeState::NotAuthorized;
                         state.status_message =
-                            "Backend proxy consent revoked; Guard's managed block was removed when it was unmodified"
+                            "Backend proxy consent revoked; Guard's managed block was removed \
+                             or was already absent"
                                 .into();
                     }
                 }
