@@ -275,15 +275,20 @@ pub async fn launch_codex_with(
             {
                 return Err("APPX_METADATA_INCOMPLETE: registered Desktop package has no verified FullTrust application identity".into());
             }
-            // A package update between discovery and launch changes the very
-            // identity being activated: re-read the registration once instead
-            // of launching a stale entry.
-            let current = crate::appx::discover_desktop_app(config, None, cancellation).await?;
-            if current.target_kind != info.target_kind || current.executable != info.executable {
-                return Err(
-                    "APPX_PACKAGE_CHANGED: Desktop package changed before launch; refresh and retry"
-                        .into(),
-                );
+            // The repair path spends a long, cancellable window in the daemon
+            // stop; re-read the registration before that window instead of
+            // launching a stale entry. The normal path has no await between
+            // its fresh pipeline discovery and the activation submit, so the
+            // pipeline discovery is already the current registration.
+            if options.refresh_codex_daemon {
+                let current = crate::appx::discover_desktop_app(config, None, cancellation).await?;
+                if current.target_kind != info.target_kind || current.executable != info.executable
+                {
+                    return Err(
+                        "APPX_PACKAGE_CHANGED: Desktop package changed before launch; refresh and retry"
+                            .into(),
+                    );
+                }
             }
         }
         DesktopTargetKind::UnpackagedExecutable => {}
