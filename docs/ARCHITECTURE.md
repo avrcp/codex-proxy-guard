@@ -7,18 +7,25 @@ ChatGPT Desktop（Chat、Work 和 Codex）。普通启动对 Codex 共享后台�
 仅在用户单次显式授权的修复启动中，Guard 通过官方生命周期命令停止共享服务。它不管理
 代理软件、不检查网络质量，也不接管 Desktop 生命周期。
 
-普通启动（默认）：
+普通启动（默认）——按目标类型分流：
 
 ```text
 用户 Launch（Enter / launch）
-→ 校验配置
+→ 校验配置与启动选项（activation-only 与 daemon 修复互斥）
 → 权限检查（非提升；查询失败也阻断）
 → 发现 Desktop（每次启动重新发现，不信任显示缓存）
 → 获取跨进程启动锁
 → 确认 Desktop 未运行
-→ 注入进程级代理环境
-→ spawn Desktop
-→ 返回事实回执（daemon_preparation = skipped）
+→ 分流：
+    RegisteredPackage
+      → prepare_registered_proxy：校验 Chromium 参数
+        → 确定 backend scope（未授权 / 已授权 Home）
+        → 已授权时先行写入 Home .env 受管块（先于任何中断性副作用）
+      → ActivateApplication（AO_NONE，短命 worker）
+      → 目标身份核验 → 事实回执
+    UnpackagedExecutable
+      → 注入进程级代理环境 → spawn Desktop → 事实回执
+→ 回执 daemon_preparation = skipped
 ```
 
 显式修复启动（`D` + `Y` 确认，或 `launch --refresh-codex-daemon`）：
@@ -26,11 +33,17 @@ ChatGPT Desktop（Chat、Work 和 Codex）。普通启动对 Codex 共享后台�
 ```text
 用户单次确认可能中断共享任务
 → 同一套启动前检查与启动锁
+→ 注册目标：未授权 backend proxy 直接拒绝（BACKEND_PROXY_REQUIRED_FOR_REPAIR）；
+  已授权时先 prepare Home .env，确认可 prepare 之后才允许进入下一步
 → 可信来源解析 Codex CLI 与目标 CODEX_HOME
 → 官方 codex app-server daemon stop（总预算 720 秒，可取消）
-→ 再检查：取消、可执行文件、Desktop 运行状态
-→ 注入环境 → spawn Desktop → 回执（stopped / not_needed）
+→ 再检查：取消、包注册、可执行文件、Desktop 运行状态
+→ RegisteredPackage → ActivateApplication；Unpackaged → 注入环境 spawn
+→ 回执（stopped / not_needed）
 ```
+
+准备顺序是硬约束：`.env` 是持久配置，提前写入不影响任何在运行进程；因此先确保新
+配置就绪，再中断旧 daemon——prepare 失败时 daemon 必然未被触碰。
 
 两条入口共用同一条启动管线与同一套检查；修复授权是单次调用意图，不持久化到配置。
 

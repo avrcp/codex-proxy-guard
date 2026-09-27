@@ -1,7 +1,8 @@
 use std::path::PathBuf;
 
 use crate::{
-    DesktopAppInfo, DesktopProcessState, GuardConfig, LaunchOptions, LaunchReceipt, ProxyField,
+    BackendProxyRuntimeState, DesktopAppInfo, DesktopProcessState, GuardConfig, LaunchOptions,
+    LaunchReceipt, ProxyField,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -52,6 +53,10 @@ pub enum TaskResult {
     LocalStateRefreshed {
         desktop_app: Result<DesktopAppInfo, String>,
         process: DesktopProcessState,
+        /// Real disk state of the authorized home proxy block, inspected
+        /// during the same refresh. `Unknown` when discovery failed before
+        /// the target kind was known.
+        backend_proxy: BackendProxyRuntimeState,
     },
     LaunchCompleted(Result<(DesktopAppInfo, LaunchReceipt), String>),
     ConfigSaved(Result<GuardConfig, String>),

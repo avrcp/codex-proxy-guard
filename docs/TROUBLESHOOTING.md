@@ -94,10 +94,30 @@ CIDR 等）。Guard 拒绝静默丢弃规则。请把该条目从 `no_proxy` 中
 按 `B` 查看确切 Home 并确认（默认取消）。Guard 不会猜测 Home，也不会用自己的
 `CODEX_HOME` 代替确认。
 
+## `BACKEND_PROXY_REQUIRED_FOR_REPAIR`
+
+已注册 Desktop 的修复启动（`D` / `--refresh-codex-daemon`）需要后端代理块先行授权：
+应用激活无法给 Codex 后端注入环境变量，未授权就停止共享服务只会中断任务而建立不了
+任何新配置。先按 `B` 授权（或改用普通启动）。未打包目标不受影响。共享服务未被触碰。
+
+## `INVALID_LAUNCH_OPTIONS`
+
+`--activation-only` 与 `--refresh-codex-daemon` 互斥：为一个明确不提交代理的诊断而
+中断共享服务没有合理意义。CLI 直接拒绝该组合；领域层同样校验（TUI/测试/未来入口
+构造的选项也会被拒）。未执行任何操作。
+
 ## `BACKEND_PROXY_CONFIG_CONFLICT`
 
 `.env` 中 Guard 标记块之外已有 `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`（含大小写变体）
 或 `ALL_PROXY`。Guard 绝不抢占：错误只列出键名（不回显值），请手工整理后再授权。
+
+## Coverage 状态行的含义
+
+`Coverage` 显示的是授权 Home `.env` 块的**真实磁盘状态**（`R` 刷新时重新检查）：
+`setup required`（未授权，黄色）、`pending sync`（已授权但块未写入，黄色）、
+`current`（块与当前配置一致，绿色）、`stale · syncs on launch`（代理配置已改、
+下次启动同步，黄色）、`conflict` / `needs attention`（红色）。黄色是需要你注意的
+真实状态，不会为了"全绿"自动写 `.env`。
 
 ## `LAUNCH_BUSY`
 

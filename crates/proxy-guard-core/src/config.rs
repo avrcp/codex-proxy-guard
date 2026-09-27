@@ -40,13 +40,13 @@ pub struct CodexConfig {
     pub cli_executable_override: PathBuf,
     pub refuse_if_running: bool,
     /// Explicit user consent for Guard to manage the HTTP_PROXY / HTTPS_PROXY /
-    /// NO_PROXY block inside one confirmed Codex Home `.env`. Default off; the
+    /// NO_PROXY block inside one authorized Codex Home `.env`. Default off; the
     /// flag is meaningless without the bound `proxy_env_home` below. Changing
     /// the home requires a new confirmation.
     pub manage_codex_proxy_env: bool,
     /// The absolute Codex Home whose `.env` the proxy-block consent is bound
-    /// to. Empty means no home has been confirmed yet. This is the default
-    /// user home's `.codex` unless the user explicitly confirmed another
+    /// to. Empty means no home is authorized yet. This is the default
+    /// user home's `.codex` unless the user explicitly authorized another
     /// location; Guard never infers it from its own CODEX_HOME variable.
     pub proxy_env_home: PathBuf,
 }
@@ -123,7 +123,7 @@ impl GuardConfig {
 
     /// Candidate Codex Home for the `.env` proxy-block consent prompt: the
     /// default `.codex` under the OS user-profile home. This is a display
-    /// candidate bound by an explicit confirmation — never a claim about the
+    /// candidate bound by an explicit authorization — never a claim about the
     /// home the activated Desktop actually uses, and never taken from Guard's
     /// own CODEX_HOME variable.
     pub fn default_codex_home() -> Option<PathBuf> {

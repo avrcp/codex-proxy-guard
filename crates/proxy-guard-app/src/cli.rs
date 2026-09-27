@@ -29,7 +29,7 @@ pub enum Command {
         /// is a one-shot authorization for this invocation only and may
         /// interrupt tasks of other CLI / IDE / remote clients sharing the
         /// same Codex Home.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "activation_only")]
         refresh_codex_daemon: bool,
         /// Diagnostic identity check: activate a registered Desktop without
         /// proxy arguments and without touching the Codex Home `.env`. The
@@ -123,5 +123,16 @@ mod tests {
         assert!(Cli::try_parse_from(["cpg", "launch", "--auto-stop-daemon"]).is_err());
         assert!(Cli::try_parse_from(["cpg", "launch", "--package-context-compat"]).is_err());
         assert!(Cli::try_parse_from(["cpg", "package-helper", "--pipe", "x"]).is_err());
+        // Stopping the shared daemon for a deliberately unproxied diagnostic
+        // is contradictory; the CLI refuses the combination outright.
+        assert!(
+            Cli::try_parse_from([
+                "cpg",
+                "launch",
+                "--activation-only",
+                "--refresh-codex-daemon"
+            ])
+            .is_err()
+        );
     }
 }

@@ -43,11 +43,18 @@
 
 ## Windows 手工验收
 
-当前候选的 A/B/C 与真实 Desktop 代理业务结果记录在 [包身份验收表](PACKAGE_IDENTITY_ACCEPTANCE.md)。
-标为 `NOT RUN` 的项目不能因编译、fixture 或 portable smoke 通过而勾选。
+真实 Desktop 验收矩阵与结果记录在 [包身份验收表](PACKAGE_IDENTITY_ACCEPTANCE.md)。
+标为 `NOT RUN` 的项目不能因编译、fixture 或 portable smoke 通过而勾选。旧的
+`Invoke-CommandInDesktopPackage` 包上下文候选已退役，不得复测或恢复。
 
-- [ ] 同一包版本下 A 正常注册入口、B 旧 Guard、C 包上下文候选依次验证目标 PID、精确 PackageFullName、弹窗和界面行为。
-- [ ] 候选方式以两个实际可用代理端口完成真实 ChatGPT/Codex 请求，并运行无破坏性的本地 Codex 任务验证沙箱。
+- [ ] A 开始菜单正常注册入口基线：真实 PID、PackageFullName、AUMID、TokenElevation、无身份弹窗。
+- [ ] B `launch --activation-only`：与 A 同等身份观测；回执 `proxy_delivery = not_established`。
+- [ ] C 普通原生激活 + Chromium 代理参数：身份核验通过、界面正常、参数已提交（不宣称网络已验证）。
+- [ ] D `B` 授权后的首次启动：`.env` 受管块写入、Coverage 变为 current、无副作用本地任务可执行。
+- [ ] E 端口切换 10808→7890：保存后 Coverage=stale，下一次启动同步 `.env` 后变 current。
+- [ ] F 显式 daemon 修复（维护窗口）：未授权时 `D` 被 `BACKEND_PROXY_REQUIRED_FOR_REPAIR` 阻止；
+      授权且 `.env` 可 prepare 时按"先 prepare 后 stop"顺序执行；故意制造 `.env` 冲突时
+      daemon 必须未被 stop（已由集成测试锁定，实机复核一次）。
 - [ ] Guard 退出后 Desktop 仍运行；普通 Enter 不停止共享服务；包更新、带空格/中文路径的发行 EXE 完成 smoke。
 
 - [ ] Windows 10 与 Windows 11 各完成一次 portable 双击启动。

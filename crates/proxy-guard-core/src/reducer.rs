@@ -68,6 +68,10 @@ fn reduce_intent(state: &mut AppState, intent: UserIntent) -> Vec<AppEffect> {
             match intent {
                 UserIntent::ConfirmDaemonRepairLaunch => {
                     state.daemon_repair_prompt = false;
+                    if daemon_repair_blocked(state) {
+                        state.status_message = daemon_repair_blocked_message().into();
+                        return Vec::new();
+                    }
                     if state.config_readiness != ConfigReadiness::Ready {
                         state.status_message =
                             "Configuration must be repaired before launch (press C)".into();
@@ -209,6 +213,15 @@ fn reduce_intent(state: &mut AppState, intent: UserIntent) -> Vec<AppEffect> {
             vec![AppEffect::LaunchDesktop(LaunchOptions::default())]
         }
         UserIntent::RequestDaemonRepairLaunch => {
+            // For a registered application, AppModel activation cannot inject
+            // backend proxy variables; a repair stop without an authorized
+            // home configuration would only interrupt shared work and build
+            // nothing. Unpackaged targets still inherit the environment
+            // directly, so D stays available there.
+            if daemon_repair_blocked(state) {
+                state.status_message = daemon_repair_blocked_message().into();
+                return Vec::new();
+            }
             state.daemon_repair_prompt = true;
             state.status_message = "Confirm the shared-daemon repair launch".into();
             Vec::new()
@@ -266,6 +279,18 @@ fn registered_package_found(state: &AppState) -> bool {
     )
 }
 
+/// A shared-daemon repair launch is only meaningful when its outcome can
+/// actually carry the new proxy: a registered application needs the
+/// authorized home `.env` block, so without consent D is blocked.
+fn daemon_repair_blocked(state: &AppState) -> bool {
+    registered_package_found(state) && !state.config.codex.manage_codex_proxy_env
+}
+
+fn daemon_repair_blocked_message() -> &'static str {
+    "Press B first. A shared-daemon repair is useful only after the Codex backend proxy \
+     configuration is authorized (BACKEND_PROXY_REQUIRED_FOR_REPAIR)"
+}
+
 fn reduce_result(state: &mut AppState, result: TaskResult) -> Vec<AppEffect> {
     // Guard is shutting down: never consume a late task result into UI state,
     // and never schedule new effects during shutdown.
@@ -276,12 +301,14 @@ fn reduce_result(state: &mut AppState, result: TaskResult) -> Vec<AppEffect> {
         TaskResult::LocalStateRefreshed {
             desktop_app,
             process,
+            backend_proxy,
         } => {
             if state.foreground != Some(ForegroundOperation::Refresh) {
                 return Vec::new();
             }
             state.foreground = None;
             state.desktop_process = process;
+            state.backend_proxy_state = backend_proxy;
             match desktop_app {
                 Ok(info) => {
                     state.desktop_app = DesktopAppDiscovery::Found(Box::new(info));
@@ -304,6 +331,19 @@ fn reduce_result(state: &mut AppState, result: TaskResult) -> Vec<AppEffect> {
             state.foreground = None;
             match result {
                 Ok((info, receipt)) => {
+                    // The receipt's backend fact is the freshest truth about
+                    // the home block: a prepared launch left it current.
+                    state.backend_proxy_state = match receipt.backend_proxy_config {
+                        crate::BackendProxyConfig::Prepared => {
+                            crate::BackendProxyRuntimeState::Current
+                        }
+                        crate::BackendProxyConfig::NotAuthorized => {
+                            crate::BackendProxyRuntimeState::NotAuthorized
+                        }
+                        crate::BackendProxyConfig::NotApplicable => {
+                            crate::BackendProxyRuntimeState::NotApplicable
+                        }
+                    };
                     state.desktop_app = DesktopAppDiscovery::Found(Box::new(info));
                     state.desktop_process = DesktopProcessState::Running { pid: receipt.pid };
                     state.status_message = launch_status_message(&receipt);
@@ -324,6 +364,13 @@ fn reduce_result(state: &mut AppState, result: TaskResult) -> Vec<AppEffect> {
             state.foreground = None;
             match result {
                 Ok(config) => {
+                    // A changed proxy endpoint makes the authorized home
+                    // block deterministically stale: the block was not
+                    // touched by this save and still holds the old values
+                    // until the next launch syncs it.
+                    if config.codex.manage_codex_proxy_env && state.config.proxy != config.proxy {
+                        state.backend_proxy_state = crate::BackendProxyRuntimeState::Stale;
+                    }
                     state.config = config;
                     state.proxy_editor = None;
                     state.config_readiness = ConfigReadiness::Ready;
@@ -346,10 +393,14 @@ fn reduce_result(state: &mut AppState, result: TaskResult) -> Vec<AppEffect> {
                 Ok(config) => {
                     state.config = config;
                     if state.config.codex.manage_codex_proxy_env {
+                        // Consent alone writes nothing: the block is pending
+                        // until the next launch (or a refresh) proves it.
+                        state.backend_proxy_state = crate::BackendProxyRuntimeState::Pending;
                         state.status_message =
                             "Backend proxy consent recorded for the bound Codex Home; the block is prepared by the next launch"
                                 .into();
                     } else {
+                        state.backend_proxy_state = crate::BackendProxyRuntimeState::NotAuthorized;
                         state.status_message =
                             "Backend proxy consent revoked; Guard's managed block was removed when it was unmodified"
                                 .into();
@@ -433,6 +484,175 @@ mod tests {
         AppState::new(GuardConfig::default(), PathBuf::from("config.toml"))
     }
 
+    /// A second fresh state within a test that already bound `state`.
+    fn fresh() -> AppState {
+        state()
+    }
+
+    fn registered_desktop() -> DesktopAppDiscovery {
+        DesktopAppDiscovery::Found(Box::new(crate::DesktopAppInfo {
+            product: DesktopProduct::ChatGpt,
+            package_name: "OpenAI.Codex".into(),
+            package_version: "1".into(),
+            architecture: "X64".into(),
+            discovery_source: DesktopDiscoverySource::AppxManifest,
+            target_kind: crate::DesktopTargetKind::RegisteredPackage(crate::PackageApplication {
+                package_full_name: "OpenAI.Codex_1_x64__test".into(),
+                package_family_name: "OpenAI.Codex_test".into(),
+                application_id: "App".into(),
+                app_user_model_id: "OpenAI.Codex_test!App".into(),
+                manifest_executable: "app/ChatGPT.exe".into(),
+                runtime_kind: crate::PackageRuntimeKind::FullTrustDesktop,
+            }),
+            install_location: PathBuf::from("app"),
+            executable: PathBuf::from("app/ChatGPT.exe"),
+        }))
+    }
+
+    fn authorize_backend_proxy(state: &mut AppState) {
+        state.desktop_app = registered_desktop();
+        state.config.codex.manage_codex_proxy_env = true;
+        state.config.codex.proxy_env_home = PathBuf::from(r"C:\Users\fixture\.codex");
+    }
+
+    #[test]
+    fn consent_enable_is_pending_not_current_and_launch_receipts_drive_the_state() {
+        let mut state = state();
+        authorize_backend_proxy(&mut state);
+        state.config.codex.manage_codex_proxy_env = false;
+        state.foreground = Some(ForegroundOperation::UpdateBackendProxyConsent);
+        let mut enabled = state.config.clone();
+        enabled.codex.manage_codex_proxy_env = true;
+        enabled.codex.proxy_env_home = PathBuf::from(r"C:\Users\fixture\.codex");
+        reduce(
+            &mut state,
+            AppAction::TaskComplete(Box::new(TaskResult::BackendProxyConsentUpdated(Ok(
+                enabled,
+            )))),
+        );
+        assert_eq!(
+            state.backend_proxy_state,
+            crate::BackendProxyRuntimeState::Pending,
+            "consent alone never claims the block is on disk"
+        );
+        // A prepared launch makes it current; the receipt is the fact.
+        state.foreground = Some(ForegroundOperation::Launch);
+        let info = match std::mem::replace(&mut state.desktop_app, DesktopAppDiscovery::Unknown) {
+            DesktopAppDiscovery::Found(info) => *info,
+            other => panic!("expected a discovered desktop, got {other:?}"),
+        };
+        let mut receipt = sample_receipt();
+        receipt.backend_proxy_config = crate::BackendProxyConfig::Prepared;
+        reduce(
+            &mut state,
+            AppAction::TaskComplete(Box::new(TaskResult::LaunchCompleted(Ok((info, receipt))))),
+        );
+        assert_eq!(
+            state.backend_proxy_state,
+            crate::BackendProxyRuntimeState::Current
+        );
+        // Revocation returns to NotAuthorized.
+        state.foreground = Some(ForegroundOperation::UpdateBackendProxyConsent);
+        let revoked = GuardConfig::default();
+        reduce(
+            &mut state,
+            AppAction::TaskComplete(Box::new(TaskResult::BackendProxyConsentUpdated(Ok(
+                revoked,
+            )))),
+        );
+        assert_eq!(
+            state.backend_proxy_state,
+            crate::BackendProxyRuntimeState::NotAuthorized
+        );
+    }
+
+    #[test]
+    fn proxy_change_marks_authorized_block_stale_without_disk_access() {
+        let mut state = state();
+        authorize_backend_proxy(&mut state);
+        state.backend_proxy_state = crate::BackendProxyRuntimeState::Current;
+        state.foreground = Some(ForegroundOperation::SaveConfig);
+        let mut updated = state.config.clone();
+        updated.proxy.port = 7890;
+        reduce(
+            &mut state,
+            AppAction::TaskComplete(Box::new(TaskResult::ConfigSaved(Ok(updated)))),
+        );
+        assert_eq!(
+            state.backend_proxy_state,
+            crate::BackendProxyRuntimeState::Stale
+        );
+        // Saving without a proxy change must not disturb a known state.
+        state.foreground = Some(ForegroundOperation::SaveConfig);
+        let unchanged = state.config.clone();
+        reduce(
+            &mut state,
+            AppAction::TaskComplete(Box::new(TaskResult::ConfigSaved(Ok(unchanged)))),
+        );
+        assert_eq!(
+            state.backend_proxy_state,
+            crate::BackendProxyRuntimeState::Stale
+        );
+        // Without authorization, a proxy change does not invent a state.
+        let mut plain = fresh();
+        plain.foreground = Some(ForegroundOperation::SaveConfig);
+        let mut changed = GuardConfig::default();
+        changed.proxy.port = 7890;
+        reduce(
+            &mut plain,
+            AppAction::TaskComplete(Box::new(TaskResult::ConfigSaved(Ok(changed)))),
+        );
+        assert_eq!(
+            plain.backend_proxy_state,
+            crate::BackendProxyRuntimeState::Unknown
+        );
+    }
+
+    #[test]
+    fn refresh_stores_the_inspected_backend_state() {
+        let mut state = state();
+        state.foreground = Some(ForegroundOperation::Refresh);
+        reduce(
+            &mut state,
+            AppAction::TaskComplete(Box::new(TaskResult::LocalStateRefreshed {
+                desktop_app: Err("CODEX_NOT_INSTALLED".into()),
+                process: DesktopProcessState::Stopped,
+                backend_proxy: crate::BackendProxyRuntimeState::Conflict {
+                    keys: vec!["HTTP_PROXY".into()],
+                },
+            })),
+        );
+        assert_eq!(
+            state.backend_proxy_state,
+            crate::BackendProxyRuntimeState::Conflict {
+                keys: vec!["HTTP_PROXY".into()]
+            }
+        );
+    }
+
+    fn sample_receipt() -> LaunchReceipt {
+        LaunchReceipt {
+            pid: 7,
+            proxy_endpoint: Some("http://127.0.0.1:10808".into()),
+            daemon_preparation: DaemonPreparation::Skipped,
+            launch_method: crate::LaunchMethod::AppmodelActivation,
+            activation_state: crate::ActivationState::Returned,
+            instance: crate::InstanceObservation::Created,
+            package_identity: crate::PackageIdentityObservation::Matched,
+            aumid: crate::AumidObservation::Matched,
+            proxy_delivery: crate::ProxyDelivery::ActivationArgumentsAndHomeConfig,
+            backend_proxy_config: crate::BackendProxyConfig::Prepared,
+            target_elevation: Some(false),
+            desktop: DesktopLaunchInfo {
+                product: DesktopProduct::ChatGpt,
+                package_name: "OpenAI.Codex".into(),
+                package_version: "1".into(),
+                architecture: "X64".into(),
+                discovery_source: DesktopDiscoverySource::AppxManifest,
+            },
+        }
+    }
+
     #[test]
     fn only_one_foreground_operation_is_allowed() {
         let mut state = state();
@@ -488,23 +708,7 @@ mod tests {
     #[test]
     fn repair_confirmation_no_longer_carries_a_package_context_choice() {
         let mut state = state();
-        state.desktop_app = DesktopAppDiscovery::Found(Box::new(crate::DesktopAppInfo {
-            product: DesktopProduct::ChatGpt,
-            package_name: "OpenAI.Codex".into(),
-            package_version: "1".into(),
-            architecture: "X64".into(),
-            discovery_source: DesktopDiscoverySource::AppxManifest,
-            target_kind: crate::DesktopTargetKind::RegisteredPackage(crate::PackageApplication {
-                package_full_name: "OpenAI.Codex_1_x64__test".into(),
-                package_family_name: "OpenAI.Codex_test".into(),
-                application_id: "App".into(),
-                app_user_model_id: "OpenAI.Codex_test!App".into(),
-                manifest_executable: "app/ChatGPT.exe".into(),
-                runtime_kind: crate::PackageRuntimeKind::FullTrustDesktop,
-            }),
-            install_location: PathBuf::from("app"),
-            executable: PathBuf::from("app/ChatGPT.exe"),
-        }));
+        authorize_backend_proxy(&mut state);
         reduce(
             &mut state,
             AppAction::Intent(UserIntent::RequestDaemonRepairLaunch),
@@ -519,6 +723,57 @@ mod tests {
                 activation_only: false,
             })]
         );
+    }
+
+    /// Registered target + no backend proxy consent: D must not even open
+    /// the stop confirmation, and a stale confirm cannot bypass the gate.
+    #[test]
+    fn daemon_repair_requires_backend_consent_for_registered_targets() {
+        let mut state = state();
+        state.desktop_app = registered_desktop();
+        assert!(
+            reduce(
+                &mut state,
+                AppAction::Intent(UserIntent::RequestDaemonRepairLaunch)
+            )
+            .is_empty()
+        );
+        assert!(!state.daemon_repair_prompt);
+        assert!(state.status_message.contains("Press B first"));
+        assert!(
+            state
+                .status_message
+                .contains("BACKEND_PROXY_REQUIRED_FOR_REPAIR")
+        );
+        // A stale confirmation is still refused.
+        assert!(
+            reduce(
+                &mut state,
+                AppAction::Intent(UserIntent::ConfirmDaemonRepairLaunch)
+            )
+            .is_empty()
+        );
+        // Once authorized, D opens the confirmation again.
+        authorize_backend_proxy(&mut state);
+        assert!(
+            reduce(
+                &mut state,
+                AppAction::Intent(UserIntent::RequestDaemonRepairLaunch)
+            )
+            .is_empty()
+        );
+        assert!(state.daemon_repair_prompt);
+        // Unpackaged targets keep D without consent: the injected process
+        // environment itself carries the new proxy.
+        let mut unpackaged = fresh();
+        assert!(
+            reduce(
+                &mut unpackaged,
+                AppAction::Intent(UserIntent::RequestDaemonRepairLaunch)
+            )
+            .is_empty()
+        );
+        assert!(unpackaged.daemon_repair_prompt);
     }
 
     #[test]

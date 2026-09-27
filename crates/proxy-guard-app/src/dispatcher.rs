@@ -4,7 +4,9 @@ use proxy_guard_core::{
     AppEffect, AppState, DesktopAppInfo, DesktopProcessState, GuardConfig, LaunchOptions,
     LaunchReceipt, TaskResult,
 };
-use proxy_guard_windows::{desktop_process_state, discover_desktop_app, launch_codex};
+use proxy_guard_windows::{
+    desktop_process_state, discover_desktop_app, inspect_backend_proxy_state, launch_codex,
+};
 use tokio::{
     sync::{Mutex, mpsc},
     task::JoinHandle,
@@ -53,12 +55,21 @@ impl EffectDispatcher {
                         .map_or(DesktopProcessState::Unknown, |info| {
                             desktop_process_state(info)
                         });
+                    // The real disk state of the authorized home block rides
+                    // along with every refresh; without a discovered target
+                    // the state stays unknown. Inspection never reads the
+                    // Codex Home when consent is off.
+                    let backend_proxy = desktop_app.as_ref().map_or(
+                        proxy_guard_core::BackendProxyRuntimeState::Unknown,
+                        |info| inspect_backend_proxy_state(info, &config),
+                    );
                     if let Ok(info) = &desktop_app {
                         *cached_app.lock().await = Some(info.clone());
                     }
                     TaskResult::LocalStateRefreshed {
                         desktop_app,
                         process,
+                        backend_proxy,
                     }
                 }
                 AppEffect::LaunchDesktop(options) => {
@@ -160,7 +171,7 @@ fn canonical_home(home: &std::path::Path) -> Result<PathBuf, String> {
         Ok(home.to_path_buf())
     } else {
         Err(
-            "BACKEND_PROXY_SCOPE_UNCONFIRMED: the confirmed Codex Home is not a usable \
+            "BACKEND_PROXY_SCOPE_UNCONFIRMED: the authorized Codex Home is not a usable \
              absolute path"
                 .into(),
         )

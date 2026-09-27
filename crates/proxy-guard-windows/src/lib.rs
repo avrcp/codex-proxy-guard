@@ -28,8 +28,8 @@ pub use elevation::{
 };
 pub use environment::{apply_proxy_environment, proxy_environment};
 pub use process::{
-    BackendProxyScope, LaunchHooks, backend_proxy_scope, desktop_process_state, launch_codex,
-    launch_codex_with,
+    BackendProxyScope, LaunchHooks, backend_proxy_scope, desktop_process_state,
+    inspect_backend_proxy_state, launch_codex, launch_codex_with,
 };
 pub use proxy_env_file::{ProxyEnvValues, env_path, inspect, prepare, revoke};
 pub use proxy_launch_plan::proxy_launch_plan;

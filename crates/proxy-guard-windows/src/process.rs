@@ -161,7 +161,7 @@ pub enum BackendProxyScope {
     /// registered launch still proceeds with Chromium arguments only, and the
     /// receipt reports the missing layer instead of silently claiming it.
     NotAuthorized,
-    /// The explicitly confirmed absolute Codex Home bound to the consent.
+    /// The explicitly authorized absolute Codex Home bound to the consent.
     Confirmed(PathBuf),
 }
 
@@ -176,12 +176,137 @@ pub fn backend_proxy_scope(config: &GuardConfig) -> Result<BackendProxyScope, St
     if home.as_os_str().is_empty() || !home.is_absolute() {
         return Err(
             "BACKEND_PROXY_SCOPE_UNCONFIRMED: the backend proxy consent is enabled but no \
-             absolute Codex Home is bound; confirm the displayed home (press B in the TUI). \
-             Nothing was written"
+             absolute authorized Codex Home is bound; authorize the displayed home (press B \
+             in the TUI). Nothing was written"
                 .into(),
         );
     }
     Ok(BackendProxyScope::Confirmed(home.clone()))
+}
+
+/// Every durable input a registered-application launch needs before any
+/// interrupting side effect: the validated activation arguments plus the
+/// already-prepared state of the authorized home block. The daemon stop and
+/// the activation only consume this result.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PreparedRegisteredProxy {
+    arguments: String,
+    endpoint: Option<String>,
+    backend: BackendProxyConfig,
+}
+
+/// Builds (and, when authorized, writes) the complete registered-launch proxy
+/// plan. Called before the optional daemon stop so a failure here — an
+/// unmappable bypass entry, an unconfirmed scope, a conflicting `.env` —
+/// aborts the launch without having interrupted the shared daemon. The
+/// `.env` block is persistent configuration for later processes from that
+/// home, so preparing it early changes nothing about running daemons.
+async fn prepare_registered_proxy(
+    config: &GuardConfig,
+    options: LaunchOptions,
+) -> Result<PreparedRegisteredProxy, String> {
+    if options.activation_only {
+        // Diagnostic identity path: no proxy arguments, no home
+        // configuration, and a receipt that says so.
+        return Ok(PreparedRegisteredProxy {
+            arguments: String::new(),
+            endpoint: None,
+            backend: BackendProxyConfig::NotApplicable,
+        });
+    }
+    let plan = proxy_launch_plan(config)?;
+    match backend_proxy_scope(config)? {
+        BackendProxyScope::NotAuthorized => {
+            if options.refresh_codex_daemon {
+                // A registered application cannot inherit backend proxy
+                // variables through activation; stopping the shared daemon
+                // without the authorized home block would only interrupt
+                // shared work without establishing anything new.
+                return Err(
+                    "BACKEND_PROXY_REQUIRED_FOR_REPAIR: a shared-daemon repair launch for a \
+                     registered application is useful only after the Codex backend proxy \
+                     configuration is authorized; press B in the TUI first. The shared daemon \
+                     was not touched"
+                        .into(),
+                );
+            }
+            Ok(PreparedRegisteredProxy {
+                arguments: plan.chromium_arguments,
+                endpoint: Some(plan.proxy_url),
+                backend: BackendProxyConfig::NotAuthorized,
+            })
+        }
+        BackendProxyScope::Confirmed(home) => {
+            let path = crate::proxy_env_file::env_path(&home);
+            let values = ProxyEnvValues::from_config(config);
+            // Preparation failure aborts the launch: a "proxied launch" must
+            // not silently degrade into an unproxied activation. The block
+            // persists after this launch by design; revocation is the user's
+            // explicit action.
+            tokio::task::spawn_blocking(move || crate::proxy_env_file::prepare(&path, &values))
+                .await
+                .map_err(|error| format!("BACKEND_PROXY_ENV_TASK_FAILED: {error}"))??;
+            Ok(PreparedRegisteredProxy {
+                arguments: plan.chromium_arguments,
+                endpoint: Some(plan.proxy_url),
+                backend: BackendProxyConfig::Prepared,
+            })
+        }
+    }
+}
+
+/// Real disk state of the backend proxy configuration for the current
+/// target, mapped onto the UI domain state. Thin by design: it only composes
+/// [`backend_proxy_scope`] with [`crate::proxy_env_file::inspect`]; there is
+/// deliberately no second `.env` parser here.
+///
+/// Security: without consent (`manage_codex_proxy_env == false`) this never
+/// touches the Codex Home at all — no read, no stat.
+pub fn inspect_backend_proxy_state(
+    info: &DesktopAppInfo,
+    config: &GuardConfig,
+) -> proxy_guard_core::BackendProxyRuntimeState {
+    use proxy_guard_core::BackendProxyRuntimeState as State;
+    if !matches!(&info.target_kind, DesktopTargetKind::RegisteredPackage(_)) {
+        return State::NotApplicable;
+    }
+    if !config.codex.manage_codex_proxy_env {
+        return State::NotAuthorized;
+    }
+    let home = match backend_proxy_scope(config) {
+        Ok(BackendProxyScope::Confirmed(home)) => home,
+        Ok(BackendProxyScope::NotAuthorized) => return State::NotAuthorized,
+        Err(_) => return State::Unavailable,
+    };
+    match crate::proxy_env_file::inspect(&crate::proxy_env_file::env_path(&home)) {
+        Ok(inspection) => {
+            if !inspection.conflicting_keys.is_empty() {
+                State::Conflict {
+                    keys: inspection.conflicting_keys,
+                }
+            } else if !inspection.managed_block_present {
+                State::Pending
+            } else if inspection.managed_values == Some(ProxyEnvValues::from_config(config)) {
+                State::Current
+            } else {
+                State::Stale
+            }
+        }
+        Err(error) => {
+            // A structurally broken Guard block is a different fact from an
+            // unreadable file; both need attention, but only one means the
+            // block itself is damaged.
+            if error.starts_with("BACKEND_PROXY_BLOCK_INVALID") {
+                State::Invalid
+            } else {
+                State::Unavailable
+            }
+        }
+    }
+}
+
+fn registered_target(info: &DesktopAppInfo) -> bool {
+    matches!(&info.target_kind, DesktopTargetKind::RegisteredPackage(_))
 }
 
 /// Launches Desktop through the backend its target kind requires.
@@ -219,6 +344,17 @@ pub async fn launch_codex_with(
     cancellation: &CancellationToken,
     hooks: &LaunchHooks<'_>,
 ) -> Result<LaunchReceipt, String> {
+    // The option combination is validated here — not only at the CLI —
+    // because `LaunchOptions` can also be constructed by the TUI, tests, or
+    // future entry points. Stopping the shared daemon only to run a
+    // deliberately unproxied diagnostic has no legitimate use.
+    if options.activation_only && options.refresh_codex_daemon {
+        return Err(
+            "INVALID_LAUNCH_OPTIONS: activation-only cannot be combined with a daemon repair; \
+             nothing was executed"
+                .into(),
+        );
+    }
     config.validate().map_err(|error| error.to_string())?;
     if cancellation.is_cancelled() {
         return Err("LAUNCH_CANCELLED: Guard is shutting down".into());
@@ -275,23 +411,33 @@ pub async fn launch_codex_with(
             {
                 return Err("APPX_METADATA_INCOMPLETE: registered Desktop package has no verified FullTrust application identity".into());
             }
-            // The repair path spends a long, cancellable window in the daemon
-            // stop; re-read the registration before that window instead of
-            // launching a stale entry. The normal path has no await between
-            // its fresh pipeline discovery and the activation submit, so the
-            // pipeline discovery is already the current registration.
-            if options.refresh_codex_daemon {
-                let current = crate::appx::discover_desktop_app(config, None, cancellation).await?;
-                if current.target_kind != info.target_kind || current.executable != info.executable
-                {
-                    return Err(
-                        "APPX_PACKAGE_CHANGED: Desktop package changed before launch; refresh and retry"
-                            .into(),
-                    );
-                }
-            }
         }
         DesktopTargetKind::UnpackagedExecutable => {}
+    }
+
+    // Every durable registered-launch input is prepared before any
+    // interrupting side effect: a failed proxy plan, unconfirmed scope, or
+    // conflicting `.env` aborts here, while the shared daemon (if a repair
+    // was requested) is still untouched.
+    let prepared_proxy = if registered_target(info) {
+        Some(prepare_registered_proxy(config, options).await?)
+    } else {
+        None
+    };
+
+    // The repair path spends a long, cancellable window in the daemon stop;
+    // re-read the registration before that window instead of activating a
+    // stale entry. The normal path has no await between its fresh pipeline
+    // discovery and the activation submit, so the pipeline discovery is
+    // already the current registration.
+    if options.refresh_codex_daemon && registered_target(info) {
+        let current = crate::appx::discover_desktop_app(config, None, cancellation).await?;
+        if current.target_kind != info.target_kind || current.executable != info.executable {
+            return Err(
+                "APPX_PACKAGE_CHANGED: Desktop package changed before launch; refresh and retry"
+                    .into(),
+            );
+        }
     }
 
     let mut pinned_home = None;
@@ -366,12 +512,14 @@ pub async fn launch_codex_with(
 
     match &info.target_kind {
         DesktopTargetKind::RegisteredPackage(package) => {
+            let prepared =
+                prepared_proxy.expect("registered targets always prepare their proxy plan first");
             launch_registered(
                 info,
                 package,
-                config,
                 options,
                 daemon_preparation,
+                prepared,
                 cancellation,
                 &mut lock,
             )
@@ -422,62 +570,35 @@ pub async fn launch_codex_with(
 }
 
 /// Registered-application launch through the native AppModel activation
-/// backend, with the proxy plan and the authorized home configuration
-/// prepared honestly and reported as separate layers.
+/// backend. Every proxy layer was already prepared by
+/// [`prepare_registered_proxy`] before the optional daemon stop; this
+/// function only consumes that plan and reports the layers separately.
 async fn launch_registered(
     info: &DesktopAppInfo,
     package: &proxy_guard_core::PackageApplication,
-    config: &GuardConfig,
     options: LaunchOptions,
     daemon_preparation: DaemonPreparation,
+    prepared: PreparedRegisteredProxy,
     cancellation: &CancellationToken,
     lock: &mut StartupLock,
 ) -> Result<LaunchReceipt, String> {
-    let mut proxy_endpoint = None;
-    let mut arguments = String::new();
-    let mut proxy_delivery = ProxyDelivery::NotEstablished;
-    let mut backend_proxy_config = BackendProxyConfig::NotApplicable;
-
-    if options.activation_only {
-        // Diagnostic identity path: no proxy arguments, no home configuration,
-        // and a receipt that says so.
+    let proxy_delivery = if options.activation_only {
+        // Diagnostic identity path: the receipt must not imply a proxy plan.
+        ProxyDelivery::NotEstablished
     } else {
-        let plan = proxy_launch_plan(config)?;
-        arguments = plan.chromium_arguments;
-        proxy_endpoint = Some(plan.proxy_url);
-        match backend_proxy_scope(config)? {
-            BackendProxyScope::NotAuthorized => {
-                proxy_delivery = ProxyDelivery::ActivationArguments;
-                backend_proxy_config = BackendProxyConfig::NotAuthorized;
-            }
-            BackendProxyScope::Confirmed(home) => {
-                let path = crate::proxy_env_file::env_path(&home);
-                let values = ProxyEnvValues::from_config(config);
-                // Preparation failure aborts the launch: a "proxied launch"
-                // must not silently degrade into an unproxied activation. The
-                // block persists after this launch by design; revocation is
-                // the user's explicit action.
-                tokio::task::spawn_blocking(move || crate::proxy_env_file::prepare(&path, &values))
-                    .await
-                    .map_err(|error| format!("BACKEND_PROXY_ENV_TASK_FAILED: {error}"))?
-                    .map_err(|error| {
-                        daemon_failure_context(
-                            format!("{error}; the activation was not attempted"),
-                            daemon_preparation,
-                        )
-                    })?;
-                proxy_delivery = ProxyDelivery::ActivationArgumentsAndHomeConfig;
-                backend_proxy_config = BackendProxyConfig::Prepared;
-            }
+        match prepared.backend {
+            BackendProxyConfig::Prepared => ProxyDelivery::ActivationArgumentsAndHomeConfig,
+            BackendProxyConfig::NotAuthorized => ProxyDelivery::ActivationArguments,
+            BackendProxyConfig::NotApplicable => ProxyDelivery::NotEstablished,
         }
-    }
+    };
 
     let request = ActivationWorkerRequest {
         version: PROTOCOL_VERSION,
         aumid: package.app_user_model_id.clone(),
         expected_package_full_name: package.package_full_name.clone(),
         expected_executable: info.executable.clone(),
-        arguments,
+        arguments: prepared.arguments,
     };
 
     // The backend owns its cancellation/permit boundary. Mark the anti-race
@@ -632,7 +753,7 @@ async fn launch_registered(
 
     Ok(LaunchReceipt {
         pid,
-        proxy_endpoint,
+        proxy_endpoint: prepared.endpoint,
         daemon_preparation,
         launch_method: proxy_guard_core::LaunchMethod::AppmodelActivation,
         activation_state: proxy_guard_core::ActivationState::Returned,
@@ -640,7 +761,7 @@ async fn launch_registered(
         package_identity,
         aumid,
         proxy_delivery,
-        backend_proxy_config,
+        backend_proxy_config: prepared.backend,
         target_elevation: receipt.elevation,
         desktop: info.into(),
     })
@@ -683,6 +804,138 @@ fn now_unix_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn registered_info() -> DesktopAppInfo {
+        DesktopAppInfo {
+            product: proxy_guard_core::DesktopProduct::ChatGpt,
+            package_name: "OpenAI.Codex".into(),
+            package_version: "1".into(),
+            architecture: "X64".into(),
+            discovery_source: proxy_guard_core::DesktopDiscoverySource::AppxManifest,
+            target_kind: DesktopTargetKind::RegisteredPackage(
+                proxy_guard_core::PackageApplication {
+                    package_full_name: "OpenAI.Codex_1_x64__test".into(),
+                    package_family_name: "OpenAI.Codex_test".into(),
+                    application_id: "App".into(),
+                    app_user_model_id: "OpenAI.Codex_test!App".into(),
+                    manifest_executable: "app/ChatGPT.exe".into(),
+                    runtime_kind: PackageRuntimeKind::FullTrustDesktop,
+                },
+            ),
+            install_location: Path::new("app").into(),
+            executable: Path::new("app/ChatGPT.exe").into(),
+        }
+    }
+
+    fn temp_home() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "cpg-backend-state-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn backend_state_without_consent_or_registered_target_never_touches_disk() {
+        let mut config = GuardConfig::default();
+        // Unpackaged target: not applicable regardless of config.
+        let unpackaged = DesktopAppInfo {
+            target_kind: DesktopTargetKind::UnpackagedExecutable,
+            ..registered_info()
+        };
+        assert_eq!(
+            inspect_backend_proxy_state(&unpackaged, &config),
+            proxy_guard_core::BackendProxyRuntimeState::NotApplicable
+        );
+        // Registered without consent: NotAuthorized (and no home is even
+        // looked at — the bound home below deliberately does not exist).
+        config.codex.manage_codex_proxy_env = false;
+        config.codex.proxy_env_home = PathBuf::from(r"Z:\definitely\missing\home");
+        assert_eq!(
+            inspect_backend_proxy_state(&registered_info(), &config),
+            proxy_guard_core::BackendProxyRuntimeState::NotAuthorized
+        );
+        // Consent enabled but no usable bound home: unavailable, still no
+        // disk access.
+        config.codex.manage_codex_proxy_env = true;
+        config.codex.proxy_env_home = PathBuf::new();
+        assert_eq!(
+            inspect_backend_proxy_state(&registered_info(), &config),
+            proxy_guard_core::BackendProxyRuntimeState::Unavailable
+        );
+    }
+
+    #[test]
+    fn backend_state_tracks_the_real_disk_block() {
+        use proxy_guard_core::BackendProxyRuntimeState as State;
+        let home = temp_home();
+        let mut config = GuardConfig::default();
+        config.codex.manage_codex_proxy_env = true;
+        config.codex.proxy_env_home = home.clone();
+        let info = registered_info();
+
+        // Authorized but no block yet: pending.
+        assert_eq!(inspect_backend_proxy_state(&info, &config), State::Pending);
+
+        // Prepared with current values: current.
+        crate::proxy_env_file::prepare(
+            &crate::proxy_env_file::env_path(&home),
+            &ProxyEnvValues::from_config(&config),
+        )
+        .unwrap();
+        assert_eq!(inspect_backend_proxy_state(&info, &config), State::Current);
+
+        // Changed proxy configuration: stale.
+        config.proxy.port = 7890;
+        assert_eq!(inspect_backend_proxy_state(&info, &config), State::Stale);
+
+        // External block removal: pending again.
+        config.proxy.port = 10808;
+        std::fs::remove_file(crate::proxy_env_file::env_path(&home)).unwrap();
+        assert_eq!(inspect_backend_proxy_state(&info, &config), State::Pending);
+
+        // Conflicting external keys: conflict, named by key.
+        std::fs::write(
+            crate::proxy_env_file::env_path(&home),
+            "HTTPS_PROXY=http://x:1\n",
+        )
+        .unwrap();
+        assert_eq!(
+            inspect_backend_proxy_state(&info, &config),
+            State::Conflict {
+                keys: vec!["HTTPS_PROXY".into()]
+            }
+        );
+
+        // A damaged Guard block: invalid, distinct from unreadable.
+        std::fs::write(
+            crate::proxy_env_file::env_path(&home),
+            format!(
+                "{}\nHTTP_PROXY=http://127.0.0.1:10808\n",
+                crate::proxy_env_file::BLOCK_BEGIN
+            ),
+        )
+        .unwrap();
+        assert_eq!(inspect_backend_proxy_state(&info, &config), State::Invalid);
+
+        // Non-UTF-8 bytes: unavailable.
+        std::fs::write(
+            crate::proxy_env_file::env_path(&home),
+            [0xFF_u8, 0xFE, 0x00],
+        )
+        .unwrap();
+        assert_eq!(
+            inspect_backend_proxy_state(&info, &config),
+            State::Unavailable
+        );
+
+        std::fs::remove_dir_all(&home).unwrap();
+    }
 
     #[test]
     fn different_locations_do_not_match_by_file_name() {

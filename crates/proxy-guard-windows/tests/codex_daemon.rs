@@ -192,7 +192,7 @@ async fn activation_only_is_refused_for_unpackaged_targets_without_spawning() {
 }
 
 #[tokio::test]
-async fn registered_package_launch_never_spawns_a_bare_exe_or_stops_the_daemon() {
+async fn registered_repair_without_consent_is_refused_before_the_daemon_stop() {
     let root = temp_dir("package-preflight");
     let stop_marker = root.join("stop-invoked");
     let desktop_marker = root.join("desktop-spawned");
@@ -210,10 +210,10 @@ async fn registered_package_launch_never_spawns_a_bare_exe_or_stops_the_daemon()
                 manifest_executable: "app/ChatGPT.exe".into(),
                 runtime_kind: PackageRuntimeKind::FullTrustDesktop,
             });
-            // The fixture package cannot match this machine's real
-            // registration, so the pre-activation re-check must fail — before
-            // the daemon stop and before any process creation. Whatever the
-            // exact environment-dependent error, nothing may have run.
+            // A registered repair without the authorized backend proxy block
+            // is refused deterministically before the daemon stop and before
+            // any process creation: the stop would interrupt shared work and
+            // establish nothing.
             let error = launch_codex_with(
                 &info,
                 &config,
@@ -226,15 +226,109 @@ async fn registered_package_launch_never_spawns_a_bare_exe_or_stops_the_daemon()
             )
             .await
             .unwrap_err();
-            assert!(!error.is_empty());
+            assert!(
+                error.starts_with("BACKEND_PROXY_REQUIRED_FOR_REPAIR:"),
+                "{error}"
+            );
             assert!(
                 !stop_marker.exists(),
-                "a registered-package launch must never run daemon commands"
+                "an unauthorized registered repair must never run daemon commands"
             );
             assert!(
                 !desktop_marker.exists(),
                 "a registered-package launch must never spawn a bare EXE"
             );
+        },
+    )
+    .await;
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn registered_repair_prepares_the_home_block_before_stopping_the_daemon() {
+    let root = temp_dir("repair-order");
+    let stop_marker = root.join("stop-invoked");
+    let desktop_marker = root.join("desktop-spawned");
+    let home = root.join("authorized-home");
+    fs::create_dir_all(&home).unwrap();
+    // A conflicting proxy key outside Guard's block: the prepare step must
+    // fail closed, and — the point of this test — the shared daemon must
+    // still not have been stopped.
+    fs::write(home.join(".env"), "HTTPS_PROXY=http://elsewhere:1\n").unwrap();
+    with_fixture_env(
+        &desktop_marker,
+        &[("FAKE_CLI_TOUCH", stop_marker.to_str().unwrap())],
+        async {
+            let mut config = config_with_cli_override(&fake_cli_exe());
+            config.codex.manage_codex_proxy_env = true;
+            config.codex.proxy_env_home = home.clone();
+            let mut info = desktop_info(&fake_cli_exe());
+            info.target_kind = DesktopTargetKind::RegisteredPackage(PackageApplication {
+                package_full_name: "Fixture_1.0.0.0_x64__test".into(),
+                package_family_name: "Fixture_test".into(),
+                application_id: "App".into(),
+                app_user_model_id: "Fixture_test!App".into(),
+                manifest_executable: "app/ChatGPT.exe".into(),
+                runtime_kind: PackageRuntimeKind::FullTrustDesktop,
+            });
+            let error = launch_codex_with(
+                &info,
+                &config,
+                LaunchOptions {
+                    refresh_codex_daemon: true,
+                    activation_only: false,
+                },
+                &CancellationToken::new(),
+                &launch_hooks(&real_resolver),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                error.starts_with("BACKEND_PROXY_CONFIG_CONFLICT:"),
+                "{error}"
+            );
+            assert!(
+                !stop_marker.exists(),
+                "a failed .env preparation must never leave the shared daemon stopped"
+            );
+            assert!(!desktop_marker.exists(), "nothing may have been launched");
+            assert_eq!(
+                fs::read_to_string(home.join(".env")).unwrap(),
+                "HTTPS_PROXY=http://elsewhere:1\n",
+                "the conflicting file must be untouched"
+            );
+        },
+    )
+    .await;
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn activation_only_with_daemon_repair_is_refused_as_invalid_options() {
+    let root = temp_dir("invalid-options");
+    let stop_marker = root.join("stop-invoked");
+    let desktop_marker = root.join("desktop-spawned");
+    with_fixture_env(
+        &desktop_marker,
+        &[("FAKE_CLI_TOUCH", stop_marker.to_str().unwrap())],
+        async {
+            let config = config_with_cli_override(&fake_cli_exe());
+            let info = desktop_info(&fake_cli_exe());
+            let error = launch_codex_with(
+                &info,
+                &config,
+                LaunchOptions {
+                    refresh_codex_daemon: true,
+                    activation_only: true,
+                },
+                &CancellationToken::new(),
+                &launch_hooks(&real_resolver),
+            )
+            .await
+            .unwrap_err();
+            assert!(error.starts_with("INVALID_LAUNCH_OPTIONS:"), "{error}");
+            assert!(!stop_marker.exists(), "no daemon command may run");
+            assert!(!desktop_marker.exists(), "nothing may be launched");
         },
     )
     .await;

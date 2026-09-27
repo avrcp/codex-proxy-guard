@@ -5,7 +5,7 @@
 - 代理 scheme 必须为 `http`；
 - 代理 host 必须是 `localhost` 或 loopback IP；
 - 不接收代理用户名、密码或远程代理地址；
-- 不写 Windows 系统代理、注册表代理或 Codex 用户配置；
+- 不写 Windows 系统代理或注册表代理，不改写 `~/.codex/config.toml`；除经显式授权的单一 `.env` 代理块外，不修改任何 Codex 用户文件；
 - 不读取 Token、Cookie、OAuth、认证文件、浏览器数据或 Credential Manager；
 - 不抓包、不解密 TLS、不保存网络内容；
 - 不发现、启动、终止或配置 v2rayN；

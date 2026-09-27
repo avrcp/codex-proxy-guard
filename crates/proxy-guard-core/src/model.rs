@@ -244,7 +244,7 @@ pub enum ProxyDelivery {
     /// the activation arguments.
     ActivationArguments,
     /// Registered launch: activation arguments plus an authorized, prepared
-    /// proxy block in the confirmed Codex Home `.env`.
+    /// proxy block in the authorized Codex Home `.env`.
     ActivationArgumentsAndHomeConfig,
     /// No proxy was delivered (activation-only diagnostics).
     NotEstablished,
@@ -272,6 +272,41 @@ impl BackendProxyConfig {
             Self::Prepared => "prepared",
         }
     }
+}
+
+/// What the authorized Codex Home `.env` proxy block actually looks like on
+/// disk right now, versus the current proxy configuration. Pure UI/domain
+/// state: no paths, file handles, or platform types live here. The state is
+/// refreshed from real disk inspection (`Refresh`) and from deterministic
+/// transitions (a proxy edit makes the block stale; a prepared launch makes
+/// it current); it is never a claim about observed network traffic.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum BackendProxyRuntimeState {
+    /// Not inspected yet.
+    #[default]
+    Unknown,
+    /// The launch target is not a registered application; no home
+    /// configuration is involved.
+    NotApplicable,
+    /// The user has not authorized Guard to manage the `.env` proxy block.
+    NotAuthorized,
+    /// Authorized, but Guard's block is not on disk yet (consent recorded;
+    /// it is written by the next launch).
+    Pending,
+    /// Guard's block exists and matches the current proxy configuration.
+    Current,
+    /// Guard's block exists but its values differ from the current proxy
+    /// configuration; the next launch syncs it.
+    Stale,
+    /// The `.env` holds proxy keys outside Guard's block; Guard refuses to
+    /// override them (named by key).
+    Conflict { keys: Vec<String> },
+    /// Guard's block is structurally damaged or of an unknown version;
+    /// automatic edits are refused.
+    Invalid,
+    /// The state could not be determined (unreadable file, encoding, or an
+    /// unusable authorized home).
+    Unavailable,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -333,6 +368,10 @@ pub struct AppState {
     pub config_readiness: ConfigReadiness,
     pub desktop_app: DesktopAppDiscovery,
     pub desktop_process: DesktopProcessState,
+    /// Real disk state of the authorized Codex Home proxy block (see
+    /// [`BackendProxyRuntimeState`]); refreshed with `R` and updated by the
+    /// deterministic consent/save/launch transitions.
+    pub backend_proxy_state: BackendProxyRuntimeState,
     pub launch: LaunchState,
     pub foreground: Option<ForegroundOperation>,
     pub daemon_repair_prompt: bool,
@@ -363,6 +402,7 @@ impl AppState {
             config_readiness: ConfigReadiness::Ready,
             desktop_app: DesktopAppDiscovery::Unknown,
             desktop_process: DesktopProcessState::Unknown,
+            backend_proxy_state: BackendProxyRuntimeState::Unknown,
             launch: LaunchState::Idle,
             foreground: None,
             daemon_repair_prompt: false,

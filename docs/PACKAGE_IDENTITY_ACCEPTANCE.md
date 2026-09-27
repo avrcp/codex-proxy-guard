@@ -1,6 +1,31 @@
-# Package identity launch acceptance (2026-09-26, updated 2026-09-27)
+# Package identity acceptance
 
-## 2026-09-27 round 2: APPX discovery JSON protocol fix
+Sections are split into **Current acceptance** (the rc.4 → rc.5 native
+activation architecture) and **Historical experiments** (retired). The old
+`Invoke-CommandInDesktopPackage -PreventBreakaway` package-context candidate
+is **retired**: it used a debugging context whose token differs from normal
+activation, never passed real Desktop acceptance, and must not be
+reintroduced or re-tested.
+
+## Current acceptance (rc.4 → rc.5)
+
+Current architecture: schema-versioned APPX discovery envelope
+(`resources/appx-discovery.ps1`), native registered-entry activation
+(`IApplicationActivationManager::ActivateApplication`, `AO_NONE`, short-lived
+Guard worker), layered proxy delivery (validated Chromium activation
+arguments plus the default-off, B-authorized Codex Home `.env` block), and a
+disk-truth `BackendProxyRuntimeState` shown as the TUI Coverage line. The
+acceptance matrix for this architecture lives in
+`docs/RELEASE_CHECKLIST.md` (rows A–F).
+
+User-confirmed on the review machine (2026-09-27, rc.4): the TUI discovers
+and displays the registered `OpenAI.Codex 26.924.2738.0` (`App` /
+`app/ChatGPT.exe` / FullTrust) without `APPX_DISCOVERY_INVALID`, and
+ChatGPT Desktop can be launched. Not yet executed or verified: proxy
+coverage of real Chat/Codex traffic, the B-authorized `.env` flow on the
+real home, port-change sync, and the D-repair flow (see the matrix).
+
+### 2026-09-27 round 2: APPX discovery JSON protocol fix
 
 The TUI refresh blocked with
 `APPX_DISCOVERY_INVALID: malformed PowerShell JSON: data did not match any
@@ -35,7 +60,7 @@ confirmation (App/Entry/Process lines, no `APPX_DISCOVERY_INVALID`) and all
 stage-2 launch acceptance remain for the user; the 2026-09-27 round-1 and
 2026-09-26 NOT RUN rows below are unchanged.
 
-## 2026-09-27 round: native application activation remediation
+### 2026-09-27 round 1: native application activation remediation
 
 The 2026-09-27 round (`0.4.1-rc.4`) replaced the experimental
 `Invoke-CommandInDesktopPackage -PreventBreakaway` candidate with the Windows
@@ -56,7 +81,7 @@ remediation manual:
   `--proxy-server` / `--proxy-bypass-list` activation arguments (loopback
   entries map one-to-one; non-mappable `no_proxy` entries are actionable
   errors, never silently dropped), plus a default-off, explicitly consented
-  `.env` proxy block bound to one confirmed Codex Home (`codex.manage_codex_proxy_env`
+  `.env` proxy block bound to one authorized Codex Home (`codex.manage_codex_proxy_env`
   + `codex.proxy_env_home`; TUI `B`). Guard's own `CODEX_HOME` is never
   inferred as the Desktop's home.
 - The receipt separates activation, instance (created/reused), package
@@ -83,7 +108,27 @@ update) was **not run** in this session either — the interactive Desktop
 launches belong to the user. The rows in §11.2 of the remediation manual are
 the acceptance checklist; do not mark them PASS without their evidence.
 
-## Delivery plan and progress (2026-09-26 round)
+### 2026-09-27 round 3 (rc.5): freeze-review hardening
+
+Final-review fixes applied on top of rc.4: fact-accurate TUI wording
+("Submits"/"not established by Guard", never "NOT proxied"), the
+`Launch`/`Coverage` relabel driven by the real disk state
+(`BackendProxyRuntimeState`: pending / current / stale / conflict / invalid /
+unavailable), consent now yields `pending` instead of green, a proxy edit
+marks the block `stale` until the next launch syncs it, `D` is blocked for
+registered targets without the authorized block
+(`BACKEND_PROXY_REQUIRED_FOR_REPAIR`), the registered repair order is now
+prepare-`.env`-then-stop-daemon (a failed prepare never wastes a daemon stop;
+locked by integration test), and `--activation-only` conflicts with
+`--refresh-codex-daemon` at both the CLI and the domain layer
+(`INVALID_LAUNCH_OPTIONS`).
+
+## Historical experiments — do not reintroduce
+
+The record below documents the retired 2026-09-26 package-context candidate
+investigation. It is kept as history and as negative guidance only.
+
+### Delivery plan and progress (2026-09-26 round)
 
 | Stage | Scope | Status |
 | --- | --- | --- |
@@ -95,7 +140,7 @@ the acceptance checklist; do not mark them PASS without their evidence.
 | T5 | Run focused regressions, repository gates, and real A/B/C acceptance | Code checks passed; A/B/C NOT RUN at user request |
 | T6 | Synchronize docs and deliver a canonical portable artifact from the pushed commit | Docs synchronized; Git and artifact evidence belongs to the delivery record |
 
-## Result
+### Result
 
 This release is a **code and build candidate**. The user requested no real
 Desktop launch during this round. The original package-identity popup is not
@@ -104,7 +149,7 @@ verified. The registered package path now fails closed on ordinary Enter/L;
 the one-shot `P` or `launch --package-context-compat` candidate requires an
 explicit selection.
 
-## Observed local baseline
+### Observed local baseline
 
 | Item | Observation |
 | --- | --- |
@@ -127,7 +172,7 @@ The repository's actual bounded APPX discovery PowerShell script was also run
 read-only on this machine. It returned the same package identity and both
 Application records above; no Desktop process was created by that check.
 
-## Controlled fixture evidence
+### Controlled fixture evidence
 
 The repository's `child-env-probe` was launched in the registered `App`
 context. It reads only a small proxy environment allowlist and its own
@@ -144,7 +189,7 @@ sets proxy variables at final target creation. They do not prove the actual
 Desktop, its backend, or its sandbox remains functional with
 `-PreventBreakaway`.
 
-## Required A/B/C acceptance
+### Required A/B/C acceptance
 
 The user chose code and build work only. All rows below are **NOT RUN**.
 

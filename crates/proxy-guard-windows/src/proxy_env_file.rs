@@ -1,4 +1,4 @@
-//! Managed proxy block inside a confirmed Codex Home `.env`.
+//! Managed proxy block inside an authorized Codex Home `.env`.
 //!
 //! Every entry point here is strictly consent-gated by the caller: without
 //! the user's explicit, home-bound confirmation nothing is created, read,

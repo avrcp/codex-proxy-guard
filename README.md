@@ -61,7 +61,7 @@ cargo build --release -p codex-proxy-guard
 | 按键 | 行为 |
 | --- | --- |
 | `Enter` / `L` | 普通启动：已注册应用走 Windows 注册入口原生激活，普通 EXE 注入进程环境 |
-| `D` | 修复启动：确认后先停止共享 Codex 后台服务再启动（`Y` 确认 / `N`、`Esc` 取消） |
+| `D` | 修复启动：确认后先停止共享 Codex 后台服务再启动（`Y` 确认 / `N`、`Esc` 取消；已注册目标需先 `B` 授权） |
 | `B` | 授权或撤销 Codex Home `.env` 后端代理块（显示确切 Home 与作用范围，`Y` 确认） |
 | `R` | 刷新 Desktop 发现与运行状态 |
 | `C` | 编辑代理地址和端口 |
@@ -105,7 +105,7 @@ worker 本身不需要 OpenAI 包身份，也不运行在包上下文中。提�
 激活），不会自动重试，也不会终止 Desktop。
 
 **后端代理配置（`B`，默认关闭）**：激活接口没有环境块参数，Chromium 参数也覆盖不了
-Codex 后端进程。若你显式授权，Guard 会在**一个已确认的 Codex Home** 的 `.env` 中维护
+Codex 后端进程。若你显式授权，Guard 会在**一个已授权绑定的 Codex Home** 的 `.env` 中维护
 自己的 `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` 标记块（原子写入、逐字节保留其他内容、
 冲突键拒绝覆盖、撤销只删自己的块）。该块会影响之后从同一 Home 启动的所有 Codex 客户端，
 不只本次 Desktop；授权与作用范围见 TUI 提示。Guard 绝不从自己的 `CODEX_HOME` 推断
@@ -114,15 +114,12 @@ Desktop 的 Home；未授权时回执明确 `backend_proxy_config = not_authoriz
 
 **显式修复启动（`D` 键确认后 `Y`，或 `launch --refresh-codex-daemon`）**：Codex 0.157+
 的常驻共享 daemon 保留其启动时继承的环境变量，已运行的旧 daemon 不会因新 Desktop
-启动而更新代理环境。若你需要丢弃旧 daemon 环境，可以显式授权一次修复：Guard 先通过
-官方 `codex app-server daemon stop` 停止共享服务，再激活 Desktop，由 Codex 自行创建
-新的 daemon。
-
-**显式修复启动（`D` 键确认后 `Y`，或 `launch --refresh-codex-daemon`）**：Codex 0.157+
-的常驻共享 daemon 保留其启动时继承的环境变量，已运行的旧 daemon 不会因新 Desktop
-启动而更新代理环境。若你需要丢弃旧 daemon 环境，可以显式授权一次修复：Guard 先通过
-官方 `codex app-server daemon stop` 停止共享服务，再以注入的代理环境启动 Desktop，由
-Codex 自行创建新的 daemon。
+启动而更新代理环境。若你需要丢弃旧 daemon 环境，可以显式授权一次修复。对已注册的
+Desktop，修复启动需要先经 `B` 授权后端代理块（未授权时 `D` 会被
+`BACKEND_PROXY_REQUIRED_FOR_REPAIR` 阻止）；Guard 先把授权 Home 的 `.env` 受管块准备
+就绪，确认无误后才执行官方 `codex app-server daemon stop`，再激活 Desktop，由 Codex
+自行创建新的 daemon——prepare 失败时共享服务必然未被中断。未打包目标不受此门禁
+限制（进程环境注入本身就携带新代理）。
 
 `daemon stop` 会中断同一 Codex Home 下其他 CLI / IDE / 远程客户端正在执行的任务，因此
 它绝不在普通启动中隐式执行：CLI 入口每次调用都要带 `--refresh-codex-daemon`，TUI 中

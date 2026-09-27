@@ -34,7 +34,7 @@ bounded, timed out, cancellable where asynchronous, and redacted before display.
 
 The single `~/.codex/.env` exception: Guard may manage exactly one
 BEGIN/END-marked `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` block inside one
-explicitly confirmed Codex Home (`codex.manage_codex_proxy_env` bound to an
+explicitly authorized Codex Home (`codex.manage_codex_proxy_env` bound to an
 absolute `codex.proxy_env_home`; default off; consent granted or revoked only
 through an explicit single-use prompt). Outside that block nothing is written:
 existing keys are reported as conflicts, other bytes are preserved verbatim,
@@ -49,7 +49,10 @@ CLI and never run daemon commands. Codex daemon compatibility is limited to the
 explicitly authorized repair launch invoking the public
 `codex app-server daemon stop` lifecycle command once (single-use user
 confirmation per launch; the stop may interrupt shared tasks of other clients on
-the same Codex Home). The Guard must never connect to the app-server socket, read
+the same Codex Home). For registered targets the repair launch additionally
+requires the authorized backend proxy block (`BACKEND_PROXY_REQUIRED_FOR_REPAIR`
+without it), and the block is always prepared before the daemon stop so a failed
+preparation never leaves the shared daemon interrupted. The Guard must never connect to the app-server socket, read
 daemon private state, inspect auth data, start/restart/update/bootstrap the
 daemon, or directly terminate shared Codex or Desktop processes. Guard may
 terminate and reap only its own short-lived helper children (bounded output,

@@ -109,7 +109,7 @@ fn draw_status(lines: &mut Vec<Line<'static>>, state: &AppState) {
         theme::accent(),
     ));
     lines.push(key_value(
-        "Backend",
+        "Launch",
         if registered {
             "Windows registered app activation".into()
         } else {
@@ -125,9 +125,9 @@ fn draw_status(lines: &mut Vec<Line<'static>>, state: &AppState) {
         process_style(state),
     ));
     lines.push(key_value(
-        "Home cfg",
-        backend_config_label(state),
-        backend_config_style(state),
+        "Coverage",
+        coverage_label(state),
+        coverage_style(state),
     ));
     if let DesktopAppDiscovery::NotFound(message) = &state.desktop_app {
         lines.push(Line::styled(message.clone(), theme::error()));
@@ -138,20 +138,12 @@ fn draw_status(lines: &mut Vec<Line<'static>>, state: &AppState) {
     }
     lines.push(Line::raw(""));
     if registered {
-        lines.push(Line::from(vec![
-            Span::styled("Delivers  ", theme::muted()),
-            Span::raw("Chromium proxy arguments on activation"),
-        ]));
-        match backend_config_state(state) {
-            BackendConfigState::Authorized => lines.push(Line::styled(
-                "Plus the authorized HTTP(S)_PROXY/NO_PROXY block in the confirmed Codex Home",
-                theme::muted(),
-            )),
-            BackendConfigState::NotAuthorized => lines.push(Line::styled(
-                "Backend Codex traffic is NOT proxied yet — press B to authorize the home .env",
-                theme::warning(),
-            )),
-        }
+        // Submission is what Guard proves; adoption by the shell is not
+        // observed, so the wording stops at "submits".
+        lines.push(Line::styled(
+            "Submits Chromium proxy arguments on activation.",
+            theme::muted(),
+        ));
     } else {
         lines.push(Line::from(vec![
             Span::styled("Injects  ", theme::muted()),
@@ -162,51 +154,50 @@ fn draw_status(lines: &mut Vec<Line<'static>>, state: &AppState) {
             theme::muted(),
         ));
     }
-    lines.push(Line::styled(
-        "Press D for a shared-daemon repair launch (asks first).",
-        theme::muted(),
-    ));
     lines.push(Line::raw(""));
     lines.push(Line::styled(primary_action(state), theme::accent()));
-    lines.push(Line::styled(
-        "Press C to change the proxy host or port.",
-        theme::muted(),
-    ));
-}
-
-enum BackendConfigState {
-    Authorized,
-    NotAuthorized,
-}
-
-fn backend_config_state(state: &AppState) -> BackendConfigState {
-    if state.config.codex.manage_codex_proxy_env {
-        BackendConfigState::Authorized
-    } else {
-        BackendConfigState::NotAuthorized
+    if registered
+        && state.backend_proxy_state == proxy_guard_core::BackendProxyRuntimeState::NotAuthorized
+    {
+        lines.push(Line::styled(
+            "Press B to also configure the Codex backend proxy.",
+            theme::accent(),
+        ));
     }
 }
 
-fn backend_config_label(state: &AppState) -> String {
+/// One line, driven by the inspected disk state, that says what the current
+/// proxy plan covers: the Desktop arguments today, the Codex backend block
+/// only when it is really on disk (and matching). Yellow means the user's
+/// attention is genuinely needed; it is never "all green" by default.
+fn coverage_label(state: &AppState) -> String {
+    use proxy_guard_core::BackendProxyRuntimeState as State;
     if !matches!(
         &state.desktop_app,
         DesktopAppDiscovery::Found(info) if matches!(info.target_kind, DesktopTargetKind::RegisteredPackage(_))
     ) {
-        return "—".into();
+        return "process environment injection".into();
     }
-    match backend_config_state(state) {
-        BackendConfigState::Authorized => format!(
-            "authorized ({})",
-            proxy_guard_core::display_path(&state.config.codex.proxy_env_home)
-        ),
-        BackendConfigState::NotAuthorized => "not authorized (press B)".into(),
-    }
+    let codex = match state.backend_proxy_state {
+        State::NotAuthorized => "Codex setup required (B)".to_string(),
+        State::Pending => "Codex pending sync".to_string(),
+        State::Current => "Codex proxy config current".to_string(),
+        State::Stale => "Codex proxy config stale · syncs on launch".to_string(),
+        State::Conflict { .. } => "Codex proxy config conflict".to_string(),
+        State::Invalid | State::Unavailable => "Codex proxy config needs attention".to_string(),
+        State::Unknown => "Codex status not inspected".to_string(),
+        State::NotApplicable => "Codex not applicable".to_string(),
+    };
+    format!("Desktop ready · {codex}")
 }
 
-fn backend_config_style(state: &AppState) -> Style {
-    match backend_config_state(state) {
-        BackendConfigState::Authorized => theme::success(),
-        BackendConfigState::NotAuthorized => theme::warning(),
+fn coverage_style(state: &AppState) -> Style {
+    use proxy_guard_core::BackendProxyRuntimeState as State;
+    match state.backend_proxy_state {
+        State::Current => theme::success(),
+        State::Conflict { .. } | State::Invalid | State::Unavailable => theme::error(),
+        State::NotAuthorized | State::Pending | State::Stale => theme::warning(),
+        State::Unknown | State::NotApplicable => theme::muted(),
     }
 }
 
@@ -400,6 +391,8 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect) {
 }
 
 fn draw_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+    // D lives only here and in Help: a low-frequency recovery action with
+    // interrupting side effects does not get main-content advertising.
     let shortcuts = if state.daemon_repair_prompt || state.backend_proxy_prompt {
         "Y  Confirm     N / Esc  Cancel"
     } else if state.proxy_editor.is_some() {
@@ -407,7 +400,7 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     } else if state.show_help {
         "? / Esc  Back     Q  Quit"
     } else {
-        "Enter  Launch     D  Repair     B  Home .env     R  Refresh     ?  Help     Q  Quit"
+        "Enter Launch · B Codex proxy · D Repair · R Refresh · C Proxy · ? Help · Q Quit"
     };
     frame.render_widget(
         Paragraph::new(vec![
@@ -498,14 +491,32 @@ fn process_style(state: &AppState) -> Style {
 }
 
 fn primary_action(state: &AppState) -> &'static str {
+    use proxy_guard_core::BackendProxyRuntimeState as State;
     if state.foreground.is_some() {
-        "Please wait…"
-    } else if matches!(state.desktop_process, DesktopProcessState::Running { .. }) {
-        "ChatGPT Desktop is already running — exit it fully before relaunching"
-    } else if matches!(state.launch, LaunchState::Running(_)) {
-        "ChatGPT Desktop was launched through the configured proxy"
-    } else {
-        "Press Enter to launch ChatGPT Desktop through this proxy"
+        return "Please wait…";
+    }
+    if matches!(state.desktop_process, DesktopProcessState::Running { .. }) {
+        return "ChatGPT Desktop is already running — exit it fully before relaunching";
+    }
+    if matches!(state.launch, LaunchState::Running(_)) {
+        return "ChatGPT Desktop was launched through the configured proxy";
+    }
+    let registered = matches!(
+        &state.desktop_app,
+        DesktopAppDiscovery::Found(info) if matches!(info.target_kind, DesktopTargetKind::RegisteredPackage(_))
+    );
+    if !registered {
+        return "Press Enter to launch with the proxy environment";
+    }
+    match state.backend_proxy_state {
+        // The next launch writes or refreshes the home block first.
+        State::Pending | State::Stale => "Press Enter to sync the Codex proxy config and launch",
+        // Current: both layers of the plan are actually in place.
+        State::Current => "Press Enter to launch with the configured proxy plan",
+        // Everything else (not authorized, attention-needed, unknown) still
+        // launches the Desktop with its arguments; the Coverage line carries
+        // the precise backend state.
+        _ => "Press Enter to launch with Desktop proxy arguments",
     }
 }
 
@@ -536,9 +547,11 @@ mod tests {
 
     #[test]
     fn full_layout_has_one_clear_primary_action() {
-        let text = rendered(90, 20);
+        let text = rendered(100, 22);
         assert!(text.contains("Press Enter to launch"));
         assert!(text.contains("HTTP_PROXY"));
+        assert!(text.contains("Coverage"));
+        assert!(text.contains("D Repair"), "footer keeps the D shortcut");
         assert!(!text.contains("Usage"));
         assert!(!text.contains("Readiness"));
     }
@@ -621,6 +634,7 @@ mod tests {
         let backend = TestBackend::new(110, 26);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut state = AppState::new(GuardConfig::default(), "config.toml".into());
+        state.backend_proxy_state = proxy_guard_core::BackendProxyRuntimeState::NotAuthorized;
         state.desktop_app = DesktopAppDiscovery::Found(Box::new(DesktopAppInfo {
             product: DesktopProduct::ChatGpt,
             package_name: "OpenAI.Codex".into(),
@@ -649,14 +663,97 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect();
         assert!(text.contains("Windows registered app activation"));
-        assert!(text.contains("Chromium proxy arguments on activation"));
-        assert!(text.contains("NOT proxied yet"));
-        assert!(text.contains("press B"));
+        // F02: Guard proves submission, not shell adoption.
+        assert!(text.contains("Submits Chromium proxy arguments on activation."));
+        assert!(!text.contains("Delivers"));
+        // F01: "not configured by Guard", never a direct-connection claim.
+        assert!(text.contains("Codex setup required (B)"));
+        assert!(!text.contains("NOT proxied"));
+        assert!(!text.contains("not proxied"));
+        assert!(text.contains("Press Enter to launch with Desktop proxy arguments"));
+        assert!(text.contains("Press B to also configure the Codex backend proxy"));
+        // F03: the launch method is Launch; Coverage carries the Codex state.
+        assert!(text.contains("Launch"));
+        assert!(text.contains("Coverage"));
+        assert!(!text.contains("Home cfg"));
+        // P1-5: D is not advertised in the main content, only in the footer.
+        assert!(!text.contains("Press D for a shared-daemon repair launch"));
         // rc-stage discovery diagnostics: the selected entry is visible.
         assert!(text.contains("App · app/ChatGPT.exe · FullTrust"));
         // No experimental candidate hint remains.
         assert!(!text.contains("package-context"));
         assert!(!text.contains("press P"));
+    }
+
+    #[test]
+    fn coverage_line_and_primary_action_follow_the_runtime_state() {
+        for (state_value, coverage, action) in [
+            (
+                proxy_guard_core::BackendProxyRuntimeState::Pending,
+                "Codex pending sync",
+                "Press Enter to sync the Codex proxy config and launch",
+            ),
+            (
+                proxy_guard_core::BackendProxyRuntimeState::Current,
+                "Codex proxy config current",
+                "Press Enter to launch with the configured proxy plan",
+            ),
+            (
+                proxy_guard_core::BackendProxyRuntimeState::Stale,
+                "Codex proxy config stale · syncs on launch",
+                "Press Enter to sync the Codex proxy config and launch",
+            ),
+            (
+                proxy_guard_core::BackendProxyRuntimeState::Conflict {
+                    keys: vec!["HTTP_PROXY".into()],
+                },
+                "Codex proxy config conflict",
+                "Press Enter to launch with Desktop proxy arguments",
+            ),
+        ] {
+            let backend = TestBackend::new(110, 26);
+            let mut terminal = Terminal::new(backend).unwrap();
+            let mut state = AppState::new(GuardConfig::default(), "config.toml".into());
+            state.backend_proxy_state = state_value.clone();
+            state.desktop_app = DesktopAppDiscovery::Found(Box::new(DesktopAppInfo {
+                product: DesktopProduct::ChatGpt,
+                package_name: "OpenAI.Codex".into(),
+                package_version: "26.924.2738.0".into(),
+                architecture: "X64".into(),
+                discovery_source: DesktopDiscoverySource::AppxManifest,
+                target_kind: DesktopTargetKind::RegisteredPackage(
+                    proxy_guard_core::PackageApplication {
+                        package_full_name: "OpenAI.Codex_26.924.2738.0_x64__2p2nqsd0c76g0".into(),
+                        package_family_name: "OpenAI.Codex_2p2nqsd0c76g0".into(),
+                        application_id: "App".into(),
+                        app_user_model_id: "OpenAI.Codex_2p2nqsd0c76g0!App".into(),
+                        manifest_executable: "app/ChatGPT.exe".into(),
+                        runtime_kind: proxy_guard_core::PackageRuntimeKind::FullTrustDesktop,
+                    },
+                ),
+                install_location: PathBuf::from("app"),
+                executable: PathBuf::from("app/ChatGPT.exe"),
+            }));
+            terminal.draw(|frame| draw(frame, &state)).unwrap();
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(
+                text.contains(coverage),
+                "{state_value:?}: missing {coverage:?}"
+            );
+            assert!(text.contains(action), "{state_value:?}: missing {action:?}");
+            if state_value == proxy_guard_core::BackendProxyRuntimeState::Current {
+                assert!(
+                    !text.contains("Press B to also configure"),
+                    "an established plan does not advertise setup"
+                );
+            }
+        }
     }
 
     #[test]
