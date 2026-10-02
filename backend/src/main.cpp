@@ -87,16 +87,22 @@ int main(int argc, char **argv) {
         const auto args = parser.positionalArguments();
         if (args.size() > 1) throw cpg::Error("CLI_INVALID", "Expected a single command.");
         const auto command = args.value(0);
-        const auto path = parser.isSet("config") ? parser.value("config") : cpg::Config::defaultPath();
         const QStringList launchFlags{"json", "refresh-codex-daemon", "activation-only"};
         const QStringList initFlags{"force", "proxy-host", "proxy-port"};
         for (const auto &flag : launchFlags) if (parser.isSet(flag) && command != "launch") throw cpg::Error("CLI_INVALID", "Launch options require launch.");
         for (const auto &flag : initFlags) if (parser.isSet(flag) && command != "init-config") throw cpg::Error("CLI_INVALID", "Configuration options require init-config.");
-        if (command == "bridge") return cpg::runBridge(path);
-        if (command == "internal-activate-package") return cpg::activationWorker();
+        // The worker and provenance query have no configuration dependency.
+        // In particular, a worker must not resolve a user profile before reading
+        // the parent's bounded activation request.
+        if (command == "internal-activate-package") {
+            if (parser.isSet("config")) throw cpg::Error("CLI_INVALID", "The activation worker does not accept configuration.");
+            return cpg::activationWorker();
+        }
         if (command == "build-info") {
             print(QJsonObject{{"version", CPG_PRODUCT_VERSION}, {"commit", CPG_BUILD_COMMIT}, {"dirty", QString(CPG_BUILD_DIRTY) == "true"}, {"language", "C++20"}, {"qt_version", QT_VERSION_STR}, {"protocol_version", 1}}); return 0;
         }
+        const auto path = parser.isSet("config") ? parser.value("config") : cpg::Config::defaultPath();
+        if (command == "bridge") return cpg::runBridge(path);
         if (command == "config-path") { print(path); return 0; }
         if (command == "init-config") {
             cpg::Config config;

@@ -3,6 +3,7 @@
 #include <QProcess>
 #include <QTemporaryDir>
 #include <QtTest>
+#include <windows.h>
 using namespace cpg;
 namespace {
 QByteArray request(int id, const QString &method, QJsonObject params = {}) {
@@ -58,6 +59,44 @@ private slots:
         QVERIFY(QJsonDocument::fromJson(lines[1]).object().value("result").toObject().value("shutting_down").toBool());
         QVERIFY(!QFile::exists(dir.filePath("guard.toml")));
     }
+    void stalledStdoutCannotPinBridge() {
+        // QProcess drains its pipes while waiting, so use an intentionally
+        // unread native pipe to exercise the engine's output deadline.
+        struct Handles {
+            HANDLE inputRead = nullptr, inputWrite = nullptr, outputRead = nullptr, outputWrite = nullptr;
+            HANDLE process = nullptr, thread = nullptr;
+            ~Handles() {
+                if (process && WaitForSingleObject(process, 0) == WAIT_TIMEOUT) {
+                    TerminateProcess(process, 99); WaitForSingleObject(process, 5000);
+                }
+                for (auto h : {inputRead, inputWrite, outputRead, outputWrite, process, thread}) if (h) CloseHandle(h);
+            }
+        } handles;
+        SECURITY_ATTRIBUTES security{sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE};
+        QVERIFY(CreatePipe(&handles.inputRead, &handles.inputWrite, &security, 4096));
+        QVERIFY(CreatePipe(&handles.outputRead, &handles.outputWrite, &security, 4096));
+        QVERIFY(SetHandleInformation(handles.inputWrite, HANDLE_FLAG_INHERIT, 0));
+        QVERIFY(SetHandleInformation(handles.outputRead, HANDLE_FLAG_INHERIT, 0));
+        QTemporaryDir dir; const auto path = dir.filePath("guard.toml");
+        const auto executable = QString::fromUtf8(TARGET_ENGINE_PATH).toStdWString();
+        auto command = ("\"" + QString::fromUtf8(TARGET_ENGINE_PATH) + "\" --config \"" + path + "\" bridge").toStdWString();
+        STARTUPINFOW startup{}; startup.cb = sizeof(startup); startup.dwFlags = STARTF_USESTDHANDLES;
+        startup.hStdInput = handles.inputRead; startup.hStdOutput = handles.outputWrite; startup.hStdError = handles.outputWrite;
+        PROCESS_INFORMATION process{};
+        QVERIFY(CreateProcessW(executable.c_str(), command.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process));
+        handles.process = process.hProcess; handles.thread = process.hThread;
+        CloseHandle(handles.inputRead); handles.inputRead = nullptr;
+        CloseHandle(handles.outputWrite); handles.outputWrite = nullptr;
+        QByteArray frames;
+        for (int id = 1; id < 65; ++id) frames += request(id, "hello") + '\n';
+        QVERIFY(frames.size() <= 4096);
+        DWORD written = 0;
+        QVERIFY(WriteFile(handles.inputWrite, frames.constData(), static_cast<DWORD>(frames.size()), &written, nullptr));
+        QCOMPARE(written, static_cast<DWORD>(frames.size()));
+        QCOMPARE(WaitForSingleObject(handles.process, 8000), static_cast<DWORD>(WAIT_OBJECT_0));
+        DWORD code = 0; QVERIFY(GetExitCodeProcess(handles.process, &code)); QCOMPARE(code, DWORD(2));
+        QVERIFY(!QFile::exists(path));
+    }
     void singleUseConsentAndStaleConfig() {
         QTemporaryDir dir; const auto path = dir.filePath("guard.toml");
         Config config; config.home = dir.path(); initializeConfig(path, config, false);
@@ -92,9 +131,16 @@ private slots:
         QCOMPARE(Config::load(path).port, 8080);
     }
     void cliRejectsRemovedAndConflictingOptions() {
-        for (const auto &args : QList<QStringList>{{"daemon-stop"}, {"launch", "--auto-stop-daemon"}, {"launch", "--refresh-codex-daemon", "--activation-only"}, {"bridge", "--force"}}) {
+        for (const auto &args : QList<QStringList>{{"daemon-stop"}, {"launch", "--auto-stop-daemon"}, {"launch", "--refresh-codex-daemon", "--activation-only"}, {"bridge", "--force"}, {"internal-activate-package", "--config", "unused"}}) {
             QProcess process; process.start(TARGET_ENGINE_PATH, args); QVERIFY(process.waitForFinished(5000)); QVERIFY(process.exitCode() != 0);
         }
+    }
+    void provenanceDoesNotLoadConfiguration() {
+        QTemporaryDir dir; const auto path = dir.filePath("missing/config.toml");
+        QProcess process; process.start(TARGET_ENGINE_PATH, {"--config", path, "build-info"});
+        QVERIFY(process.waitForFinished(5000)); QCOMPARE(process.exitCode(), 0);
+        const auto info = QJsonDocument::fromJson(process.readAllStandardOutput()).object();
+        QCOMPARE(info.value("language").toString(), "C++20"); QVERIFY(!QFile::exists(path));
     }
 };
 QTEST_GUILESS_MAIN(BridgeTests)

@@ -41,18 +41,26 @@ bool boolean(const QJsonObject &params, const QString &key) {
 // A blocked reader must not pin the engine. The writer owns no business state,
 // and synchronous Windows pipe I/O can be cancelled on the owning thread.
 void writeFrame(const QJsonObject &value) {
-    QByteArray bytes = QJsonDocument(value).toJson(QJsonDocument::Compact) + '\n';
-    if (bytes.size() > 128 * 1024) throw Error("BRIDGE_OUTPUT_INVALID", "Engine output exceeds its limit.");
-    bool ok = false;
-    std::thread writer([&] {
+    struct WriteState { QByteArray bytes; bool ok = false; };
+    const auto state = std::make_shared<WriteState>();
+    state->bytes = QJsonDocument(value).toJson(QJsonDocument::Compact) + '\n';
+    if (state->bytes.size() > 128 * 1024) throw Error("BRIDGE_OUTPUT_INVALID", "Engine output exceeds its limit.");
+    std::thread writer([state] {
         DWORD written = 0;
-        ok = WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), bytes.constData(), static_cast<DWORD>(bytes.size()), &written, nullptr)
-             && written == static_cast<DWORD>(bytes.size());
+        state->ok = WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), state->bytes.constData(), static_cast<DWORD>(state->bytes.size()), &written, nullptr)
+             && written == static_cast<DWORD>(state->bytes.size());
     });
     const HANDLE handle = static_cast<HANDLE>(writer.native_handle());
-    if (WaitForSingleObject(handle, 2000) != WAIT_OBJECT_0) CancelSynchronousIo(handle);
+    bool done = WaitForSingleObject(handle, 2000) == WAIT_OBJECT_0;
+    // Cancellation can race with a not-yet-entered WriteFile. Retry until the
+    // thread acknowledges it; never unbounded-join an unresponsive pipe writer.
+    for (int attempt = 0; !done && attempt < 100; ++attempt) {
+        CancelSynchronousIo(handle);
+        done = WaitForSingleObject(handle, 10) == WAIT_OBJECT_0;
+    }
+    if (!done) { writer.detach(); throw Error("BRIDGE_IO_FAILED", "Bridge output stalled."); }
     writer.join();
-    if (!ok) throw Error("BRIDGE_IO_FAILED", "Bridge output closed or stalled.");
+    if (!state->ok) throw Error("BRIDGE_IO_FAILED", "Bridge output closed or stalled.");
 }
 }
 
