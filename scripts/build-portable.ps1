@@ -211,10 +211,10 @@ try {
     # The C++ engine/activation worker starts from engine/, so the parent's
     # application-local runtime is not on its DLL search path on a clean PC.
     Get-ChildItem -LiteralPath $CrtDirs[0].FullName -Filter '*.dll' | Copy-Item -Destination "$Output\engine"
-    New-Item -ItemType Directory -Path "$Output\licenses\tomlplusplus" -Force | Out-Null
-    Copy-Item -LiteralPath 'backend\third_party\toml++\LICENSE' -Destination "$Output\licenses\tomlplusplus"
     Copy-Item -LiteralPath 'LICENSE', 'THIRD_PARTY_NOTICES.md' -Destination $Output
     Copy-Item -LiteralPath 'licenses' -Destination $Output -Recurse
+    New-Item -ItemType Directory -Path "$Output\licenses\tomlplusplus" -Force | Out-Null
+    Copy-Item -LiteralPath 'backend\third_party\toml++\LICENSE' -Destination "$Output\licenses\tomlplusplus"
 
     $SourceCache = Join-Path $Root "target\qt-source\$SourceName"
     New-Item -ItemType Directory -Path (Split-Path $SourceCache) -Force | Out-Null
