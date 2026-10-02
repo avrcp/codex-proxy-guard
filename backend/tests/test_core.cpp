@@ -2,12 +2,19 @@
 #include <QtTest>
 #include <QDir>
 #include <QFile>
+#include <QJsonDocument>
+#include <QProcess>
 #include <QTemporaryDir>
 #include <windows.h>
 #include <functional>
 
 using namespace cpg;
+namespace cpg::testing { void setEnvTransactionHook(std::function<void(bool)> hook); }
 namespace {
+struct EnvHook {
+    explicit EnvHook(std::function<void(bool)> hook) { testing::setEnvTransactionHook(std::move(hook)); }
+    ~EnvHook() { testing::setEnvTransactionHook({}); }
+};
 void writeBytes(const QString &path, const QByteArray &bytes)
 {
     QFile file(path);
@@ -217,6 +224,239 @@ private slots:
         QCOMPARE(failure, "BACKEND_PROXY_REVOKE_FAILED"); QCOMPARE(readBytes(env), validBlock); QCOMPARE(readBytes(path), originalConfig);
         const auto revoked = updateConsent(path, config, false, config.home); QVERIFY(!revoked.manageBackend);
     }
+    void editedManagedValuesPreserveConsentAndBytes()
+    {
+        QTemporaryDir root; QVERIFY(root.isValid()); const auto config = authorized(root.path());
+        const QString env = root.filePath(".env"); const QString path = root.filePath("guard.toml");
+        initializeConfig(path, config, false); const auto originalConfig = readBytes(path);
+        const QByteArray endpoint = "http://127.0.0.1:10808";
+        const QList<QList<QByteArray>> invalid{
+            {"http://192.0.2.1:10808", "http://192.0.2.1:10808", "localhost"},
+            {endpoint, "http://127.0.0.1:7890", "localhost"},
+            {"https://127.0.0.1:10808", "https://127.0.0.1:10808", "localhost"},
+            {"http://user:pass@127.0.0.1:10808", "http://user:pass@127.0.0.1:10808", "localhost"},
+            {"http://127.0.0.1:00080", "http://127.0.0.1:00080", "localhost"},
+            {"http://127.0.0.1:0", "http://127.0.0.1:0", "localhost"},
+            {"http://127.0.0.1:65536", "http://127.0.0.1:65536", "localhost"},
+            {endpoint, endpoint, ""}, {endpoint, endpoint, " localhost"},
+            {endpoint, endpoint, QByteArray("local") + '\0' + "host"},
+            {endpoint, endpoint, QByteArray(256, 'a')}, {endpoint, endpoint, QByteArray(4097, 'a')}
+        };
+        for (const auto &values : invalid) {
+            const QByteArray bytes = "# user data\r\n# BEGIN CODEX PROXY GUARD: proxy-v1\nHTTP_PROXY=" + values[0]
+                + "\nHTTPS_PROXY=" + values[1] + "\nNO_PROXY=" + values[2] + "\n# END CODEX PROXY GUARD: proxy-v1\n";
+            writeBytes(env, bytes);
+            QCOMPARE(inspectProxyEnv(config), "invalid");
+            QCOMPARE(errorCode([&] { prepareProxyEnv(config); }), "BACKEND_PROXY_BLOCK_INVALID");
+            QCOMPARE(errorCode([&] { revokeProxyEnv(config.home); }), "BACKEND_PROXY_BLOCK_INVALID");
+            QCOMPARE(errorCode([&] { updateConsent(path, config, false, config.home); }), "BACKEND_PROXY_REVOKE_FAILED");
+            QCOMPARE(readBytes(env), bytes); QCOMPARE(readBytes(path), originalConfig);
+        }
+        QVERIFY(QFile::remove(env));
+        Config unusual = config; unusual.host = "0:0:0:0:0:0:0:1";
+        unusual.noProxy = {",", QString(240, 'a') + ",,", QString(240, 'b')};
+        prepareProxyEnv(unusual); QCOMPARE(inspectProxyEnv(unusual), "current");
+        // A valid prior endpoint is stale, not externally corrupted.
+        QCOMPARE(inspectProxyEnv(config), "stale"); prepareProxyEnv(config); QCOMPARE(inspectProxyEnv(config), "current");
+        revokeProxyEnv(config.home); QVERIFY(!QFileInfo::exists(env));
+    }
+    void invalidRecoveryNeverErasesConsentEvidence()
+    {
+        QTemporaryDir root; QVERIFY(root.isValid()); const QString path = root.filePath("guard.toml");
+        const QString env = root.filePath(".env"); const auto config = authorized(root.path());
+        prepareProxyEnv(config); const auto originalEnv = readBytes(env);
+        const QList<QByteArray> invalid{
+            "version=1\n[codex]\nmanage_codex_proxy_env=true\nproxy_env_home='C:/existing/home'\n",
+            "[proxy\n[codex]\nmanage_codex_proxy_env=true\nproxy_env_home='C:/existing/home'\n",
+            "version=2\n[codex]\nproxy_env_home='C:/existing/home'\nBROKEN =\n",
+            "version=1\n[codex]\n\"manage_codex_proxy_\\u0065nv\"=true\n",
+            "[codex]\n\"proxy_env_\\U00000068ome\"='C:/existing/home'\nBROKEN =\n",
+            QByteArray("version=1\n") + QByteArray::fromHex("ff")
+        };
+        for (const auto &bytes : invalid) {
+            writeBytes(path, bytes);
+            QCOMPARE(errorCode([&] { updateProxy(path, Config{}, true, "127.0.0.1", 7890); }), "CONFIG_CONSENT_REPAIR_REQUIRED");
+            QCOMPARE(errorCode([&] { initializeConfig(path, Config{}, true); }), "CONFIG_CONSENT_REPAIR_REQUIRED");
+            QCOMPARE(readBytes(path), bytes); QCOMPARE(readBytes(env), originalEnv);
+        }
+        // Repair the syntax manually without dropping the binding; the normal
+        // confirmed revoke path can then safely remove the block and consent.
+        writeBytes(path, config.toml()); const auto revoked = updateConsent(path, config, false, config.home);
+        QVERIFY(!revoked.manageBackend); QVERIFY(!QFileInfo::exists(env));
+        writeBytes(path, "version=1\n");
+        QCOMPARE(updateProxy(path, Config{}, true, "127.0.0.1", 7890).port, 7890);
+    }
+    void legacyExtendedHomeSupportsActualFileOperations()
+    {
+        QTemporaryDir root; QVERIFY(root.isValid());
+        const QString extended = "\\\\?\\" + QDir::toNativeSeparators(root.path());
+        Config config = authorized(extended); const QString env = root.filePath(".env");
+        QVERIFY(errorCode([&] { prepareProxyEnv(config); }).isEmpty());
+        QCOMPARE(inspectProxyEnv(config), "current"); QVERIFY(QFileInfo::exists(env));
+        config.port = 7890; QVERIFY(errorCode([&] { prepareProxyEnv(config); }).isEmpty());
+        QCOMPARE(inspectProxyEnv(config), "current");
+        QVERIFY(errorCode([&] { revokeProxyEnv(extended); }).isEmpty()); QVERIFY(!QFileInfo::exists(env));
+        writeBytes(env, "OTHER=preserved\r\n");
+        QVERIFY(errorCode([&] { prepareProxyEnv(config); }).isEmpty());
+        QVERIFY(errorCode([&] { revokeProxyEnv(extended); }).isEmpty());
+        QCOMPARE(readBytes(env), "OTHER=preserved\r\n");
+        const QString configPath = extended + "\\guard.toml";
+        QVERIFY(errorCode([&] { initializeConfig(configPath, config, false); }).isEmpty());
+        QCOMPARE(Config::load(configPath), config);
+        ConfigLease lease(configPath, config);
+    }
+    void transactionExcludesExternalRenameAndSaveDeterministically()
+    {
+        QTemporaryDir root; QVERIFY(root.isValid());
+        Config config = authorized(root.path());
+        const QString env = root.filePath(".env"); const QString away = root.filePath("renamed.env");
+        const QString candidate = root.filePath("editor-save.tmp");
+        const QByteArray original = "OTHER=preserved\r\n";
+        writeBytes(env, original); prepareProxyEnv(config);
+        for (int mode = 0; mode < 3; ++mode) {
+            if (mode == 2) QVERIFY(QFile::remove(env));
+            writeBytes(candidate, "OTHER=editor-new-value\r\n");
+            QJsonObject result;
+            bool helperRan = false;
+            {
+                EnvHook hook([&](bool staged) {
+                    if (staged) return;
+                    // This child runs only after the transaction has compared
+                    // bytes, precisely at the former pathname-race window.
+                    QProcess child;
+                    child.start(QCoreApplication::applicationFilePath(), {"--env-race-helper", env, away, candidate});
+                    if (!child.waitForStarted(2000) || !child.waitForFinished(3000)) {
+                        child.kill(); child.waitForFinished(1000);
+                        throw Error("TEST_HELPER_FAILED", "The deterministic writer fixture did not complete.");
+                    }
+                    result = parseJsonObject(child.readAllStandardOutput(), 4096, "TEST_HELPER_FAILED");
+                    helperRan = true;
+                });
+                config.port = 7890;
+                const auto failure = errorCode([&] {
+                    if (mode == 1) revokeProxyEnv(config.home);
+                    else prepareProxyEnv(config);
+                });
+                QVERIFY2(failure.isEmpty(), qPrintable(failure));
+            }
+            QVERIFY(helperRan);
+            QVERIFY(!result.value("rename_succeeded").toBool());
+            QVERIFY(!result.value("save_succeeded").toBool());
+            QVERIFY(!result.value("write_open_succeeded").toBool());
+            QVERIFY(!QFileInfo::exists(away)); QCOMPARE(readBytes(candidate), "OTHER=editor-new-value\r\n");
+            if (mode == 0) { QVERIFY(readBytes(env).startsWith(original)); QCOMPARE(inspectProxyEnv(config), "current"); }
+            if (mode == 1) QCOMPARE(readBytes(env), original);
+            if (mode == 2) QCOMPARE(inspectProxyEnv(config), "current");
+        }
+    }
+    void abortedTransactionsPublishNothingAndKeepConsent()
+    {
+        try {
+        QTemporaryDir root; QVERIFY(root.isValid()); const auto config = authorized(root.path());
+        const QString env = root.filePath(".env"); const QString path = root.filePath("guard.toml");
+        initializeConfig(path, config, false); const auto originalConfig = readBytes(path);
+        {
+            EnvHook hook([&](bool staged) { if (staged) throw Error("TEST_ABORT", "Abort after staging."); });
+            QCOMPARE(errorCode([&] { prepareProxyEnv(config); }), "TEST_ABORT");
+        }
+        QVERIFY(!QFileInfo::exists(env));
+        for (const auto &prefix : QList<QByteArray>{QByteArray{}, QByteArray("OTHER=preserved\r\n")}) {
+            writeBytes(env, prefix); prepareProxyEnv(config); const auto originalEnv = readBytes(env);
+            bool isolated = false;
+            {
+                struct Reader {
+                    HANDLE value;
+                    ~Reader() { if (value != INVALID_HANDLE_VALUE) CloseHandle(value); }
+                } reader{CreateFileW(reinterpret_cast<const wchar_t *>(env.utf16()), GENERIC_READ,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr)};
+                QVERIFY(reader.value != INVALID_HANDLE_VALUE);
+                EnvHook hook([&](bool staged) {
+                    if (!staged) return;
+                    QByteArray visible(originalEnv.size(), Qt::Uninitialized);
+                    DWORD got = 0;
+                    isolated = ReadFile(reader.value, visible.data(), static_cast<DWORD>(visible.size()), &got, nullptr)
+                        && got == static_cast<DWORD>(visible.size()) && visible == originalEnv;
+                    throw Error("TEST_ABORT", "Abort after staging.");
+                });
+                QCOMPARE(errorCode([&] { updateConsent(path, config, false, config.home); }), "BACKEND_PROXY_REVOKE_FAILED");
+            }
+            QVERIFY(isolated); QCOMPARE(readBytes(env), originalEnv); QCOMPARE(readBytes(path), originalConfig);
+            auto updated = config; updated.port = 7890;
+            {
+                EnvHook hook([&](bool staged) { if (staged) throw Error("TEST_ABORT", "Abort after staging."); });
+                QCOMPARE(errorCode([&] { prepareProxyEnv(updated); }), "TEST_ABORT");
+            }
+            QCOMPARE(readBytes(env), originalEnv);
+        }
+        } catch (const Error &error) { QFAIL(qPrintable(error.code + ": " + error.message)); }
+        catch (const std::exception &error) { QFAIL(error.what()); }
+    }
+    void commitTimeoutPreservesFileConfigurationAndConsent()
+    {
+        QTemporaryDir root; QVERIFY(root.isValid()); const auto config = authorized(root.path());
+        const QString env = root.filePath(".env"); const QString path = root.filePath("guard.toml");
+        initializeConfig(path, config, false); const auto originalConfig = readBytes(path);
+        for (int operation = 0; operation < 3; ++operation) {
+            // Create, update an existing file, then confirmed consent revoke.
+            // The hook does not throw: the actual CommitTransaction call must
+            // reject its expired five-second transaction and roll back.
+            QByteArray originalEnv;
+            if (operation != 0) {
+                writeBytes(env, "OTHER=preserved\r\n"); prepareProxyEnv(config); originalEnv = readBytes(env);
+            }
+            bool staged = false;
+            QString failure;
+            QString message;
+            {
+                EnvHook hook([&](bool written) {
+                    if (written) { staged = true; QTest::qSleep(5500); }
+                });
+                try {
+                    if (operation == 2) updateConsent(path, config, false, config.home);
+                    else {
+                        auto updated = config; updated.port = 7890; prepareProxyEnv(updated);
+                    }
+                } catch (const Error &error) { failure = error.code; message = error.message; }
+            }
+            QVERIFY(staged);
+            if (operation == 2) {
+                QCOMPARE(failure, "BACKEND_PROXY_REVOKE_FAILED");
+                QVERIFY(message.contains("Cause: BACKEND_PROXY_ENV_IO."));
+            } else {
+                QCOMPARE(failure, "BACKEND_PROXY_ENV_IO");
+                QVERIFY(message.contains("could not commit"));
+            }
+            if (operation == 0) QVERIFY(!QFileInfo::exists(env));
+            else QCOMPARE(readBytes(env), originalEnv);
+            QCOMPARE(readBytes(path), originalConfig); QCOMPARE(Config::load(path), config);
+        }
+    }
 };
-QTEST_GUILESS_MAIN(CoreTests)
+int main(int argc, char **argv)
+{
+    QCoreApplication application(argc, argv);
+    const auto arguments = application.arguments();
+    if (arguments.size() == 5 && arguments[1] == "--env-race-helper") {
+        const QString env = QDir::toNativeSeparators(arguments[2]);
+        const QString away = QDir::toNativeSeparators(arguments[3]);
+        const QString candidate = QDir::toNativeSeparators(arguments[4]);
+        const auto wide = [](const QString &text) { return reinterpret_cast<const wchar_t *>(text.utf16()); };
+        const bool renamed = MoveFileExW(wide(env), wide(away), 0) != FALSE;
+        const DWORD renameError = GetLastError();
+        const bool saved = MoveFileExW(wide(candidate), wide(env), MOVEFILE_REPLACE_EXISTING) != FALSE;
+        const DWORD saveError = GetLastError();
+        const HANDLE writer = CreateFileW(wide(env), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        const DWORD writeError = GetLastError();
+        const bool opened = writer != INVALID_HANDLE_VALUE;
+        if (opened) CloseHandle(writer);
+        const QJsonObject result{{"rename_succeeded", renamed}, {"rename_error", static_cast<qint64>(renameError)},
+            {"save_succeeded", saved}, {"save_error", static_cast<qint64>(saveError)},
+            {"write_open_succeeded", opened}, {"write_error", static_cast<qint64>(writeError)}};
+        QFile output; output.open(stdout, QIODevice::WriteOnly); output.write(QJsonDocument(result).toJson(QJsonDocument::Compact));
+        return 0;
+    }
+    CoreTests tests;
+    return QTest::qExec(&tests, argc, argv);
+}
 #include "test_core.moc"

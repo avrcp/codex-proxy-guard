@@ -10,6 +10,7 @@
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <shlobj.h>
+#include <ktmw32.h>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -19,9 +20,8 @@
 #include <QRegularExpression>
 #include <QSet>
 #include <QStringDecoder>
-#include <QUuid>
 #include <algorithm>
-#include <cstring>
+#include <functional>
 #include <limits>
 #include <optional>
 #include <sstream>
@@ -42,6 +42,8 @@ constexpr qsizetype configLimit = 64 * 1024;
 constexpr qsizetype envLimit = 1024 * 1024;
 const QByteArray blockBegin = "# BEGIN CODEX PROXY GUARD: proxy-v1";
 const QByteArray blockEnd = "# END CODEX PROXY GUARD: proxy-v1";
+// Private linked-test seam, never configured from requests or the environment.
+thread_local std::function<void(bool)> envTransactionHook;
 
 [[noreturn]] void fail(const QString &code, const QString &message) { throw Error(code, message); }
 const wchar_t *wide(const QString &s) { return reinterpret_cast<const wchar_t *>(s.utf16()); }
@@ -88,6 +90,32 @@ std::optional<Config> tryConfig(const QByteArray &bytes)
     try { return Config::parse(bytes); } catch (const Error &) { return std::nullopt; }
 }
 
+bool mayContainConsent(const QByteArray &bytes)
+{
+    // A broken configuration may be the only durable record of a managed Home.
+    // Never erase that evidence during default-based editor recovery or reset.
+    // Decode key escapes as well; malformed TOML cannot be trusted to have only
+    // bare keys, and ambiguous/comment-only evidence deliberately fails closed.
+    if (!strictUtf8(bytes)) return true;
+    QString text = QString::fromUtf8(bytes);
+    static const QRegularExpression escape("\\\\(?:u([0-9a-fA-F]{4})|U([0-9a-fA-F]{8}))");
+    QString decoded;
+    qsizetype copied = 0;
+    auto matches = escape.globalMatch(text);
+    while (matches.hasNext()) {
+        const auto match = matches.next();
+        decoded += text.mid(copied, match.capturedStart() - copied);
+        const auto hex = match.captured(1).isEmpty() ? match.captured(2) : match.captured(1);
+        const char32_t point = hex.toUInt(nullptr, 16);
+        if (point <= 0x10ffff && !(point >= 0xd800 && point <= 0xdfff)) decoded += QString::fromUcs4(&point, 1);
+        else decoded += match.captured();
+        copied = match.capturedEnd();
+    }
+    decoded += text.mid(copied);
+    return decoded.contains("manage_codex_proxy_env", Qt::CaseInsensitive)
+        || decoded.contains("proxy_env_home", Qt::CaseInsensitive);
+}
+
 class Transaction {
 public:
     Handle handle;
@@ -95,12 +123,12 @@ public:
     Transaction(const QString &path, const Config *expected, bool invalid, bool create = false)
     {
         if (create || invalid) ensureParent(path, "CONFIG_LOCK_FAILED");
-        handle.value = CreateFileW(wide(path), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ,
+        handle.value = CreateFileW(wide(QDir::toNativeSeparators(path)), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ,
                                    nullptr, create ? CREATE_NEW : OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
         bool created = create;
         if (handle.value == INVALID_HANDLE_VALUE && !create && invalid
             && (GetLastError() == ERROR_FILE_NOT_FOUND || GetLastError() == ERROR_PATH_NOT_FOUND)) {
-            handle.value = CreateFileW(wide(path), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ,
+            handle.value = CreateFileW(wide(QDir::toNativeSeparators(path)), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ,
                                        nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
             created = handle.value != INVALID_HANDLE_VALUE;
         }
@@ -110,6 +138,8 @@ public:
         const auto current = tryConfig(original);
         if (!created && ((invalid && current) || (expected && (!current || *current != *expected))))
             fail("CONFIG_CHANGED", "Refresh and confirm the configuration again.");
+        if (!created && !current && mayContainConsent(original))
+            fail("CONFIG_CONSENT_REPAIR_REQUIRED", "The invalid configuration contains proxy authorization fields; repair it manually while preserving the bound Home before resetting or saving.");
     }
     void commit(const Config &config)
     {
@@ -206,10 +236,54 @@ struct EnvFile {
     bool conflict = false;
 };
 
+bool generatedNoProxy(const QByteArray &bytes)
+{
+    if (bytes.isEmpty() || bytes.size() > 4096 || bytes.contains('\r') || bytes.contains('\n') || bytes.contains('\0')) return false;
+    // Configuration entries can themselves contain commas. Find a partition
+    // into at most 32 valid entries instead of falsely rejecting a block that
+    // Guard itself generated from such entries.
+    QList<qsizetype> boundaries{-1};
+    for (qsizetype i = 0; i < bytes.size(); ++i) if (bytes.at(i) == ',') boundaries.append(i);
+    boundaries.append(bytes.size());
+    std::vector<int> fewest(static_cast<size_t>(boundaries.size()), 33);
+    fewest[0] = 0;
+    for (qsizetype i = 0; i < boundaries.size() - 1; ++i) {
+        if (fewest[static_cast<size_t>(i)] >= 32) continue;
+        for (qsizetype j = i + 1; j < boundaries.size(); ++j) {
+            const auto length = boundaries[j] - boundaries[i] - 1;
+            if (length > 255) break;
+            if (length == 0) continue;
+            const auto entry = QString::fromUtf8(bytes.mid(boundaries[i] + 1, length));
+            if (entry != entry.trimmed()) continue;
+            auto &next = fewest[static_cast<size_t>(j)];
+            next = std::min(next, fewest[static_cast<size_t>(i)] + 1);
+        }
+    }
+    return fewest.back() <= 32;
+}
+
+void validateManagedValues(const EnvFile &env)
+{
+    const auto http = env.values.value("HTTP_PROXY");
+    if (http != env.values.value("HTTPS_PROXY") || !generatedNoProxy(env.values.value("NO_PROXY")))
+        fail("BACKEND_PROXY_BLOCK_INVALID", "The managed block contains values Guard could not have generated.");
+    static const QRegularExpression endpoint("^http://(\\[[^\\]]+\\]|[^:/?#@\\s]+):([0-9]{1,5})$");
+    const auto match = endpoint.match(QString::fromUtf8(http));
+    if (!match.hasMatch()) fail("BACKEND_PROXY_BLOCK_INVALID", "The managed block proxy endpoint was edited.");
+    Config generated;
+    generated.host = match.captured(1);
+    if (generated.host.startsWith('[')) generated.host = generated.host.mid(1, generated.host.size() - 2);
+    generated.port = match.captured(2).toInt();
+    try { generated.validate(); }
+    catch (const Error &) { fail("BACKEND_PROXY_BLOCK_INVALID", "The managed block proxy endpoint is not a valid loopback proxy."); }
+    if (generated.proxyUrl().toUtf8() != http)
+        fail("BACKEND_PROXY_BLOCK_INVALID", "The managed block proxy endpoint was edited.");
+}
+
 EnvFile readEnv(const QString &path)
 {
     EnvFile env;
-    Handle file(CreateFileW(wide(path), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+    Handle file(CreateFileW(wide(QDir::toNativeSeparators(path)), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                             nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
     if (file.value == INVALID_HANDLE_VALUE) {
         if (GetLastError() == ERROR_FILE_NOT_FOUND || GetLastError() == ERROR_PATH_NOT_FOUND) return env;
@@ -261,6 +335,7 @@ EnvFile readEnv(const QString &path)
     }
     if (inside || ((env.begin >= 0) != (env.end >= 0)) || (env.begin >= 0 && env.values.size() != 3))
         fail("BACKEND_PROXY_BLOCK_INVALID", "The Guard block is truncated or incomplete.");
+    if (env.begin >= 0) validateManagedValues(env);
     return env;
 }
 
@@ -271,38 +346,61 @@ bool currentValues(const EnvFile &env, const Config &config)
         && env.values.value("NO_PROXY") == config.noProxyValue().toUtf8();
 }
 
-void atomicEnv(const QString &path, const EnvFile &expected, const QByteArray &updated)
+class EnvTransaction {
+    Handle handle_;
+    bool committed_ = false;
+public:
+    EnvTransaction() : handle_(CreateTransaction(nullptr, nullptr, 0, 0, 0, 5000, nullptr))
+    {
+        if (handle_.value == INVALID_HANDLE_VALUE)
+            fail("BACKEND_PROXY_ENV_ATOMIC_UNAVAILABLE", "Windows file transactions are unavailable; the proxy file was not changed.");
+    }
+    ~EnvTransaction() { if (!committed_) RollbackTransaction(handle_.value); }
+    HANDLE handle() const { return handle_.value; }
+    void commit()
+    {
+        if (!CommitTransaction(handle_.value))
+            fail("BACKEND_PROXY_ENV_IO", "The proxy file transaction could not commit; no partial edit was published.");
+        committed_ = true;
+    }
+};
+
+void atomicEnv(const QString &path, const EnvFile &expected, const QByteArray &updated, bool remove = false)
 {
     if (updated.size() > envLimit) fail("BACKEND_PROXY_ENV_IO", "The updated proxy file exceeds 1 MiB.");
     ensureParent(path, "BACKEND_PROXY_ENV_IO");
-    const QString temp = QFileInfo(path).absolutePath() + "/.cpg-proxy-env-" + QUuid::createUuid().toString(QUuid::WithoutBraces) + ".tmp";
-    struct TempCleanup { QString path; ~TempCleanup() { DeleteFileW(wide(path)); } } cleanup{temp};
-    Handle staged(CreateFileW(wide(temp), GENERIC_WRITE | DELETE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr));
-    if (staged.value == INVALID_HANDLE_VALUE || !writeHandle(staged.value, updated))
-        fail("BACKEND_PROXY_ENV_IO", "Cannot write the temporary proxy file.");
-    // Hold write exclusion during verification and the atomic replacement. A
-    // concurrently opened writer makes verification fail instead of being lost.
-    Handle original(CreateFileW(wide(path), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE,
-                                nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
-    const bool exists = original.value != INVALID_HANDLE_VALUE;
-    if (!exists && GetLastError() != ERROR_FILE_NOT_FOUND && GetLastError() != ERROR_PATH_NOT_FOUND)
-        fail("BACKEND_PROXY_ENV_IO", "Cannot re-verify the original proxy file.");
-    if (exists != expected.exists || (exists && readHandle(original.value, envLimit, "BACKEND_PROXY_ENV_IO") != expected.bytes))
-        fail("BACKEND_PROXY_CONFIG_CONFLICT", "The proxy file changed; no changes were applied.");
-    // The extended POSIX rename permits replacing our still-open verified
-    // reader. Keep write exclusion through the one atomic filesystem operation;
-    // unsupported filesystems fail closed. Do not use ReplaceFileW: documented
-    // failure modes can remove the original name before returning an error.
-    const QString target = QDir::toNativeSeparators(QFileInfo(path).absoluteFilePath());
-    const auto nameBytes = static_cast<size_t>(target.size()) * sizeof(wchar_t);
-    const auto bufferBytes = sizeof(FILE_RENAME_INFO) + nameBytes;
-    std::vector<quint64> storage((bufferBytes + sizeof(quint64) - 1) / sizeof(quint64));
-    auto *rename = reinterpret_cast<FILE_RENAME_INFO *>(storage.data());
-    rename->Flags = exists ? FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS : 0;
-    rename->FileNameLength = static_cast<DWORD>(nameBytes);
-    std::memcpy(rename->FileName, target.utf16(), nameBytes);
-    if (!SetFileInformationByHandle(staged.value, FileRenameInfoEx, rename, static_cast<DWORD>(bufferBytes)))
-        fail("BACKEND_PROXY_ENV_IO", "Cannot atomically replace the proxy file (Windows error " + QString::number(GetLastError()) + ").");
+    const QString target = QDir::toNativeSeparators(path);
+    EnvTransaction transaction;
+    {
+        // A transacted writer locks both data and namespace identity, including
+        // against non-transacted rename-and-save editors. The lock survives the
+        // file-handle close until commit/rollback. A normal shared-delete handle
+        // plus pathname rename cannot provide this compare-and-write guarantee.
+        Handle file(CreateFileTransactedW(wide(target), GENERIC_READ | GENERIC_WRITE | DELETE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+            expected.exists ? OPEN_EXISTING : CREATE_NEW, FILE_ATTRIBUTE_NORMAL,
+            nullptr, transaction.handle(), nullptr, nullptr));
+        if (file.value == INVALID_HANDLE_VALUE) {
+            const DWORD error = GetLastError();
+            if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND || error == ERROR_FILE_EXISTS || error == ERROR_ALREADY_EXISTS)
+                fail("BACKEND_PROXY_CONFIG_CONFLICT", "The proxy file changed; no changes were applied.");
+            if (error == ERROR_TRANSACTIONS_UNSUPPORTED_REMOTE || error == ERROR_NOT_SUPPORTED
+                || error == ERROR_INVALID_FUNCTION || error == ERROR_EFS_NOT_ALLOWED_IN_TRANSACTION)
+                fail("BACKEND_PROXY_ENV_ATOMIC_UNAVAILABLE", "This location does not support the required Windows file transactions; the proxy file was not changed.");
+            fail("BACKEND_PROXY_ENV_IO", "Cannot lock the proxy file for an atomic transaction.");
+        }
+        if (readHandle(file.value, envLimit, "BACKEND_PROXY_ENV_IO") != expected.bytes)
+            fail("BACKEND_PROXY_CONFIG_CONFLICT", "The proxy file changed; no changes were applied.");
+        if (envTransactionHook) envTransactionHook(false);
+        if (remove) {
+            if (!DeleteFileTransactedW(wide(target), transaction.handle()))
+                fail("BACKEND_PROXY_ENV_IO", "Cannot remove the managed proxy file transactionally.");
+        } else if (!writeHandle(file.value, updated)) {
+            fail("BACKEND_PROXY_ENV_IO", "Cannot stage the proxy file transaction.");
+        }
+        if (envTransactionHook) envTransactionHook(true);
+    }
+    transaction.commit();
 }
 
 // QJsonDocument validates syntax but deliberately coalesces duplicate keys.
@@ -354,6 +452,10 @@ public:
     void check() { if (bytes.startsWith("\xef\xbb\xbf")) position = 3; value(0); }
 };
 } // namespace
+
+namespace testing {
+void setEnvTransactionHook(std::function<void(bool)> hook) { envTransactionHook = std::move(hook); }
+}
 
 Error::Error(QString errorCode, QString text)
     : std::runtime_error(errorCode.toStdString()), code(std::move(errorCode)), message(publicText(text, 1024)) {}
@@ -482,7 +584,7 @@ QString Config::defaultPath() { return QDir(knownFolder(FOLDERID_RoamingAppData)
 QString Config::defaultHome() { return QDir(knownFolder(FOLDERID_Profile)).filePath(".codex"); }
 Config Config::load(const QString &path)
 {
-    Handle file(CreateFileW(wide(path), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+    Handle file(CreateFileW(wide(QDir::toNativeSeparators(path)), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                             nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
     if (file.value == INVALID_HANDLE_VALUE) fail("CONFIG_READ_FAILED", "Cannot read the Guard configuration.");
     return parse(readHandle(file.value, configLimit, "CONFIG_READ_FAILED"));
@@ -498,7 +600,7 @@ Config Config::loadOrCreate(const QString &path)
 struct ConfigLease::Impl { Handle handle; };
 ConfigLease::ConfigLease(const QString &path, const Config &expected) : impl_(std::make_unique<Impl>())
 {
-    impl_->handle.value = CreateFileW(wide(path), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    impl_->handle.value = CreateFileW(wide(QDir::toNativeSeparators(path)), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (impl_->handle.value == INVALID_HANDLE_VALUE) fail("CONFIG_LOCK_FAILED", "Configuration is changing or unavailable.");
     const auto current = tryConfig(readHandle(impl_->handle.value, configLimit, "CONFIG_READ_FAILED"));
     if (!current || *current != expected) fail("CONFIG_CHANGED", "Refresh before launching with the new configuration.");
@@ -545,7 +647,13 @@ Config updateConsent(const QString &path, const Config &expected, bool enable, c
         if (!expected.manageBackend || expected.home != confirmedHome)
             fail("CONFIG_CHANGED", "Proxy management is no longer authorized for the confirmed Home.");
         try { revokeProxyEnv(confirmedHome); }
-        catch (const Error &) { fail("BACKEND_PROXY_REVOKE_FAILED", "The managed block was not safely removed; consent and its bound Home remain unchanged."); }
+        catch (const Error &error) {
+            static const QSet<QString> reasons{"BACKEND_PROXY_ENV_IO", "BACKEND_PROXY_ENV_ATOMIC_UNAVAILABLE",
+                "BACKEND_PROXY_CONFIG_CONFLICT", "BACKEND_PROXY_BLOCK_INVALID", "BACKEND_PROXY_ENV_ENCODING",
+                "BACKEND_PROXY_SCOPE_UNCONFIRMED"};
+            const QString reason = reasons.contains(error.code) ? error.code : "BACKEND_PROXY_ENV_FAILURE";
+            fail("BACKEND_PROXY_REVOKE_FAILED", "The managed block was not safely removed; consent and its bound Home remain unchanged. Cause: " + reason + ".");
+        }
         updated.manageBackend = false; updated.home.clear();
     }
     try { transaction.commit(updated); }
@@ -592,16 +700,6 @@ void revokeProxyEnv(const QString &home)
     const EnvFile env = readEnv(path);
     if (env.begin < 0) return;
     const QByteArray updated = env.bytes.left(env.begin) + env.bytes.mid(env.end);
-    if (updated.isEmpty()) {
-        // Delete through a held handle, excluding both edits and pathname
-        // replacement, after re-verifying the exact bytes we intend to remove.
-        Handle file(CreateFileW(wide(path), GENERIC_READ | DELETE, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
-        if (file.value == INVALID_HANDLE_VALUE) fail("BACKEND_PROXY_ENV_IO", "Cannot lock the proxy file for removal.");
-        if (readHandle(file.value, envLimit, "BACKEND_PROXY_ENV_IO") != env.bytes)
-            fail("BACKEND_PROXY_CONFIG_CONFLICT", "The proxy file changed; no changes were applied.");
-        FILE_DISPOSITION_INFO info{TRUE};
-        if (!SetFileInformationByHandle(file.value, FileDispositionInfo, &info, sizeof(info)))
-            fail("BACKEND_PROXY_ENV_IO", "Cannot remove the managed proxy file.");
-    } else atomicEnv(path, env, updated);
+    atomicEnv(path, env, updated, updated.isEmpty());
 }
 } // namespace cpg
