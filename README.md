@@ -48,6 +48,31 @@ HTTP 路径；授权的 Home 块覆盖后续从该 Home 启动的 Codex 后端�
 
 ## 快速开始
 
+`0.5.0-rc.1` 新增 C++ / Qt Widgets 图形入口。解压 GUI portable ZIP 后双击
+`CodexProxyGuard.exe`；保留旁边的 `engine/`、Qt DLL、`platforms/` 和许可证目录。
+无需安装 Rust 或 Qt SDK。引擎与 GUI 必须来自同一发行包。
+
+主窗口提供 Launch、代理编辑、Codex proxy 授权/撤销、Repair 和 Refresh。
+授权对话框显示确切 Home；Repair 每次单独确认可能中断共享任务。操作期间可 Cancel，
+关闭窗口会等待引擎清理；引擎失联后可显式 Restart Engine，不自动重试启动。
+Coverage 表示配置文件事实，不表示已验证联网。界面跟随系统明暗主题。
+
+GUI 构建：安装带 CMake/Ninja 的 MSVC x64 C++ tools 和 Python 3，运行：
+
+```powershell
+python -m pip install py7zr
+.\scripts\build-gui.cmd
+```
+
+脚本复用 canonical Rust portable 构建，运行 Qt 测试，部署动态库和 app-local VC
+runtime，生成 `dist/gui/` 和版本化 ZIP（含源码、许可证、SHA 清单及 build-info）。
+首次构建会下载并校验官方 Qt 6.8.3 SDK 和源码归档；每次使用归档解出的完整隔离
+SDK 编译，不依赖预装 Qt 或 `QTDIR`。开发用 CMake preset 可单独指定 `QTDIR`。详见
+[GUI 实施计划](docs/CPP_GUI_IMPLEMENTATION_PLAN.md)、[协议](docs/CPP_GUI_PROTOCOL.md)
+和[验收记录](docs/CPP_GUI_ACCEPTANCE.md)。
+
+现有 TUI / CLI 用法保持如下：
+
 要求 Windows 10/11 与 Rust 1.88 或更新版本。
 
 ```powershell

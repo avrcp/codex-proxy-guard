@@ -1,5 +1,27 @@
 # Security Model
 
+## GUI process boundary
+
+The Qt GUI uses the bundled Rust engine through a strict, bounded stdio protocol;
+it cannot issue arbitrary commands. It never edits TOML or `.env` itself. Backend
+consent and repair each require an explicit Cancel-default dialog and a single-use
+Rust confirmation token bound to the displayed scope and current configuration.
+These supplement the TUI/CLI authorization paths described below.
+
+The GUI runs asInvoker. Rust remains the final authority on elevation, loopback
+proxy validation, package identity and repair gates. A malformed/mismatched engine
+response disables actions; no submitted operation is auto-retried. Raw stderr is
+not displayed. Shutdown cancels cooperatively before any last-resort termination
+of the GUI-owned bridge child; it never kills Desktop or the shared daemon.
+
+Concurrent frontends cannot replace the authorized Home while a revoke transaction
+is running: Windows configuration handles deny concurrent writes/deletion and
+compare the expected state before any Home change. Launch holds a read-only lease
+until cleanup, so stale launches cannot recreate blocks after consent is revoked.
+Invalid-config repair refuses to overwrite a newly valid configuration. A storage
+failure during Guard config commit attempts rollback and remains an explicit
+error; no crash-atomicity promise is made for the Guard configuration file.
+
 ## 强制边界
 
 - 代理 scheme 必须为 `http`；
@@ -122,4 +144,3 @@ Guard 不访问配置的代理端口，也不访问 OpenAI 域名。代理失效
 `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` 仅传递给新启动的进程树。它们不构成 VPN、
 透明代理或防泄漏控制：Guard 不接管 DNS、UDP、系统服务或应用后续以其他路径建立的连接。
 尤其不应把 ChatGPT Voice 等可能使用 UDP 的流量视为已经被 HTTP 代理覆盖。
-

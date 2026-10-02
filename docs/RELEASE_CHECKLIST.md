@@ -2,6 +2,12 @@
 
 ## 自动验证
 
+- [ ] `scripts\build-gui.cmd`：Qt 6.8.3 dynamic、CTest、windeployqt、app-local CRT。
+- [ ] GUI `--smoke-test` 无引擎/业务副作用，`--build-info` 与 engine/包清单一致。
+- [ ] GUI ZIP SHA、逐文件 SHA、Qt 对应源码 SHA 与许可证完整。
+- [ ] GUI 协议和 controller fake-engine 测试覆盖失联、确认、取消、未知状态。
+- [ ] [GUI 验收记录](CPP_GUI_ACCEPTANCE.md) 如实区分自动 smoke 与真实环境验收。
+
 - [ ] `codegraph status .`
 - [ ] `cargo fmt --all -- --check`
 - [ ] `cargo clippy --workspace --all-targets --locked -- -D warnings`

@@ -1,5 +1,28 @@
 # Architecture
 
+## Qt frontend
+
+`gui/` is a C++20 Qt Widgets frontend. `MainWindow` renders controller state;
+`LauncherController` coordinates explicit user intents; `EngineBridge` handles
+one QProcess and schema-1 stdio. It never reads TOML/`.env`, discovers packages or
+executes daemon commands. Native Windows chrome and asInvoker execution preserve
+normal platform behavior. TUI and CLI remain supported.
+
+The hidden Rust `bridge` command reuses the reducer, authorization and dispatcher.
+Configuration, discovery, launch and consent effects remain Rust-owned. Single-use
+confirmation proposals bind the displayed Home/configuration to the eventual
+decision; the GUI cannot substitute a Home path. Protocol limits, cancellation,
+EOF and shutdown behavior are documented in [CPP_GUI_PROTOCOL.md](CPP_GUI_PROTOCOL.md).
+
+Configuration mutations use a Windows-held write handle that allows readers but
+excludes other writers and deletion. The expected configuration is compared under
+that handle, which stays held across backend revoke and the final write. Launches
+hold a read-only configuration lease for their entire pipeline, preventing a
+second frontend from revoking consent while an older launch prepares that Home.
+Device write failure attempts to restore the prior bytes and reports failure;
+this does not claim power-loss atomicity for Guard's configuration file. The
+separate managed `.env` block retains its atomic replacement protocol.
+
 ## 单一职责
 
 Codex Proxy Guard 是最小化 Windows 启动器：使用用户配置的本机 HTTP/Mixed 代理启动

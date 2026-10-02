@@ -261,3 +261,18 @@ codex-proxy-guard init-config --force --proxy-host 127.0.0.1 --proxy-port 7890
 
 这是预期行为。Guard 只负责启动时注入环境，不托管 Desktop 生命周期；Guard 退出时的
 清理只针对自己创建的短命子进程。
+# Qt GUI
+
+- **Engine unavailable / missing**: restore the complete portable folder including
+  `engine/codex-proxy-guard.exe`; use Restart Engine after checking the cause.
+  Never automatically repeat a launch whose submission outcome is unknown.
+- **Engine / GUI version mismatch**: replace the whole package. Mixing binaries
+  from different builds is unsupported.
+- **Configuration invalid**: Edit opens the proxy form while Launch stays blocked.
+  Saving invokes Rust validation; dismissing the error does not permit launch.
+- **Confirmation expired**: Refresh, review the current Home and confirm again.
+- **Elevated launch unsupported**: close Guard and start it normally.
+- **Qt platform plugin missing**: keep `platforms/qwindows.dll` and the Qt DLLs
+  beside the GUI. Re-extract the package; no SDK installation should be necessary.
+- **Copy diagnostic** includes only build identity, error code, Desktop version and
+  coverage state. Raw stderr, file contents and consent Home are excluded.

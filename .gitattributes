@@ -1,0 +1,2 @@
+# Preserve upstream license/attribution bytes, including their original whitespace.
+licenses/Qt/** -text -whitespace

@@ -18,8 +18,10 @@ stale or unhealthy index.
   check, cross-process startup locking, Codex CLI resolution, the public daemon
   stop compatibility step, native application-model activation, environment
   injection, the consented `.env` proxy block, and process launch.
-- `codex-proxy-guard`: minimal CLI, single-screen TUI, dispatch, and launch
-  orchestration.
+- `codex-proxy-guard`: minimal CLI, single-screen TUI, bounded GUI stdio bridge,
+  dispatch, and launch orchestration.
+- `gui/`: C++20 Qt Widgets presentation/controller and QProcess client only;
+  no duplicated system operations, direct TOML/.env access, Qt Network or FFI.
 
 Preserve the state boundary `Action -> candidate reduce -> authorize -> commit ->
 dispatch -> TaskResult`. Only one foreground operation may be active. Guard shutdown
@@ -95,6 +97,7 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --all-targets --locked
 cargo audit
 .\scripts\build-portable.cmd
+.\scripts\build-gui.cmd
 ```
 
 Windows portable artifacts must always come from the canonical script. Completion also
