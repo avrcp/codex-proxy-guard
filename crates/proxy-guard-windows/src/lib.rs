@@ -1,6 +1,7 @@
 pub mod appmodel_activation;
 pub mod appx;
 pub mod codex_daemon;
+pub mod config_transaction;
 pub mod elevation;
 pub mod environment;
 #[cfg(windows)]
@@ -22,6 +23,7 @@ pub use codex_daemon::{
     CodexCli, CodexHomeInput, DaemonStopBudget, resolve_codex_cli, resolve_codex_cli_from,
     stop_codex_daemon,
 };
+pub use config_transaction::{ConfigExpectation, GuardConfigLease, GuardConfigTransaction};
 pub use elevation::{
     ELEVATED_LAUNCH_UNSUPPORTED, ElevationState, elevation_gate, ensure_non_elevated,
     query_elevation,

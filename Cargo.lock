@@ -226,7 +226,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "codex-proxy-guard"
-version = "0.4.1-rc.6"
+version = "0.5.0-rc.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -1135,7 +1135,7 @@ dependencies = [
 
 [[package]]
 name = "proxy-guard-core"
-version = "0.4.1-rc.6"
+version = "0.5.0-rc.1"
 dependencies = [
  "directories",
  "serde",
@@ -1146,7 +1146,7 @@ dependencies = [
 
 [[package]]
 name = "proxy-guard-windows"
-version = "0.4.1-rc.6"
+version = "0.5.0-rc.1"
 dependencies = [
  "proxy-guard-core",
  "serde",
@@ -1154,6 +1154,7 @@ dependencies = [
  "sysinfo",
  "tokio",
  "tokio-util",
+ "toml",
  "windows 0.62.2",
  "windows-sys 0.60.2",
 ]

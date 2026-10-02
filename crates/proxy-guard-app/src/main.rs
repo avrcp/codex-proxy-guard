@@ -1,3 +1,5 @@
+mod bridge;
+mod bridge_protocol;
 mod build_info;
 mod cli;
 mod dispatcher;
@@ -27,6 +29,7 @@ async fn main() -> anyhow::Result<()> {
     let config_path = cli.config.unwrap_or(GuardConfig::config_path()?);
 
     match cli.command {
+        Some(Command::Bridge) => bridge::run(config_path).await,
         Some(Command::ConfigPath) => {
             println!("{}", config_path.display());
             Ok(())
@@ -54,7 +57,7 @@ async fn main() -> anyhow::Result<()> {
                 refresh_codex_daemon,
                 activation_only,
             };
-            let (_, receipt) = launch_command(&config, options).await?;
+            let (_, receipt) = launch_command(&config, &config_path, options).await?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&receipt)?);
             } else {
@@ -120,6 +123,7 @@ fn print_receipt_summary(receipt: &LaunchReceipt) {
 /// reflects the outcome.
 async fn launch_command(
     config: &GuardConfig,
+    config_path: &Path,
     options: LaunchOptions,
 ) -> anyhow::Result<(DesktopAppInfo, LaunchReceipt)> {
     let cancellation = CancellationToken::new();
@@ -129,7 +133,7 @@ async fn launch_command(
             ctrl_c_token.cancel();
         }
     });
-    let result = launch_pipeline(config, options, &cancellation).await;
+    let result = launch_pipeline(config, config_path, options, &cancellation).await;
     ctrl_c.abort();
     result.map_err(|error| anyhow::anyhow!(redact_text(&error)))
 }

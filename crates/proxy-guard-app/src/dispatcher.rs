@@ -16,7 +16,8 @@ use tokio_util::sync::CancellationToken;
 
 /// Bounded wait for the single foreground task to finish its cleanup when
 /// Guard shuts down.
-const SHUTDOWN_JOIN_BUDGET: Duration = Duration::from_secs(3);
+// The daemon helper can require five seconds to reap after cancellation.
+const SHUTDOWN_JOIN_BUDGET: Duration = Duration::from_secs(8);
 
 #[derive(Clone)]
 pub struct EffectDispatcher {
@@ -24,6 +25,7 @@ pub struct EffectDispatcher {
     cancellation: CancellationToken,
     cached_app: Arc<Mutex<Option<DesktopAppInfo>>>,
     foreground_task: Arc<Mutex<Option<JoinHandle<()>>>>,
+    foreground_cancellation: Arc<std::sync::Mutex<Option<CancellationToken>>>,
 }
 
 impl EffectDispatcher {
@@ -33,6 +35,7 @@ impl EffectDispatcher {
             cancellation,
             cached_app: Arc::new(Mutex::new(None)),
             foreground_task: Arc::new(Mutex::new(None)),
+            foreground_cancellation: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -43,7 +46,12 @@ impl EffectDispatcher {
         }
         let tx = self.tx.clone();
         let cancellation = self.cancellation.child_token();
+        if let Ok(mut slot) = self.foreground_cancellation.lock() {
+            *slot = Some(cancellation.clone());
+        }
         let config = state.config.clone();
+        let repair_required =
+            state.config_readiness == proxy_guard_core::ConfigReadiness::RepairRequired;
         let config_path = state.config_path.clone();
         let cached_app = Arc::clone(&self.cached_app);
         let handle = tokio::spawn(async move {
@@ -73,7 +81,8 @@ impl EffectDispatcher {
                     }
                 }
                 AppEffect::LaunchDesktop(options) => {
-                    let result = launch_pipeline(&config, options, &cancellation).await;
+                    let result =
+                        launch_pipeline(&config, &config_path, options, &cancellation).await;
                     if let Ok((info, _)) = &result {
                         *cached_app.lock().await = Some(info.clone());
                     }
@@ -81,7 +90,14 @@ impl EffectDispatcher {
                 }
                 AppEffect::SaveConfig(updated) => {
                     let result = tokio::task::spawn_blocking(move || {
-                        updated.save(&config_path).map(|()| updated)
+                        let expected = if repair_required {
+                            proxy_guard_windows::ConfigExpectation::Invalid
+                        } else {
+                            proxy_guard_windows::ConfigExpectation::Current(&config)
+                        };
+                        proxy_guard_windows::GuardConfigTransaction::begin(&config_path, expected)?
+                            .commit(&updated)
+                            .map(|()| updated)
                     })
                     .await
                     .map_err(|error| format!("configuration save task failed: {error}"))
@@ -115,6 +131,27 @@ impl EffectDispatcher {
             let _ = timeout(SHUTDOWN_JOIN_BUDGET, task).await;
         }
     }
+
+    /// Cancel only the current operation; subsequent launches get a fresh
+    /// child token. Never terminates Desktop or the shared daemon.
+    pub fn cancel_foreground(&self) {
+        if let Ok(slot) = self.foreground_cancellation.lock()
+            && let Some(token) = slot.as_ref()
+        {
+            token.cancel();
+        }
+    }
+
+    /// The bridge checks this before checking its result channel. A
+    /// finished task without a queued result indicates a panic/early exit,
+    /// which must close the operation instead of leaving the GUI busy.
+    pub async fn foreground_finished(&self) -> bool {
+        self.foreground_task
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(JoinHandle::is_finished)
+    }
 }
 
 /// Applies one explicit consent decision.
@@ -134,30 +171,28 @@ async fn update_backend_proxy_consent(
     enable: bool,
     home: PathBuf,
 ) -> Result<GuardConfig, String> {
-    if enable {
+    let config = config.clone();
+    let config_path = config_path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        // Acquire write/delete exclusion and compare the actual file before
+        // any Home mutation. Keep this exact handle until consent is saved.
+        let transaction = proxy_guard_windows::GuardConfigTransaction::begin(
+            &config_path,
+            proxy_guard_windows::ConfigExpectation::Current(&config),
+        )?;
+        if enable {
         let mut updated = config.clone();
         updated.codex.manage_codex_proxy_env = true;
         updated.codex.proxy_env_home = canonical_home(&home)?;
-        updated
-            .save(config_path)
+        transaction
+            .commit(&updated)
             .map(|()| updated)
-            .map_err(|error| error.to_string())
     } else {
         // The saved configuration is the only durable record of which Home
         // the block belongs to, so the block must be gone before that record
         // is dropped — the reverse order could strand an orphan block no
         // later Guard run could even locate.
-        let revoke_home = home;
-        tokio::task::spawn_blocking(move || {
-            proxy_guard_windows::revoke(&proxy_guard_windows::env_path(&revoke_home))
-        })
-        .await
-        .map_err(|error| {
-            format!(
-                "BACKEND_PROXY_REVOKE_TASK_FAILED: {error}; the managed block was not \
-                 removed, so the consent remains enabled and the bound Home is unchanged"
-            )
-        })?
+        proxy_guard_windows::revoke(&proxy_guard_windows::env_path(&home))
         .map_err(|error| {
             format!(
                 "BACKEND_PROXY_REVOKE_FAILED: {error}; the managed block was not safely \
@@ -169,8 +204,8 @@ async fn update_backend_proxy_consent(
         let mut updated = config.clone();
         updated.codex.manage_codex_proxy_env = false;
         updated.codex.proxy_env_home = PathBuf::new();
-        updated
-            .save(config_path)
+        transaction
+            .commit(&updated)
             .map(|()| updated)
             .map_err(|error| {
                 format!(
@@ -180,7 +215,8 @@ async fn update_backend_proxy_consent(
                      configuration write problem"
                 )
             })
-    }
+        }
+    }).await.map_err(|_| "BACKEND_PROXY_REVOKE_TASK_FAILED: the configuration task did not return; refresh before retrying".to_string())?
 }
 
 /// Canonicalizes the confirmed home when it exists and keeps the absolute path
@@ -202,10 +238,21 @@ fn canonical_home(home: &std::path::Path) -> Result<PathBuf, String> {
 
 pub async fn launch_pipeline(
     config: &GuardConfig,
+    config_path: &std::path::Path,
     options: LaunchOptions,
     cancellation: &CancellationToken,
 ) -> Result<(DesktopAppInfo, LaunchReceipt), String> {
     config.validate().map_err(|error| error.to_string())?;
+    if cancellation.is_cancelled() {
+        return Err("LAUNCH_CANCELLED: Guard is shutting down".into());
+    }
+    let expected = config.clone();
+    let lease_path = config_path.to_path_buf();
+    let _configuration_lease = tokio::task::spawn_blocking(move || {
+        proxy_guard_windows::GuardConfigLease::acquire(&lease_path, &expected)
+    })
+    .await
+    .map_err(|_| "CONFIG_LOCK_FAILED: configuration lease task did not return".to_string())??;
     if cancellation.is_cancelled() {
         return Err("LAUNCH_CANCELLED: Guard is shutting down".into());
     }
@@ -336,6 +383,7 @@ mod tests {
         let with_file = dir.join("home-with-file");
         std::fs::create_dir_all(&with_file).unwrap();
         std::fs::write(with_file.join(".env"), "KEEP=1\n").unwrap();
+        authorized_config(&with_file).save(&config_path).unwrap();
         let updated = update_backend_proxy_consent(
             &authorized_config(&with_file),
             &config_path,
@@ -353,6 +401,7 @@ mod tests {
         // …and a home whose .env does not exist at all.
         let missing = dir.join("home-missing-env");
         std::fs::create_dir_all(&missing).unwrap();
+        authorized_config(&missing).save(&config_path).unwrap();
         let updated = update_backend_proxy_consent(
             &authorized_config(&missing),
             &config_path,
@@ -367,7 +416,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unsaveable_config_reports_the_removed_block_honestly() {
+    async fn unsaveable_config_is_rejected_before_removing_the_block() {
         let dir = temp_root("save-fail");
         let home = dir.join("home");
         std::fs::create_dir_all(&home).unwrap();
@@ -378,8 +427,10 @@ mod tests {
             &proxy_guard_windows::ProxyEnvValues::from_config(&config),
         )
         .unwrap();
-        // A regular file where the config directory should be makes the save
-        // fail after the block was already removed.
+        let original_env = std::fs::read(&env).unwrap();
+        // A regular file where the config directory should be prevents the
+        // transaction from acquiring its configuration handle. Revoke must
+        // not begin until that handle is acquired and the config is matched.
         let blocker = dir.join("blocker");
         std::fs::write(&blocker, "not a directory").unwrap();
 
@@ -392,24 +443,55 @@ mod tests {
         .await
         .unwrap_err();
 
-        assert!(
-            error.starts_with("BACKEND_PROXY_CONSENT_SAVE_FAILED:"),
-            "{error}"
-        );
-        assert!(error.contains("still authorizes management"), "{error}");
-        assert!(
-            !env.exists(),
-            "the block itself was already removed; only the consent save failed"
+        assert!(error.starts_with("CONFIG_LOCK_FAILED:"), "{error}");
+        assert_eq!(
+            std::fs::read(&env).unwrap(),
+            original_env,
+            "failed lock must leave the authorized block untouched"
         );
         // The authorized config is still intact on the in-memory side, and a
         // retry against a writable path now succeeds end to end.
         let retry_path = dir.join("real-config.toml");
+        config.save(&retry_path).unwrap();
         let updated = update_backend_proxy_consent(&config, &retry_path, false, home)
             .await
             .unwrap();
         assert!(!updated.codex.manage_codex_proxy_env);
         let on_disk = GuardConfig::load(&retry_path).unwrap();
         assert!(!on_disk.codex.manage_codex_proxy_env);
+        assert!(!env.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_consent_cannot_revoke_a_home_or_overwrite_a_new_binding() {
+        let dir = temp_root("stale-consent");
+        let config_path = dir.join("config.toml");
+        let home_a = dir.join("home-a");
+        let home_b = dir.join("home-b");
+        std::fs::create_dir_all(&home_a).unwrap();
+        std::fs::create_dir_all(&home_b).unwrap();
+        let config_a = authorized_config(&home_a);
+        let config_b = authorized_config(&home_b);
+        let env_a = proxy_guard_windows::env_path(&home_a);
+        let env_b = proxy_guard_windows::env_path(&home_b);
+        for (env, config) in [(&env_a, &config_a), (&env_b, &config_b)] {
+            proxy_guard_windows::prepare(
+                env,
+                &proxy_guard_windows::ProxyEnvValues::from_config(config),
+            )
+            .unwrap();
+        }
+        config_b.save(&config_path).unwrap();
+        let before_a = std::fs::read(&env_a).unwrap();
+        let before_b = std::fs::read(&env_b).unwrap();
+        let error = update_backend_proxy_consent(&config_a, &config_path, false, home_a)
+            .await
+            .unwrap_err();
+        assert!(error.starts_with("CONFIG_CHANGED:"), "{error}");
+        assert_eq!(std::fs::read(&env_a).unwrap(), before_a);
+        assert_eq!(std::fs::read(&env_b).unwrap(), before_b);
+        assert_eq!(GuardConfig::load(&config_path).unwrap(), config_b);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

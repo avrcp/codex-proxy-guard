@@ -19,6 +19,6 @@ proxy-guard-core = { path = "../proxy-guard-core" }
 proxy-guard-windows = { path = "../proxy-guard-windows" }
 ratatui.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
 tokio.workspace = true
 tokio-util.workspace = true

@@ -19,6 +19,9 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Private, versioned stdio transport for the GUI frontend.
+    #[command(hide = true)]
+    Bridge,
     /// Launch ChatGPT Desktop immediately without opening the TUI.
     Launch {
         /// Print the launch receipt as JSON.
