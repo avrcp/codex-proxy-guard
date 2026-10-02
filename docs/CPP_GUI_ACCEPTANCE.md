@@ -54,5 +54,25 @@ archive-to-runtime manifest verifier was executed successfully before packaging.
 
 ## Final release evidence
 
-Final commands, source provenance and package verification are appended after
-the review fixes and canonical packaging complete. Build artifacts remain ignored.
+Canonical `scripts/build-portable.cmd` and `scripts/build-gui.cmd` have completed
+successfully from pushed, clean commits. The GUI pipeline rebuilds the canonical
+engine, runs all three CTest suites, deploys only Core/Gui/Widgets and their needed
+plugins, verifies the unmodified Qt DLL hashes, and includes corresponding source.
+
+Package smoke creates the GUI and closes it without starting an engine; separate
+engine hello/shutdown smoke holds stdin open, uses an isolated temporary Guard
+configuration, and verifies the file remains unchanged. Both EXEs report matching
+product version/commit/dirty state. Smoke uses a PATH without Qt/VS/Rust SDK paths.
+An import-table inspection found the engine's VCRUNTIME140 dependency; the package
+therefore also places that runtime beside the engine and runs its smoke from its
+own directory, rather than depending on the GUI's working directory.
+
+Output: `dist/CodexProxyGuard-0.5.0-rc.1-windows-x86_64.zip`, matching `.sha256`,
+`dist/gui/SHA256SUMS.txt`, `dist/gui/build-info.json`, and the canonical Rust files
+under `dist/portable/`. The generated build-info is authoritative for each rebuild's
+exact commit, per-file hashes and SDK/source provenance. Artifacts remain ignored.
+
+Known build observations: the QtBase-only SDK has no translations catalog (the
+English-only GUI deliberately uses `--no-translations`); the canonical Rust script
+reports Authenticode status unavailable in this PowerShell environment. Neither is
+recorded as successful signing or full clean-machine acceptance.

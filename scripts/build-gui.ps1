@@ -62,7 +62,7 @@ function Invoke-Smoke([string] $File, [string] $Arguments, [string] $InputData =
     $Start = New-Object Diagnostics.ProcessStartInfo
     $Start.FileName = $File
     $Start.Arguments = $Arguments
-    $Start.WorkingDirectory = $Output
+    $Start.WorkingDirectory = Split-Path -Parent $File
     $Start.UseShellExecute = $false
     $Start.CreateNoWindow = $true
     $Start.RedirectStandardOutput = $true
@@ -203,6 +203,9 @@ try {
     $CrtDirs = @(Get-ChildItem -LiteralPath "$Vs\VC\Redist\MSVC\$RedistVersion\x64" -Directory | Where-Object Name -match '^Microsoft\.VC\d+\.CRT$')
     if ($CrtDirs.Count -ne 1) { throw 'Cannot unambiguously locate the app-local x64 VC runtime.' }
     Get-ChildItem -LiteralPath $CrtDirs[0].FullName -Filter '*.dll' | Copy-Item -Destination $Output
+    # The Rust engine/activation worker starts from engine/, so the parent's
+    # application-local runtime is not on its DLL search path on a clean PC.
+    Get-ChildItem -LiteralPath $CrtDirs[0].FullName -Filter 'vcruntime140*.dll' | Copy-Item -Destination "$Output\engine"
     Copy-Item -LiteralPath 'LICENSE', 'THIRD_PARTY_NOTICES.md' -Destination $Output
     Copy-Item -LiteralPath 'licenses' -Destination $Output -Recurse
 
@@ -216,7 +219,7 @@ try {
     Copy-Item -LiteralPath $SourceCache -Destination "$Output\sources"
     Write-Utf8 "$Output\sources\README.txt" "QtBase $QtVersion corresponding source (including bundled third-party notices).`nOriginal source: $SourceUrl`nSHA-256: $SourceHash`nSee THIRD_PARTY_NOTICES.md for rebuilding/replacing Qt shared libraries."
 
-    foreach ($Required in @('Qt6Core.dll', 'Qt6Gui.dll', 'Qt6Widgets.dll', 'platforms\qwindows.dll', 'msvcp140.dll', 'vcruntime140.dll', 'vcruntime140_1.dll')) {
+    foreach ($Required in @('Qt6Core.dll', 'Qt6Gui.dll', 'Qt6Widgets.dll', 'platforms\qwindows.dll', 'msvcp140.dll', 'vcruntime140.dll', 'vcruntime140_1.dll', 'engine\vcruntime140.dll')) {
         if (-not (Test-Path -LiteralPath "$Output\$Required" -PathType Leaf)) { throw "Incomplete deployment: $Required" }
     }
     # Verify DLL loading without Qt/VS/Rust SDK paths or plugin overrides.
