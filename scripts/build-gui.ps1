@@ -27,7 +27,11 @@ function Invoke-Checked([string] $File, [string[]] $Arguments) {
 }
 
 function Get-Hash([string] $Path) {
-    return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+    # Avoid module auto-loading differences after the MSVC environment import.
+    $Stream = [IO.File]::OpenRead($Path)
+    $Hasher = [Security.Cryptography.SHA256]::Create()
+    try { return ([BitConverter]::ToString($Hasher.ComputeHash($Stream))).Replace('-', '').ToLowerInvariant() }
+    finally { $Hasher.Dispose(); $Stream.Dispose() }
 }
 
 function Write-Utf8([string] $Path, [string] $Text) {
