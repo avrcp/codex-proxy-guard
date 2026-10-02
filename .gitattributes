@@ -1,2 +1,4 @@
 # Preserve upstream license/attribution bytes, including their original whitespace.
 licenses/Qt/** -text -whitespace
+backend/third_party/toml++/toml.hpp -text -whitespace
+backend/third_party/toml++/LICENSE -text -whitespace

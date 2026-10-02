@@ -11,7 +11,7 @@ Reference concepts in the brief: `ui/widgets/buttons.*`, `ui/widgets/labels.*`,
 
 The product has one native `QMainWindow`, standard buttons and form controls,
 small information rows, a controller and a process client. `QProcess` owns only
-the Rust bridge. No Qt Network, QML, WebEngine, FFI or Telegram toolkit is used.
+the C++ bridge. No Qt Network, QML, WebEngine, FFI or Telegram toolkit is used.
 
 Authoritative implementation references:
 

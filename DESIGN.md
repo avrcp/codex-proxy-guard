@@ -10,7 +10,7 @@ and what proxy configuration is prepared. Launch is the only primary action.
 - Original blue accent, neutral surfaces, semantic status text and colors.
 - Follow `QStyleHints::colorSchemeChanged` at runtime.
 - Standard buttons, dialogs, text fields and spin box preserve keyboard semantics.
-- Consent dialogs show the exact Rust-provided Home and default to Cancel.
+- Consent dialogs show the exact C++-provided Home and default to Cancel.
 - Busy state offers Cancel; lost engine offers explicit Restart Engine.
 - Errors remain visible until an explicit operation supersedes them; diagnostics
   copy only version, error code, application version and coverage state.

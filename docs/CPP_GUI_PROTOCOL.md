@@ -17,7 +17,7 @@ Methods:
 | --- | --- |
 | `hello` | `{}` → protocol/engine versions, commit, capabilities |
 | `snapshot` | `{}` → safe local state, action flags and confirmation proposals |
-| `set_proxy` | `{host,port}` → validate/save through Rust, refreshed snapshot |
+| `set_proxy` | `{host,port}` → validate/save through C++, refreshed snapshot |
 | `set_backend_proxy_consent` | `{enabled,confirmation_token}` → existing consent/revoke transaction, snapshot |
 | `start_launch` | `{repair,confirmation_token?}` → `{operation_id}`; repair requires token |
 | `cancel_operation` | `{operation_id}` → request cooperative cancellation |

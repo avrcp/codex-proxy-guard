@@ -1,4 +1,4 @@
-# Rust build outputs
+# CMake build outputs and dependency caches
 /target/
 
 # Portable build artifacts (EXE, SHA, build-info.json, etc.)
@@ -46,10 +46,6 @@ $RECYCLE.BIN/
 *.swo
 *~
 .history/
-
-# Rust tooling artifacts
-.rs.bk
-Cargo.toml.bak
 
 # Common local IDE/build metadata
 .vs/

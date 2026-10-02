@@ -8,7 +8,7 @@ Windows native desktop (Qt Widgets).
 
 ## Stack
 
-C++20, Qt 6.8+ Core/Gui/Widgets, MSVC x64, CMake; existing Rust engine over stdio.
+C++20, Qt 6.8+ Core/Gui/Widgets, MSVC x64, CMake; C++ engine over stdio.
 
 ## Users and purpose
 
@@ -18,7 +18,7 @@ It does not manage proxy services, measure connectivity or own Desktop's lifecyc
 
 ## Constraints
 
-Rust is the only implementation of system operations. One foreground operation,
+C++ is the only implementation of system operations. One foreground operation,
 explicit consent, bounded cancellation, no network probes, no authentication data.
 An observed activation or prepared configuration is never a network success claim.
 

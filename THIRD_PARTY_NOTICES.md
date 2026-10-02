@@ -60,8 +60,11 @@ Microsoft's license terms; they are not covered by this project's MIT license.
 See https://visualstudio.microsoft.com/license-terms/ and
 https://learn.microsoft.com/cpp/windows/redistributing-visual-cpp-files.
 
-## Rust engine
+## toml++ 3.4.0
 
-The separate `engine/codex-proxy-guard.exe` is built from this repository with
-the dependency versions pinned in `Cargo.lock`. Source-level license metadata
-for those dependencies is available through `cargo metadata --locked`.
+The C++ engine dynamically links Qt Core and uses the vendored toml++ 3.4.0
+single-header TOML parser, copyright Mark Gillard and contributors, under MIT.
+Its original license is in `backend/third_party/toml++/LICENSE` in source and
+`licenses/tomlplusplus/LICENSE` in the portable package. The upstream URL and
+pinned source checksum are recorded in that vendored directory's README.
+No Rust dependencies are included in this release.

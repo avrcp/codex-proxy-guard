@@ -1,3 +1,5 @@
+> Historical record for the Rust-backed releases through 0.5.0-rc.1. Current C++ implementation and validation are documented in CPP_ENGINE_MIGRATION_PLAN.md and CPP_ENGINE_ACCEPTANCE.md. Historical test/launch results below do not validate the new engine.
+
 # C++ / Qt GUI implementation plan
 
 Baseline: `04142556bd57d2d69fa25e0344d4ea24a85e0fa0` (`0.4.1-rc.6`).
