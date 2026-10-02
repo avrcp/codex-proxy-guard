@@ -1,0 +1,15 @@
+{
+  "version": 6,
+  "configurePresets": [{
+    "name": "windows-release",
+    "generator": "Ninja",
+    "binaryDir": "${sourceDir}/../target/gui-release",
+    "cacheVariables": {
+      "CMAKE_BUILD_TYPE": "Release",
+      "CMAKE_PREFIX_PATH": "$env{QTDIR}",
+      "BUILD_TESTING": "ON"
+    }
+  }],
+  "buildPresets": [{"name": "windows-release", "configurePreset": "windows-release"}],
+  "testPresets": [{"name": "windows-release", "configurePreset": "windows-release", "output": {"outputOnFailure": true}}]
+}
