@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(CodexProxyGuardGui VERSION 0.5.0 LANGUAGES CXX)
+project(CodexProxyGuardGui VERSION 0.6.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -7,7 +7,7 @@ set(CMAKE_AUTOMOC ON)
 find_package(Qt6 6.8 REQUIRED COMPONENTS Core Gui Widgets)
 qt_standard_project_setup()
 
-set(CPG_PRODUCT_VERSION "0.5.0-rc.1" CACHE STRING "Product version")
+set(CPG_PRODUCT_VERSION "0.6.0-rc.1" CACHE STRING "Product version")
 set(CPG_BUILD_COMMIT "unknown" CACHE STRING "Source commit")
 set(CPG_BUILD_DIRTY "true" CACHE STRING "Source dirty flag")
 add_library(guard_gui STATIC
