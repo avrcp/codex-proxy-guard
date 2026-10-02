@@ -41,8 +41,8 @@ restoration is attempted on write failure, but physical storage failure is not a
 power-loss transaction guarantee.
 
 The `.env` adapter preserves bytes outside exactly one known marker pair, rejects
-conflicting variables/edited blocks and atomically replaces after content
-re-verification. Revocation removes the block before committing disabled consent.
+conflicting variables/edited blocks and commits a filesystem transaction after content
+re-verification. The transaction isolates both writers and editor rename-save races. Revocation removes the block before committing disabled consent.
 The user Home is resolved explicitly, never inferred from Guard's CODEX_HOME.
 
 ## Launch
@@ -79,3 +79,20 @@ checks portable runtime loading, source provenance and checksums.
 
 The version-2 config schema survives migration for data safety. The old full-screen
 Rust TUI is replaced by the console; no source/binary fallback to Rust remains.
+
+## Filesystem transaction decision
+
+A held Windows reader can exclude writers, but allowing an atomic replacement also
+allows a different editor to rename-save between verification and replacement.
+A second content check does not close that window. The `.env` adapter therefore
+uses an isolated NTFS transaction for expected-content comparison and atomic
+write/delete commit. Unsupported filesystems/runtime configurations fail closed;
+there is no nontransactional fallback and no change to system policy.
+
+This is a deliberate narrow dependency, not a claim that TxF is generally the
+preferred Windows storage API. [Microsoft recommends alternatives and warns that
+TxF may be unavailable in future Windows versions](https://learn.microsoft.com/en-us/windows/win32/fileio/transactional-ntfs-portal).
+The stricter requirement here is to preserve an independently edited `.env` outside
+Guard's block, including concurrent rename-save, while committing one visible
+change. If TxF is removed or disabled, backend block management must be redesigned
+or refused; ordinary launches without that optional block remain available.

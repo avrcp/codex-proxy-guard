@@ -57,3 +57,9 @@ Bridge failures disable actions and require explicit recovery. stdout is strictl
 bounded NDJSON; stderr is not shown verbatim. The GUI cancels and waits for its own
 engine only; quitting Guard never terminates Desktop. A submitted activation can
 remain unknown even if the helper/bridge has exited.
+
+Backend proxy block writes require working local NTFS transactions. Microsoft
+recommends alternatives to TxF for new applications; this narrow adapter retains
+it to enforce the strict concurrent-file preservation contract. If unavailable,
+Guard refuses the write/revoke and keeps consent retryable instead of weakening
+the transaction. See the architecture decision for details.

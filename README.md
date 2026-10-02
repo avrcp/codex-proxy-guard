@@ -62,3 +62,6 @@ Guard 的块由 `# BEGIN CODEX PROXY GUARD: proxy-v1` 和对应 END 标记界定
 第一条编译 C++ 并执行全部后端和 GUI 测试。canonical portable 脚本构建两个 C++ EXE、运行测试、部署动态 Qt/VC 运行库、执行隔离 PATH 冒烟测试、核对内嵌 commit/dirty 并生成 SHA-256 清单和 ZIP。`build-gui.cmd` 是同一流程的入口别名。输出目录为 `dist/gui`，ZIP 位于 `dist`。包内含 Qt LGPL 文本、对应源码和 toml++ MIT 许可证。
 
 详见 [迁移计划](docs/CPP_ENGINE_MIGRATION_PLAN.md)、[架构](docs/ARCHITECTURE.md)、[安全边界](docs/SECURITY.md)、[发布门禁](docs/RELEASE_CHECKLIST.md) 和 [第三方许可](THIRD_PARTY_NOTICES.md)。
+
+`.env` 写入与撤销要求本地 NTFS 事务可用；不支持时保留授权并拒绝修改，无非事务回退。
+该严格并发保护与其 Windows API 生命周期取舍记录在[架构决策](docs/ARCHITECTURE.md#filesystem-transaction-decision)。

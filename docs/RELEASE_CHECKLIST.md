@@ -13,6 +13,7 @@
 - [ ] Run canonical `scripts/build-portable.cmd` from the clean pushed commit.
 - [ ] Check release tests, packaged GUI/engine provenance, isolated-PATH GUI and hello/shutdown smoke (stdin kept open).
 - [ ] Verify ZIP CRC, ZIP SHA-256, every `files_sha256` member, official deployed Qt hashes, and dirty=false.
+- [ ] Run `python scripts/verify-package.py dist/CodexProxyGuard-0.6.0-rc.1-windows-x86_64.zip --expected-commit (git rev-parse HEAD)`.
 - [ ] Confirm package includes engine Qt Core + VC runtime, root GUI dependencies, all notices and corresponding Qt source.
 
 Live launch, shared-daemon repair, clean Windows VM loading, Windows 10, high DPI,

@@ -52,3 +52,17 @@ All production paths must share the same implementation; no fallback to Rust.
 
 Real Desktop launch/shared-service interruption and clean-machine acceptance are
 separate from automated fixtures and are recorded honestly, never inferred from builds.
+
+## Implementation record
+
+- `62a15d8`: assessment and shared C++ interfaces.
+- `536e1a8`: strict configuration, consent and proxy-file core.
+- `9db79ba`: native Windows discovery/activation and bounded helpers.
+- `c58211f`: shared launch pipeline, bridge, console/CLI and CMake tests.
+- `9ddd630`: remove Rust/Cargo and switch canonical portable packaging/docs.
+- Final hardening closes invalid-config authorization loss, edited-block handling,
+  extended-path I/O, writer cancellation and configuration-free worker dispatch.
+- The file transaction decision closes the external rename-save race; its NTFS
+  and Windows API lifecycle constraints are explicit in ARCHITECTURE.md.
+
+See CPP_ENGINE_ACCEPTANCE.md for verification scope, release gates and limitations.

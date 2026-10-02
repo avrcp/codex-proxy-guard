@@ -135,6 +135,9 @@ Push-Location $Root
 $OriginalPath = $Env:PATH
 $OriginalQtPluginPath = $Env:QT_PLUGIN_PATH
 try {
+    if ((Get-Hash (Join-Path $Root 'backend\third_party\toml++\toml.hpp')) -ne '6b5172ad4dd6519aec67b919181fa7a38a2234131e5b2afa232dfe444819783e') {
+        throw 'Vendored toml++ differs from the reviewed upstream release.'
+    }
     # These hashes come from the checksum-verified official SDK archive, not
     # from this machine's installation or its self-reported qmake version.
     & (Join-Path $PSScriptRoot 'verify-qt-sdk.ps1') -SdkOutputPath $QtRoot
