@@ -119,3 +119,15 @@ re-running the new tests against the unfixed sources. Still not exercised,
 unchanged from above: live Desktop activation, live shared-daemon interruption,
 clean Windows VM, Windows 10, UNC, high-DPI/screen-reader and signing acceptance
 (V1 manual matrix remains pending operator authorization).
+
+Final release artifact: `scripts/build-portable.cmd` ran from the clean merge
+commit `ba176b1` on `main` (`git_dirty=false`; the script re-ran all seven
+suites, 100% passed). `dist/gui/build-info.json` records product `0.6.0-rc.1`,
+Qt 6.8.3, C++20 engine, GUI and engine commit `ba176b1`, deployed Qt DLL hashes
+equal to the verified official SDK, and engine bridge smoke (hello/shutdown
+passed; stdin held open; isolated config unchanged). ZIP:
+`CodexProxyGuard-0.6.0-rc.1-windows-x86_64.zip`, SHA-256
+`914e97440c46d0cba978f790f841ee448992460cd094613f474ac4d29c448eda`
+(member manifest in `dist/gui/SHA256SUMS.txt`). Rust toolchain-era working-tree
+leftovers (`target/` cache markers, fixtures and logs, `aqtinstall.log`) were
+removed after packaging; only C++ build outputs remain.
