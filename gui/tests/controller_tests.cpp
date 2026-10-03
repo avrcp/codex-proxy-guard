@@ -1,7 +1,11 @@
 #include "controller/launcher_controller.h"
 #include "ui/main_window.h"
+#include "ui/proxy_settings_dialog.h"
 #include "ui/theme.h"
 #include <QDir>
+#include <QLabel>
+#include <QLineEdit>
+#include <QSpinBox>
 #include <QStyleHints>
 #include <QJsonArray>
 #include <QPushButton>
@@ -233,6 +237,117 @@ private slots:
         QVERIFY(c.message().contains("Application activated"));
         QVERIFY(!c.message().contains("existing Desktop instance"));
         QVERIFY(MainWindow::receiptSummary(c.receipt()).contains("Created (new instance observed)"));
+    }
+    void proxySaveFailureKeepsDialogAndInput() {
+        FakeEngineClient engine; LauncherController c(&engine); c.start();
+        auto snapshot = readySnapshot();
+        snapshot.insert("proxy", QJsonObject{{"host", "127.0.0.1"}, {"port", 10808}});
+        engine.reply("snapshot", snapshot);
+        ProxySettingsDialog dialog(&c, nullptr);
+        dialog.show(); QCoreApplication::processEvents();
+        auto *host = dialog.findChild<QLineEdit *>("proxyHost");
+        auto *port = dialog.findChild<QSpinBox *>("proxyPort");
+        QPushButton *save = nullptr;
+        for (auto *button : dialog.findChildren<QPushButton *>())
+            if (button->text() == "Save") save = button;
+        QVERIFY(host && port && save);
+        host->setText("192.0.2.1"); port->setValue(7890);
+        save->click();
+        QCOMPARE(engine.calls.last().method, "set_proxy"); // Engine is the final validator.
+        QVERIFY(dialog.isVisible());
+        QTest::keyClick(&dialog, Qt::Key_Escape); // Saving blocks Esc/X/Cancel until a bounded result.
+        QCoreApplication::processEvents();
+        QVERIFY(dialog.isVisible());
+        for (const auto &code : {QString("CONFIG_INVALID"), QString("CONFIG_CHANGED"), QString("CONFIG_LOCK_FAILED")}) {
+            emit engine.requestFailed(2, "set_proxy", code, "The engine rejected this save.", false);
+            QVERIFY(dialog.isVisible()); // The dialog stays open…
+            QCOMPARE(host->text(), "192.0.2.1"); QCOMPARE(port->value(), 7890); // …with the user's input.
+            bool shown = false;
+            for (auto *label : dialog.findChildren<QLabel *>()) shown = shown || label->text().contains(code);
+            QVERIFY2(shown, "The rejection must be visible inside the dialog.");
+            save->click(); // Retry is an explicit user action from the restored editing state.
+            QCOMPARE(engine.calls.last().method, "set_proxy");
+        }
+        // A confirmed save closes the dialog exactly once.
+        emit engine.response(3, "set_proxy", snapshot);
+        QTRY_VERIFY(!dialog.isVisible());
+        QCOMPARE(engine.calls.size(), 5); // snapshot + four saves, no silent extra submissions.
+    }
+    void proxySaveOutcomeUnknownOnEngineFailure() {
+        FakeEngineClient engine; LauncherController c(&engine); c.start();
+        auto snapshot = readySnapshot();
+        snapshot.insert("proxy", QJsonObject{{"host", "127.0.0.1"}, {"port", 10808}});
+        engine.reply("snapshot", snapshot);
+        ProxySettingsDialog dialog(&c, nullptr);
+        dialog.show(); QCoreApplication::processEvents();
+        auto *host = dialog.findChild<QLineEdit *>("proxyHost");
+        QPushButton *save = nullptr;
+        for (auto *button : dialog.findChildren<QPushButton *>())
+            if (button->text() == "Save") save = button;
+        QVERIFY(host && save);
+        const int callsBefore = engine.calls.size();
+        save->click();
+        engine.failAndStop("ENGINE_IO_FAILED", "Engine died during the save.");
+        QCoreApplication::processEvents();
+        QVERIFY(dialog.isVisible()); // Not closed, not resubmitted.
+        QCOMPARE(engine.calls.size(), callsBefore + 1);
+        QCOMPARE(host->text(), "127.0.0.1");
+        bool unconfirmed = false;
+        for (auto *label : dialog.findChildren<QLabel *>())
+            unconfirmed = unconfirmed || (label->text().contains("unconfirmed") && label->text().contains("verify"));
+        QVERIFY(unconfirmed);
+        QTest::keyClick(&dialog, Qt::Key_Escape); // The unknown state allows closing again.
+        QTRY_VERIFY(!dialog.isVisible());
+    }
+    void proxyDialogSurvivesReopenAndLateSignals() {
+        FakeEngineClient engine; LauncherController c(&engine); c.start();
+        auto snapshot = readySnapshot();
+        snapshot.insert("proxy", QJsonObject{{"host", "127.0.0.1"}, {"port", 10808}});
+        engine.reply("snapshot", snapshot);
+        ProxySettingsDialog dialog(&c, nullptr);
+        dialog.show(); QCoreApplication::processEvents();
+        QPushButton *save = nullptr;
+        for (auto *button : dialog.findChildren<QPushButton *>())
+            if (button->text() == "Save") save = button;
+        QVERIFY(save);
+        save->click(); // Start a save, then close the engine session and hide the dialog.
+        emit engine.response(3, "set_proxy", snapshot);
+        QTRY_VERIFY(!dialog.isVisible());
+        // A stale late signal for a finished session must not crash or reopen.
+        emit c.proxySaveFailed("CONFIG_INVALID", "stale");
+        QCoreApplication::processEvents();
+        QVERIFY(!dialog.isVisible());
+        auto applied = snapshot;
+        applied.insert("proxy", QJsonObject{{"host", "::1"}, {"port", 7890}});
+        engine.reply("snapshot", applied);
+        dialog.reset(); // Reopen re-arms from the current snapshot, not the old draft.
+        dialog.show(); QCoreApplication::processEvents();
+        QCOMPARE(dialog.findChild<QSpinBox *>("proxyPort")->value(), 7890);
+        QCOMPARE(dialog.findChildren<QPushButton *>().size(), 2); // No duplicate buttons or connections.
+        save->click();
+        QCOMPARE(engine.calls.last().params.value("host").toString(), "::1");
+    }
+    void proxySaveSuccessStillReportsDiscoveryError() {
+        FakeEngineClient engine; LauncherController c(&engine); c.start();
+        engine.reply("snapshot", readySnapshot());
+        QSignalSpy saved(&c, &LauncherController::proxySaveSucceeded);
+        QVERIFY(c.setProxy("127.0.0.1", 7890));
+        // The refreshed snapshot may carry a discovery error; the save itself succeeded.
+        auto result = readySnapshot();
+        result.insert("error", QJsonObject{{"code", "DESKTOP_DISCOVERY_FAILED"}, {"message", "Not found."}});
+        emit engine.response(2, "set_proxy", result);
+        QCOMPARE(saved.count(), 1);
+        QCOMPARE(c.errorCode(), "DESKTOP_DISCOVERY_FAILED");
+        QVERIFY(!c.busy());
+    }
+    void doubleSubmitSendsOneRequest() {
+        FakeEngineClient engine; LauncherController c(&engine); c.start();
+        engine.reply("snapshot", readySnapshot());
+        QVERIFY(c.setProxy("127.0.0.1", 7890));
+        QVERIFY(!c.setProxy("127.0.0.1", 7891)); // The controller refuses a second concurrent save.
+        QCOMPARE(engine.calls.size(), 2); // snapshot + exactly one set_proxy
+        QCOMPARE(engine.calls.last().method, "set_proxy");
+        QCOMPARE(engine.calls.last().params.value("port").toInt(), 7890);
     }
     void invalidConfigurationCanBeEdited() {
         FakeEngineClient engine; LauncherController c(&engine); c.start();

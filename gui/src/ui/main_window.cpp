@@ -1,4 +1,5 @@
 #include "main_window.h"
+#include "proxy_settings_dialog.h"
 #include "theme.h"
 #include "widgets/info_row.h"
 #include <QApplication>
@@ -197,22 +198,9 @@ void MainWindow::render() {
 }
 void MainWindow::proxyDialog() {
     if (!controller_->allows("can_edit_proxy")) return;
-    QDialog dialog(this); dialog.setWindowTitle("Proxy settings"); dialog.setMinimumWidth(380);
-    auto *layout = new QVBoxLayout(&dialog);
-    layout->setContentsMargins(20,20,20,20); layout->setSpacing(16);
-    layout->addWidget(textLabel("Use a local HTTP or Mixed proxy. The engine validates the address before saving.", &dialog));
-    auto *form = new QFormLayout;
-    const auto proxy = controller_->snapshot().value("proxy").toObject();
-    auto *host = new QLineEdit(proxy.value("host").toString("127.0.0.1"), &dialog);
-    host->setMaxLength(255); host->setAccessibleName("Proxy host");
-    auto *port = new QSpinBox(&dialog); port->setRange(1,65535);
-    port->setValue(proxy.value("port").toInt(10808)); port->setAccessibleName("Proxy port");
-    form->addRow("&Host", host); form->addRow("&Port", port); layout->addLayout(form);
-    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Save | QDialogButtonBox::Cancel, &dialog);
-    connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
-    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
-    layout->addWidget(buttons);
-    if (dialog.exec() == QDialog::Accepted) controller_->setProxy(host->text(), port->value());
+    if (!proxyDialog_) proxyDialog_ = new ProxySettingsDialog(controller_, this);
+    proxyDialog_->reset();
+    proxyDialog_->open();
 }
 void MainWindow::backendDialog() {
     if (!controller_->allows("can_authorize_backend_proxy")) return;

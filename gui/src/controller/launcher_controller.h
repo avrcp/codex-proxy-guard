@@ -23,7 +23,9 @@ public:
     bool allows(const QString &action) const;
     void start();
     void refresh();
-    void setProxy(const QString &host, int port);
+    // Returns whether the save request was submitted; completion is reported
+    // through proxySaveSucceeded / proxySaveFailed / proxySaveOutcomeUnknown.
+    bool setProxy(const QString &host, int port);
     void setBackendConsent(bool enabled, const QString &token);
     void launch(bool repair = false, const QString &token = {});
     void cancel();
@@ -31,6 +33,11 @@ public:
 signals:
     void changed();
     void closed();
+    // Result of the single outstanding set_proxy request; success means the
+    // engine confirmed the write, never that a snapshot discovered the Desktop.
+    void proxySaveSucceeded();
+    void proxySaveFailed(const QString &code, const QString &message);
+    void proxySaveOutcomeUnknown(const QString &reason);
 private:
     void send(const QString &method, const QJsonObject &params = {});
     void report(const QString &code, const QString &message);
@@ -43,6 +50,7 @@ private:
     bool closing_ = false;
     bool engineStopped_ = true;
     bool closeCompletionQueued_ = false;
+    bool savingProxy_ = false;
     quint64 operation_ = 0;
     QString message_ = QStringLiteral("Connecting to engine…");
     QString errorCode_;

@@ -33,6 +33,13 @@ LauncherController::LauncherController(IEngineClient *engine, QObject *parent)
                 errorCode_ = error.value("code").toString();
                 errorMessage_ = error.value("message").toString();
             }
+            // A set_proxy response is the engine's confirmation of the write.
+            // A discovery error carried by the refreshed snapshot is a separate
+            // observation and does not turn the confirmed save into a failure.
+            if (method == "set_proxy" && savingProxy_) {
+                savingProxy_ = false;
+                emit proxySaveSucceeded();
+            }
         }
         emit changed();
     });
@@ -75,12 +82,22 @@ LauncherController::LauncherController(IEngineClient *engine, QObject *parent)
         // Its terminal result is authoritative; an obsolete cancel is not a failure.
         if (method == "cancel_operation" && !operation_ && code == "OPERATION_NOT_FOUND") return;
         if (method != "cancel_operation") pending_ = false;
+        if (method == "set_proxy" && savingProxy_) {
+            savingProxy_ = false;
+            emit proxySaveFailed(code, message);
+        }
         report(code, message);
     });
     connect(engine_, &IEngineClient::failed, this, [this](const QString &code, const QString &message) {
         connected_ = false;
         pending_ = false;
         operation_ = 0;
+        // The engine died while a save was in flight; the write may or may not
+        // have landed. Never assume it did not happen and auto-resubmit.
+        if (savingProxy_) {
+            savingProxy_ = false;
+            emit proxySaveOutcomeUnknown(code);
+        }
         report(code, message);
     });
     connect(engine_, &IEngineClient::stopped, this, [this] {
@@ -88,6 +105,10 @@ LauncherController::LauncherController(IEngineClient *engine, QObject *parent)
         pending_ = false;
         operation_ = 0;
         engineStopped_ = true;
+        if (savingProxy_) {
+            savingProxy_ = false;
+            emit proxySaveOutcomeUnknown(QStringLiteral("ENGINE_STOPPED"));
+        }
         if (closing_) completeCloseIfStopped();
         else emit changed();
     });
@@ -106,6 +127,7 @@ void LauncherController::start() {
     snapshot_ = {};
     receipt_ = {};
     errorCode_.clear(); errorMessage_.clear();
+    savingProxy_ = false; // A save from the previous engine session can no longer resolve.
     pending_ = true;
     message_ = "Connecting to engine…";
     emit changed();
@@ -130,11 +152,20 @@ void LauncherController::refresh() {
     receipt_ = {};
     send("snapshot");
 }
-void LauncherController::setProxy(const QString &host, int port) {
-    if (!allows("can_edit_proxy")) return;
+bool LauncherController::setProxy(const QString &host, int port) {
+    if (!allows("can_edit_proxy") || savingProxy_) return false;
     errorCode_.clear(); errorMessage_.clear();
     receipt_ = {};
-    send("set_proxy", {{"host", host}, {"port", port}});
+    pending_ = true;
+    emit changed();
+    if (!engine_->request("set_proxy", {{"host", host}, {"port", port}})) {
+        pending_ = false;
+        if (errorCode_.isEmpty()) report("BRIDGE_BUSY", "The engine cannot accept this request yet. Refresh when it becomes available.");
+        else emit changed();
+        return false;
+    }
+    savingProxy_ = true;
+    return true;
 }
 void LauncherController::setBackendConsent(bool enabled, const QString &token) {
     if (!allows("can_authorize_backend_proxy") || token.isEmpty()) return;

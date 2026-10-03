@@ -16,6 +16,7 @@ add_library(guard_gui STATIC
     src/engine/snapshot.cpp src/engine/snapshot.h
     src/controller/launcher_controller.cpp src/controller/launcher_controller.h
     src/ui/main_window.cpp src/ui/main_window.h
+    src/ui/proxy_settings_dialog.cpp src/ui/proxy_settings_dialog.h
     src/ui/theme.cpp src/ui/theme.h
     src/ui/widgets/info_row.cpp src/ui/widgets/info_row.h
 )

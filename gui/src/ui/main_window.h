@@ -6,6 +6,7 @@ class QPushButton;
 class QProgressBar;
 namespace guard {
 class InfoRow;
+class ProxySettingsDialog;
 class MainWindow final : public QMainWindow {
     Q_OBJECT
 public:
@@ -27,6 +28,7 @@ private:
     QLabel *badge_, *status_;
     QPushButton *launch_, *edit_, *backend_, *repair_, *refresh_, *cancel_, *restart_, *details_;
     QProgressBar *progress_;
+    ProxySettingsDialog *proxyDialog_ = nullptr;
     bool closeReady_ = false;
 };
 }
