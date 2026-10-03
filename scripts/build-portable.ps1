@@ -3,9 +3,11 @@
 Builds and verifies the Windows x64 Qt GUI portable directory and ZIP.
 .DESCRIPTION
 Requires MSVC x64, Visual Studio CMake/Ninja, Python 3 and py7zr. The complete
-pinned Qt SDK is extracted from its verified official archive for each build.
+pinned Qt SDK is extracted from its verified official archive for each build and
+removed afterwards; only the archive cache under target/qt-source persists. The
+produced ZIP is re-verified in place by scripts/verify-package.py before success.
 #>
-param()
+param([string] $Version = '0.6.0-rc.1')
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -116,19 +118,23 @@ function Invoke-Smoke([string] $File, [string] $Arguments, [string] $InputData =
 function Invoke-BridgeSmoke([string] $File, [string] $Version, [string] $Commit) {
     $SmokeDirectory = Join-Path $Root ('target\gui-smoke-' + [Guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $SmokeDirectory -Force | Out-Null
-    $SmokeConfig = Join-Path $SmokeDirectory 'guard.toml'
-    Write-Utf8 $SmokeConfig "[proxy]`nhost = `"127.0.0.1`"`nport = 10808"
-    $ConfigHash = Get-Hash $SmokeConfig
-    $Frames = '{"schema":1,"id":1,"method":"hello","params":{}}' + "`n" + '{"schema":1,"id":2,"method":"shutdown","params":{}}' + "`n"
-    $BridgeOutput = Invoke-Smoke $File "--config `"$SmokeConfig`" bridge" $Frames
-    $Lines = @($BridgeOutput -split '\r?\n')
-    if ($Lines.Count -ne 2) { throw 'Bridge smoke expected exactly hello and shutdown responses.' }
-    $Hello = $Lines[0] | ConvertFrom-Json
-    $Shutdown = $Lines[1] | ConvertFrom-Json
-    if ($Hello.schema -ne 1 -or $Hello.id -ne 1 -or $Hello.ok -ne $true -or $Hello.result.protocol_version -ne 1 -or $Hello.result.engine_version -ne $Version -or $Hello.result.engine_commit -ne $Commit) { throw 'Packaged bridge hello/provenance mismatch.' }
-    if ($Shutdown.schema -ne 1 -or $Shutdown.id -ne 2 -or $Shutdown.ok -ne $true -or $Shutdown.result.shutting_down -ne $true) { throw 'Packaged bridge shutdown failed.' }
-    if ((Get-Hash $SmokeConfig) -ne $ConfigHash -or @(Get-ChildItem -LiteralPath $SmokeDirectory -File).Count -ne 1) { throw 'Read-only bridge smoke unexpectedly modified its isolated configuration.' }
-    return 'hello/shutdown passed; stdin held open; isolated config unchanged'
+    try {
+        $SmokeConfig = Join-Path $SmokeDirectory 'guard.toml'
+        Write-Utf8 $SmokeConfig "[proxy]`nhost = `"127.0.0.1`"`nport = 10808"
+        $ConfigHash = Get-Hash $SmokeConfig
+        $Frames = '{"schema":1,"id":1,"method":"hello","params":{}}' + "`n" + '{"schema":1,"id":2,"method":"shutdown","params":{}}' + "`n"
+        $BridgeOutput = Invoke-Smoke $File "--config `"$SmokeConfig`" bridge" $Frames
+        $Lines = @($BridgeOutput -split '\r?\n')
+        if ($Lines.Count -ne 2) { throw 'Bridge smoke expected exactly hello and shutdown responses.' }
+        $Hello = $Lines[0] | ConvertFrom-Json
+        $Shutdown = $Lines[1] | ConvertFrom-Json
+        if ($Hello.schema -ne 1 -or $Hello.id -ne 1 -or $Hello.ok -ne $true -or $Hello.result.protocol_version -ne 1 -or $Hello.result.engine_version -ne $Version -or $Hello.result.engine_commit -ne $Commit) { throw 'Packaged bridge hello/provenance mismatch.' }
+        if ($Shutdown.schema -ne 1 -or $Shutdown.id -ne 2 -or $Shutdown.ok -ne $true -or $Shutdown.result.shutting_down -ne $true) { throw 'Packaged bridge shutdown failed.' }
+        if ((Get-Hash $SmokeConfig) -ne $ConfigHash -or @(Get-ChildItem -LiteralPath $SmokeDirectory -File).Count -ne 1) { throw 'Read-only bridge smoke unexpectedly modified its isolated configuration.' }
+        return 'hello/shutdown passed; stdin held open; isolated config unchanged'
+    } finally {
+        Remove-Item -LiteralPath $SmokeDirectory -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
 
 Push-Location $Root
@@ -137,6 +143,11 @@ $OriginalQtPluginPath = $Env:QT_PLUGIN_PATH
 try {
     if ((Get-Hash (Join-Path $Root 'backend\third_party\toml++\toml.hpp')) -ne '6b5172ad4dd6519aec67b919181fa7a38a2234131e5b2afa232dfe444819783e') {
         throw 'Vendored toml++ differs from the reviewed upstream release.'
+    }
+    # Keep the script and both CMake default caches on one product version.
+    foreach ($CmakeLists in @('CMakeLists.txt', 'gui\CMakeLists.txt')) {
+        $DefaultVersion = [regex]::Match((Get-Content -LiteralPath (Join-Path $Root $CmakeLists) -Raw), 'CPG_PRODUCT_VERSION "([^"]+)"').Groups[1].Value
+        if ($DefaultVersion -ne $Version) { throw "Product version drift: $CmakeLists default '$DefaultVersion' does not match '$Version'." }
     }
     # These hashes come from the checksum-verified official SDK archive, not
     # from this machine's installation or its self-reported qmake version.
@@ -156,6 +167,8 @@ try {
     $CTest = Join-Path (Split-Path $CMake) 'ctest.exe'
     $Ninja = Join-Path $Vs 'Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe'
     foreach ($Tool in @($CMake, $CTest, $Ninja)) { if (-not (Test-Path -LiteralPath $Tool)) { throw "Required build tool missing: $Tool" } }
+    $Python = Get-Command python.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $Python) { throw 'Python 3 (with py7zr) is required for SDK verification and the final package check.' }
     $Env:PATH = "$QtRoot\bin;$(Split-Path $Ninja);$Env:PATH"
     $Env:QT_PLUGIN_PATH = Join-Path $QtRoot 'plugins'
 
@@ -166,7 +179,6 @@ try {
     $StatusBefore = (@(& git status --porcelain=v1 --untracked-files=all) -join "`n")
     if ($LASTEXITCODE -ne 0) { throw 'Cannot read source status.' }
     $Dirty = [bool]($StatusBefore.Length -gt 0)
-    $Version = '0.6.0-rc.1'
 
     Invoke-Checked $CMake @('--fresh', '-S', $Root, '-B', $Build, '-G', 'Ninja', "-DCMAKE_MAKE_PROGRAM=$Ninja", '-DCMAKE_BUILD_TYPE=Release', "-DCMAKE_PREFIX_PATH=$QtRoot", "-DQt6_DIR=$QtRoot/lib/cmake/Qt6", '-DBUILD_TESTING=ON', "-DCPG_PRODUCT_VERSION=$Version", "-DCPG_BUILD_COMMIT=$Commit", "-DCPG_BUILD_DIRTY=$($Dirty.ToString().ToLowerInvariant())")
     Invoke-Checked $CMake @('--build', $Build, '--config', 'Release', '--parallel')
@@ -265,11 +277,26 @@ try {
     $Zip = Join-Path $Root "dist\CodexProxyGuard-$Version-windows-x86_64.zip"
     Compress-Archive -Path "$Output\*" -DestinationPath $Zip -CompressionLevel Optimal -Force
     Write-Utf8 "$Zip.sha256" "$(Get-Hash $Zip)  $([IO.Path]::GetFileName($Zip))"
+    # Final independent gate: re-open the ZIP and re-verify CRC, sidecar,
+    # every manifest member, deployed Qt hashes and provenance from scratch.
+    # Dirty trees are legitimate development iterations; the strict verifier
+    # requires a clean commit, so it runs exactly when release evidence would.
+    if ($Dirty) {
+        Write-Warning 'Dirty working tree: development ZIP only. The clean-commit package verifier was skipped; this artifact is not release evidence.'
+    } else {
+        Invoke-Checked $Python.Source @((Join-Path $PSScriptRoot 'verify-package.py'), $Zip, '--expected-commit', $Commit)
+    }
     Write-Host "GUI bundle: $Output"
     Write-Host "GUI ZIP: $Zip"
     Write-Host "Source commit: $Commit (dirty: $Dirty)"
 } finally {
     $Env:PATH = $OriginalPath
     if ($null -ne $OriginalQtPluginPath) { $Env:QT_PLUGIN_PATH = $OriginalQtPluginPath } else { Remove-Item Env:QT_PLUGIN_PATH -ErrorAction SilentlyContinue }
+    # The per-run SDK extraction is disposable; only the target/qt-source
+    # archive cache persists between builds.
+    $TargetDir = Join-Path $Root 'target'
+    if ($QtRoot.StartsWith($TargetDir + '\', [StringComparison]::OrdinalIgnoreCase) -and (Split-Path -Leaf $QtRoot).StartsWith('qt-sdk-')) {
+        Remove-Item -LiteralPath $QtRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
     Pop-Location
 }
