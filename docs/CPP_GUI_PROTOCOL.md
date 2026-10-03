@@ -1,7 +1,9 @@
 # GUI stdio protocol 1
 
-The hidden `codex-proxy-guard bridge` command is a child-process transport, not a
-network API. The GUI resolves `engine/codex-proxy-guard.exe` relative to its own
+The hidden `bridge` argument is a child-process transport, not a
+network API. Since 0.6.1 the GUI relaunches its own executable file
+(`QCoreApplication::applicationFilePath()`; formerly a separate
+`engine/codex-proxy-guard.exe`), so
 installation, never through PATH or the current directory. stdout is protocol
 only; raw stderr is retained in a bounded 64 KiB ring and is never displayed.
 
