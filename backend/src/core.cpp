@@ -236,6 +236,70 @@ struct EnvFile {
     bool conflict = false;
 };
 
+// Read-only lexical gate for the authorized Home .env. Codex reads this file
+// with dotenv-style logical lines: while a quote stays open, or after a value
+// ending in a backslash, physical lines are joined into one value. A marker
+// inside such a span is value content, not an independent managed block, so
+// marker recognition and byte-splice editing are only safe when every physical
+// line is an independent single-line construct. Returns the 1-based number of
+// the first line Guard refuses to edit, or 0 when the whole file is safe.
+qsizetype unsafeEnvLine(const QByteArray &bytes)
+{
+    enum class Ctx { Start, Key, Value, Comment };
+    Ctx ctx = Ctx::Start;
+    bool inQuote = false;
+    char quoteChar = 0;
+    bool escaped = false;
+    bool spaced = false;
+    qsizetype line = 1;
+    qsizetype offset = bytes.startsWith("\xef\xbb\xbf") ? 3 : 0;
+    const qsizetype size = bytes.size();
+    for (; offset < size; ++offset) {
+        const char ch = bytes.at(offset);
+        if (inQuote) {
+            if (ch == '\n') return line; // The quoted value spans a physical line.
+            if (escaped) escaped = false;
+            else if (ch == '\\') escaped = true;
+            else if (ch == quoteChar) { inQuote = false; quoteChar = 0; }
+            continue;
+        }
+        if (ch == '\n') {
+            ctx = Ctx::Start;
+            escaped = false;
+            spaced = false;
+            ++line;
+            continue;
+        }
+        if (ctx == Ctx::Comment) continue;
+        if (escaped) { escaped = false; continue; }
+        if (ch == '\\') {
+            // Outside quotes dotenv joins a trailing backslash with the next
+            // physical line; refuse to guess what that continuation means.
+            if (offset + 1 >= size || bytes.at(offset + 1) == '\n') return line;
+            escaped = true;
+            continue;
+        }
+        if (ctx == Ctx::Start) {
+            if (ch == ' ' || ch == '\t') continue;
+            if (ch == '#') { ctx = Ctx::Comment; continue; } // Quotes inside comments never pair.
+            ctx = Ctx::Key;
+        }
+        if (ctx == Ctx::Key) {
+            if (ch == '=') { ctx = Ctx::Value; spaced = false; continue; }
+            if (ch == '\'' || ch == '"') return line; // Quoted key: assignment boundary is not decidable.
+            if (ch == '#') { ctx = Ctx::Comment; continue; } // No assignment on this line.
+            continue;
+        }
+        // Unquoted value context. A hash only starts a trailing comment after
+        // whitespace; before it, it is literal value content.
+        if (ch == '\'' || ch == '"') { inQuote = true; quoteChar = ch; continue; }
+        if ((ch == ' ' || ch == '\t') && !spaced) { spaced = true; continue; }
+        if (ch == '#' && spaced) ctx = Ctx::Comment;
+    }
+    if (inQuote || escaped) return line; // Unterminated quote or trailing backslash at end of file.
+    return 0;
+}
+
 bool generatedNoProxy(const QByteArray &bytes)
 {
     if (bytes.isEmpty() || bytes.size() > 4096 || bytes.contains('\r') || bytes.contains('\n') || bytes.contains('\0')) return false;
@@ -292,6 +356,12 @@ EnvFile readEnv(const QString &path)
     env.exists = true;
     env.bytes = readHandle(file.value, envLimit, "BACKEND_PROXY_ENV_IO");
     if (!strictUtf8(env.bytes)) fail("BACKEND_PROXY_ENV_ENCODING", "The proxy file is not valid UTF-8.");
+    const qsizetype unsafe = unsafeEnvLine(env.bytes);
+    if (unsafe > 0)
+        fail("BACKEND_PROXY_ENV_SYNTAX_UNSUPPORTED",
+             QString("The proxy file uses multi-line or unterminated quoting at line %1; "
+                     "Guard cannot safely edit it automatically. Fix the file manually and retry.")
+                 .arg(unsafe));
     bool inside = false;
     qsizetype offset = 0;
     while (offset < env.bytes.size()) {
@@ -650,7 +720,7 @@ Config updateConsent(const QString &path, const Config &expected, bool enable, c
         catch (const Error &error) {
             static const QSet<QString> reasons{"BACKEND_PROXY_ENV_IO", "BACKEND_PROXY_ENV_ATOMIC_UNAVAILABLE",
                 "BACKEND_PROXY_CONFIG_CONFLICT", "BACKEND_PROXY_BLOCK_INVALID", "BACKEND_PROXY_ENV_ENCODING",
-                "BACKEND_PROXY_SCOPE_UNCONFIRMED"};
+                "BACKEND_PROXY_ENV_SYNTAX_UNSUPPORTED", "BACKEND_PROXY_SCOPE_UNCONFIRMED"};
             const QString reason = reasons.contains(error.code) ? error.code : "BACKEND_PROXY_ENV_FAILURE";
             fail("BACKEND_PROXY_REVOKE_FAILED", "The managed block was not safely removed; consent and its bound Home remain unchanged. Cause: " + reason + ".");
         }
@@ -676,6 +746,7 @@ QString inspectProxyEnv(const Config &config)
         return currentValues(env, config) ? "current" : "stale";
     } catch (const Error &error) {
         if (error.code == "BACKEND_PROXY_ENV_IO") return "unavailable";
+        if (error.code == "BACKEND_PROXY_ENV_SYNTAX_UNSUPPORTED") return "unsupported";
         return "invalid";
     }
 }

@@ -60,7 +60,7 @@ Config updateProxy(const QString &path, const Config &expected, bool invalid,
 Config updateConsent(const QString &path, const Config &expected, bool enable,
                      const QString &confirmedHome);
 QString consentHome(const Config &config);
-QString inspectProxyEnv(const Config &config); // unknown/not_authorized/pending/current/stale/conflict/invalid/unavailable
+QString inspectProxyEnv(const Config &config); // unknown/not_authorized/pending/current/stale/conflict/invalid/unavailable/unsupported
 void prepareProxyEnv(const Config &config);
 void revokeProxyEnv(const QString &home);
 bool strictUtf8(const QByteArray &bytes);

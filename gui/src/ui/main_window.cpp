@@ -170,9 +170,12 @@ void MainWindow::render() {
     const auto processState = process.value("state").toString();
     process_->setValue(knownText(processState, {{"running", "Running"}, {"stopped", "Stopped"}}));
     process_->setTone(processState == "running" ? t.success : t.secondary);
-    coverage_->setValue(knownText(state, {{"not_authorized", "Setup required"}, {"not_applicable", "Process environment"}, {"pending", "Pending next launch"}, {"current", "Configuration current"}, {"stale", "Changed · launch to update"}, {"conflict", "Configuration conflict"}, {"invalid", "Invalid configuration"}, {"unavailable", "Unavailable"}}));
+    coverage_->setValue(knownText(state, {{"not_authorized", "Setup required"}, {"not_applicable", "Process environment"}, {"pending", "Pending next launch"}, {"current", "Configuration current"}, {"stale", "Changed · launch to update"}, {"conflict", "Configuration conflict"}, {"invalid", "Invalid configuration"}, {"unavailable", "Unavailable"}, {"unsupported", "Cannot auto-edit · fix .env manually"}}));
     const bool coverageError = state == "conflict" || state == "invalid" || state == "unavailable";
     coverage_->setTone(state == "current" ? t.success : coverageError ? t.danger : state == "unknown" || state.isEmpty() ? t.secondary : t.warning);
+    coverage_->setToolTip(state == "unsupported"
+        ? "The Codex Home .env uses multi-line or unterminated quoting. Guard refuses to edit it automatically; no network state is implied. Fix the file manually, then retry."
+        : QString());
     launch_->setEnabled(controller_->allows("can_launch"));
     edit_->setEnabled(controller_->allows("can_edit_proxy"));
     backend_->setEnabled(controller_->allows("can_authorize_backend_proxy"));

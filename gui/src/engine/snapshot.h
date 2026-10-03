@@ -7,7 +7,7 @@ namespace guard {
 
 enum class DesktopState { Unknown, Found, Missing };
 enum class ProcessState { Unknown, Stopped, Running };
-enum class Coverage { Unknown, NotApplicable, NotAuthorized, Pending, Current, Stale, Conflict, Invalid, Unavailable };
+enum class Coverage { Unknown, NotApplicable, NotAuthorized, Pending, Current, Stale, Conflict, Invalid, Unavailable, Unsupported };
 
 struct Snapshot {
     QString configReadiness;

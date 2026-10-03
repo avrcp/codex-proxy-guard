@@ -39,6 +39,7 @@ Snapshot Snapshot::fromJson(const QJsonObject &object)
     else if (state == "conflict") s.coverage = Coverage::Conflict;
     else if (state == "invalid") s.coverage = Coverage::Invalid;
     else if (state == "unavailable") s.coverage = Coverage::Unavailable;
+    else if (state == "unsupported") s.coverage = Coverage::Unsupported;
     s.backendEnabled = coverage.value("enabled").toBool(false);
     s.authorizedHome = coverage.value("authorized_home").toString();
     s.candidateHome = coverage.value("candidate_home").toString();

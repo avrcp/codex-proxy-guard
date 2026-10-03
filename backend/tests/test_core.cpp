@@ -205,6 +205,68 @@ private slots:
         QCOMPARE(QDir(root.path()).entryList({".cpg-proxy-env-*.tmp"}, QDir::Files | QDir::Hidden).size(), 0);
         prepareProxyEnv(config); QCOMPARE(inspectProxyEnv(config), "current");
     }
+    void envSyntaxGateRejectsUnsafeBoundaries()
+    {
+        QTemporaryDir root; QVERIFY(root.isValid());
+        const QString env = root.filePath(".env");
+        const QString path = root.filePath("guard.toml");
+        const auto config = authorized(root.path());
+        initializeConfig(path, config, false);
+        const auto originalConfig = readBytes(path);
+        const QByteArray begin = "# BEGIN CODEX PROXY GUARD: proxy-v1\n";
+        const QByteArray end = "# END CODEX PROXY GUARD: proxy-v1\n";
+        const QByteArray inner = "HTTP_PROXY=http://127.0.0.1:10808\nHTTPS_PROXY=http://127.0.0.1:10808\nNO_PROXY=localhost,127.0.0.1,::1\n";
+        // A complete marker block that is only the content of a multi-line
+        // quoted value is not a managed block, and unterminated quoting never
+        // becomes one through appending.
+        const QList<QByteArray> unsafe{
+            "TEMPLATE='\n" + begin + inner + end + "'\n",
+            "TEMPLATE=\"\n" + begin + inner + end + "\"\n",
+            "TEMPLATE='unterminated\n",
+            "TEMPLATE=\"unterminated",
+            "VALUE='esc\\' apen\n",
+            "VALUE=tail\\\nNEXT=1\n",
+            begin + inner + end + "TEMPLATE='open\n"};
+        for (const auto &bytes : unsafe) {
+            writeBytes(env, bytes);
+            QCOMPARE(inspectProxyEnv(config), "unsupported");
+            QCOMPARE(errorCode([&] { prepareProxyEnv(config); }), "BACKEND_PROXY_ENV_SYNTAX_UNSUPPORTED");
+            QCOMPARE(readBytes(env), bytes); // Refusal never touches a byte.
+            QString revokeMessage;
+            try { updateConsent(path, config, false, config.home); }
+            catch (const Error &error) { QCOMPARE(error.code, "BACKEND_PROXY_REVOKE_FAILED"); revokeMessage = error.message; }
+            QVERIFY(!revokeMessage.isEmpty());
+            QVERIFY2(revokeMessage.contains("Cause: BACKEND_PROXY_ENV_SYNTAX_UNSUPPORTED."), qPrintable(revokeMessage));
+            QCOMPARE(readBytes(env), bytes);
+            QCOMPARE(readBytes(path), originalConfig); // Consent and its bound Home survive for retry.
+            QCOMPARE(Config::load(path), config);
+        }
+        // An existing valid block plus later unsupported syntax refuses the
+        // whole edit; Guard never deletes the part that "looks like its own".
+        const QByteArray mixed = begin + inner + end + "TEMPLATE='open\n";
+        writeBytes(env, mixed);
+        QCOMPARE(errorCode([&] { revokeProxyEnv(config.home); }), "BACKEND_PROXY_ENV_SYNTAX_UNSUPPORTED");
+        QCOMPARE(readBytes(env), mixed);
+    }
+    void envSyntaxGateAcceptsSingleLineQuoting()
+    {
+        QTemporaryDir root; QVERIFY(root.isValid());
+        const auto config = authorized(root.path());
+        const QString env = root.filePath(".env");
+        const QByteArray safe = "# someone's \"settings\"\r\n"
+            "OTHER='single quoted value'\r\n"
+            "ANOTHER=\"double \\\"escaped\\\" value\"\r\n"
+            "HASHY=literal#hash\r\n"
+            "TRAILING=value # trailing comment with 'quote'\r\n"
+            "export SIMPLE=plain\r\n";
+        writeBytes(env, safe);
+        prepareProxyEnv(config);
+        QCOMPARE(inspectProxyEnv(config), "current");
+        QVERIFY(readBytes(env).startsWith(safe));
+        QVERIFY(readBytes(env).contains("HTTP_PROXY=http://127.0.0.1:10808\n"));
+        revokeProxyEnv(root.path());
+        QCOMPARE(readBytes(env), safe);
+    }
     void failedRevokePreservesAuthorizationAndFile()
     {
         QTemporaryDir root; QVERIFY(root.isValid()); const QString path = root.filePath("guard.toml");
