@@ -1,10 +1,12 @@
 #include "cli.h"
 #include "bridge.h"
 #include <QCommandLineParser>
+#include <QDirIterator>
 #include <QFile>
 #include <QJsonDocument>
 #include <QTextStream>
 #include <iostream>
+#include <utility>
 #include <windows.h>
 
 namespace {
@@ -83,13 +85,25 @@ bool writeResource(const QString &resourcePath) {
 int licenses() {
     const char separator[] = "\n-----\n\n";
     const HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
-    for (const QString &name : {QStringLiteral("LICENSE"), QStringLiteral("THIRD_PARTY_NOTICES.md")}) {
-        const QString header = "===== " + name + " =====\n";
-        DWORD written = 0;
+    DWORD written = 0;
+    const auto emitChunk = [output, &written](const char *data, size_t size) {
+        return WriteFile(output, data, static_cast<DWORD>(size), &written, nullptr)
+            && written == static_cast<DWORD>(size);
+    };
+    // Deterministic sorted order over the root notices plus every embedded
+    // Qt and third-party license text, preserving resource-relative paths.
+    QStringList entries{QStringLiteral("LICENSE"), QStringLiteral("THIRD_PARTY_NOTICES.md")};
+    QDirIterator iterator(QStringLiteral(":/licenses/Qt"), QDir::Files, QDirIterator::Subdirectories);
+    const QString prefix = QStringLiteral(":/licenses/");
+    while (iterator.hasNext())
+        entries.append(iterator.next().mid(prefix.size()));
+    entries.sort();
+    for (const QString &name : std::as_const(entries)) {
+        const QString header = QStringLiteral("===== ") + name + QStringLiteral(" =====\n");
         const auto headerBytes = header.toUtf8();
-        if (!WriteFile(output, headerBytes.constData(), static_cast<DWORD>(headerBytes.size()), &written, nullptr)) return 1;
-        if (!writeResource(QStringLiteral(":/licenses/") + name)) return 1;
-        if (!WriteFile(output, separator, static_cast<DWORD>(sizeof(separator) - 1), &written, nullptr)) return 1;
+        if (!emitChunk(headerBytes.constData(), static_cast<size_t>(headerBytes.size()))) return 1;
+        if (!writeResource(prefix + name)) return 1;
+        if (!emitChunk(separator, sizeof(separator) - 1)) return 1;
     }
     return 0;
 }

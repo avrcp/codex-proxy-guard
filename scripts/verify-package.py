@@ -165,6 +165,100 @@ def verify_split(runtime_zip: pathlib.Path, bundle: zipfile.ZipFile, files: dict
                           'zip_crc': 'passed', 'split_linkage': 'verified'}, indent=2))
 
 
+def verify_static_single(runtime_zip: pathlib.Path, bundle: zipfile.ZipFile, files: dict,
+                         info: dict, expected_commit: str, qt_source_sha: str) -> None:
+    import os
+    import subprocess
+    import tempfile
+    # The static-single runtime archive carries exactly one member: the EXE.
+    if set(files) != {'CodexProxyGuard.exe'}:
+        raise SystemExit(f'static-single runtime must contain only CodexProxyGuard.exe: {sorted(files)}')
+    manifest_path = runtime_zip.parent / 'release-manifest.json'
+    if not manifest_path.is_file():
+        raise SystemExit('static-single runtime requires release-manifest.json beside it')
+    manifest = json.loads(manifest_path.read_text(encoding='utf-8-sig'))
+    if (manifest.get('schema_version') != 2 or manifest.get('profile') != 'static-single'
+            or isinstance(manifest.get('source_dirty'), str)):
+        raise SystemExit('Release manifest schema mismatch')
+    if manifest['source_commit'] != expected_commit or manifest['source_dirty'] is not False:
+        raise SystemExit('Release manifest does not match the expected clean commit')
+    runtime_record = manifest['runtime_archive']
+    if runtime_record['name'] != runtime_zip.name:
+        raise SystemExit('Release manifest runtime archive name mismatch')
+    if runtime_record['sha256'] != check_sidecar(runtime_zip):
+        raise SystemExit('Release manifest runtime archive digest mismatch')
+    executable = manifest.get('executable', {})
+    if (executable.get('qt_linkage') != 'static' or executable.get('crt_linkage') != 'static'
+            or not manifest.get('qt_static', {}).get('recipe_key')):
+        raise SystemExit('Static provenance incomplete: qt/crt linkage or recipe key missing')
+    if manifest['qt_source']['sha256'] != qt_source_sha:
+        raise SystemExit('Release manifest Qt source digest mismatch')
+
+    exe_bytes = bundle.read(files['CodexProxyGuard.exe'])
+    if digest(exe_bytes) != executable['sha256']:
+        raise SystemExit('Executable digest mismatch against release manifest')
+    if exe_bytes[:2] != b'MZ':
+        raise SystemExit('Executable member is not a PE image')
+
+    # Build information comes from executing the actual packaged executable
+    # with a scratch-only PATH, never from trusting the packaging script JSON.
+    with tempfile.TemporaryDirectory(prefix='cpg-verify-') as scratch:
+        extracted = pathlib.Path(scratch) / 'CodexProxyGuard.exe'
+        extracted.write_bytes(exe_bytes)
+        environment = dict(os.environ)
+        environment['PATH'] = scratch
+        environment.pop('QT_QPA_PLATFORM', None)
+        environment.pop('QT_PLUGIN_PATH', None)
+        completed = subprocess.run([str(extracted), 'build-info'], capture_output=True,
+                                   text=True, timeout=60, env=environment)
+        if completed.returncode != 0:
+            raise SystemExit(f'build-info execution failed: {completed.stderr.strip()}')
+        embedded = json.loads(completed.stdout)
+        if (embedded.get('git_commit') != expected_commit or embedded.get('commit') != expected_commit
+                or embedded.get('version') != manifest['product_version']
+                or embedded.get('product_version') != manifest['product_version']
+                or embedded.get('git_dirty') is not False or embedded.get('dirty') is not False
+                or embedded.get('language') != 'C++20' or embedded.get('protocol_version') != 1):
+            raise SystemExit('Embedded build-info disagrees with the release manifest')
+
+    compliance_zip = runtime_zip.parent / manifest['source_compliance_archive']['name']
+    if not compliance_zip.is_file():
+        raise SystemExit('Source compliance archive listed in the manifest is missing')
+    if file_digest(compliance_zip) != manifest['source_compliance_archive']['sha256']:
+        raise SystemExit('Source compliance archive digest mismatch')
+    with zipfile.ZipFile(compliance_zip) as compliance:
+        compliance_files = member_map(compliance)
+        if 'recipes/qt-static-recipe.json' not in compliance_files:
+            raise SystemExit('Static source compliance package lacks the Qt static recipe')
+        recipe = json.loads(compliance.read('recipes/qt-static-recipe.json').decode('utf-8-sig'))
+        if recipe.get('recipe_key') != manifest['qt_static']['recipe_key']:
+            raise SystemExit('Compliance recipe key disagrees with the release manifest')
+        if recipe.get('qt_source_sha256') != qt_source_sha:
+            raise SystemExit('Compliance recipe Qt source digest mismatch')
+        if digest(compliance.read(f'upstream/{QT_SOURCE_NAME}')) != qt_source_sha:
+            raise SystemExit('Corresponding Qt source mismatch inside compliance archive')
+        revision = compliance.read('SOURCE_REVISION.txt').decode('utf-8-sig')
+        if expected_commit not in revision:
+            raise SystemExit('Source revision does not name the expected commit')
+        compliance_manifest = json.loads(compliance.read('manifest.json').decode('utf-8-sig'))
+        listed = compliance_manifest['files_sha256']
+        if 'manifest.json' in listed:
+            raise SystemExit('Compliance manifest must not hash itself')
+        if set(listed) | {'manifest.json'} != set(compliance_files):
+            raise SystemExit('Unmanifested or missing compliance members')
+        for name, checksum in listed.items():
+            if digest(compliance.read(name)) != checksum:
+                raise SystemExit(f'Compliance member digest mismatch: {name}')
+        print(json.dumps({'version': manifest['product_version'], 'commit': expected_commit,
+                          'dirty': False, 'profile': 'static-single',
+                          'executable_sha256': executable['sha256'],
+                          'qt_linkage': 'static', 'crt_linkage': 'static',
+                          'qt_recipe_key': manifest['qt_static']['recipe_key'],
+                          'runtime_members': 1,
+                          'compliance_members': len(compliance_files),
+                          'zip_crc': 'passed', 'embedded_build_info': 'executed'}, indent=2))
+
+
 def verify_legacy(bundle: zipfile.ZipFile, files: dict, info: dict, expected_commit: str) -> None:
     for name in REQUIRED_RUNTIME_LEGACY:
         if name not in files:
@@ -192,18 +286,27 @@ def main() -> None:
     check_sidecar(args.archive)
     with zipfile.ZipFile(args.archive) as bundle:
         files = member_map(bundle)
-        info = json.loads(bundle.read(files['build-info.json']).decode('utf-8-sig'))
-        if info.get('git_commit') != args.expected_commit or info.get('git_dirty') is not False:
-            raise SystemExit('Package is not the expected clean commit')
-        if info['engine']['language'] != 'C++20' or info['engine']['protocol_version'] != 1:
-            raise SystemExit('Unexpected engine provenance')
-        detected = 'legacy' if any(name.startswith('sources/') for name in files) \
-            else info.get('profile', 'legacy')
+        if set(files) == {'CodexProxyGuard.exe'}:
+            # EXE-only archive: no member manifest exists; the static-single
+            # schema is anchored by the external release manifest instead.
+            detected = 'static-single'
+            info = {}
+        else:
+            info = json.loads(bundle.read(files['build-info.json']).decode('utf-8-sig'))
+            if info.get('git_commit') != args.expected_commit or info.get('git_dirty') is not False:
+                raise SystemExit('Package is not the expected clean commit')
+            if info['engine']['language'] != 'C++20' or info['engine']['protocol_version'] != 1:
+                raise SystemExit('Unexpected engine provenance')
+            detected = 'legacy' if any(name.startswith('sources/') for name in files) \
+                else info.get('profile', 'legacy')
         schema = detected if args.schema == 'auto' else args.schema
         if schema != detected:
             raise SystemExit(f'Package does not match the requested schema: {detected}')
         if schema == 'legacy':
             verify_legacy(bundle, files, info, args.expected_commit)
+        elif schema == 'static-single':
+            verify_static_single(args.archive, bundle, files, info,
+                                 args.expected_commit, args.qt_source_sha256)
         else:
             verify_split(args.archive, bundle, files, info, args.expected_commit,
                          args.qt_source_sha256)
