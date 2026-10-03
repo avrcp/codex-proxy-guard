@@ -15,13 +15,32 @@ public:
     struct Call { QString method; QJsonObject params; };
     QList<Call> calls;
     bool shutdownRequested = false;
-    void start() override { emit ready(); }
+    bool stoppedOnce = false;
+    bool deferShutdownStop = false;
+    // The real bridge resets its one-shot stop notification on start().
+    void start() override { stoppedOnce = false; emit ready(); }
     quint64 request(const QString &method, const QJsonObject &params = {}) override {
         calls.append({method, params}); return static_cast<quint64>(calls.size());
     }
-    void shutdown() override { shutdownRequested = true; emit stopped(); }
+    void shutdown() override {
+        shutdownRequested = true;
+        if (!deferShutdownStop) notifyStopped();
+    }
+    void failAndStop(const QString &code, const QString &message) {
+        emit failed(code, message);
+        notifyStopped();
+    }
     void reply(const QString &method, const QJsonObject &result) { emit response(1, method, result); }
+private:
+    void notifyStopped() {
+        if (stoppedOnce) return;
+        stoppedOnce = true;
+        emit stopped();
+    }
 };
+static QString enginePath(const QString &relative) {
+    return QDir(QCoreApplication::applicationDirPath()).absoluteFilePath(relative);
+}
 static QJsonObject readySnapshot() {
     return {{"config_readiness", "ready"}, {"elevation", "not_elevated"},
         {"desktop", QJsonObject{{"state", "found"}, {"display_name", "ChatGPT Desktop"}, {"package_version", "26.1"}}},
@@ -92,9 +111,97 @@ private slots:
         FakeEngineClient engine; LauncherController c(&engine); c.start(); engine.reply("snapshot", readySnapshot());
         c.launch(); engine.reply("start_launch", {{"operation_id", 1}});
         QSignalSpy closed(&c, &LauncherController::closed); c.close();
-        QVERIFY(engine.shutdownRequested); QCOMPARE(closed.count(), 1);
+        QVERIFY(engine.shutdownRequested); QCOMPARE(closed.count(), 0);
         engine.reply("snapshot", readySnapshot());
+        QTRY_COMPARE(closed.count(), 1);
         QVERIFY(!c.allows("can_launch"));
+    }
+    void realEngineStartFailureThenCloseCompletes() {
+        // Portable package without the engine binary: start fails and the
+        // engine reaches its terminal stopped state long before the user
+        // closes the window. The close must still complete exactly once.
+        EngineBridge engine(enginePath(QStringLiteral("missing/fake-engine-absent.exe")), nullptr);
+        LauncherController c(&engine);
+        QSignalSpy failed(&engine, &IEngineClient::failed);
+        QSignalSpy stopped(&engine, &IEngineClient::stopped);
+        QSignalSpy closed(&c, &LauncherController::closed);
+        c.start();
+        QTRY_COMPARE(failed.count(), 1);
+        QTRY_COMPARE(stopped.count(), 1);
+        QVERIFY(!c.connected());
+        QCOMPARE(closed.count(), 0);
+        c.close();
+        QTRY_COMPARE(closed.count(), 1);
+    }
+    void realEngineCrashThenCloseCompletes() {
+        EngineBridge engine(enginePath(QStringLiteral("fake_engine.exe")), nullptr);
+        LauncherController c(&engine);
+        QSignalSpy stopped(&engine, &IEngineClient::stopped);
+        QSignalSpy closed(&c, &LauncherController::closed);
+        c.start();
+        QTRY_VERIFY(c.connected());
+        QTRY_VERIFY(!c.busy());
+        c.setProxy("crash", 7890); // The fake engine exits; failure and stop are reported.
+        QTRY_COMPARE(stopped.count(), 1);
+        QVERIFY(!c.connected());
+        c.close();
+        QTRY_COMPARE(closed.count(), 1);
+        QCOMPARE(closed.count(), 1);
+    }
+    void realEngineRestartAfterCrashThenCloseWaitsForNewStop() {
+        EngineBridge engine(enginePath(QStringLiteral("fake_engine.exe")), nullptr);
+        LauncherController c(&engine);
+        QSignalSpy ready(&engine, &IEngineClient::ready);
+        QSignalSpy stopped(&engine, &IEngineClient::stopped);
+        QSignalSpy closed(&c, &LauncherController::closed);
+        c.start(); QTRY_VERIFY(c.connected()); QTRY_VERIFY(!c.busy());
+        c.setProxy("crash", 7890);
+        QTRY_COMPARE(stopped.count(), 1);
+        c.start(); // Explicit restart must clear the previous stop fact.
+        QTRY_COMPARE(ready.count(), 2);
+        QTRY_VERIFY(c.connected()); QTRY_VERIFY(!c.busy());
+        c.close();
+        QTRY_COMPARE(stopped.count(), 2);
+        QTRY_COMPARE(closed.count(), 1);
+    }
+    void closeBeforeStopWaitsForTerminalStop() {
+        FakeEngineClient engine; LauncherController c(&engine); c.start(); engine.reply("snapshot", readySnapshot());
+        engine.deferShutdownStop = true; // Engine still cleaning up; no stop notification yet.
+        QSignalSpy closed(&c, &LauncherController::closed);
+        emit engine.failed("ENGINE_IO_FAILED", "Communication failed; cleanup running.");
+        QVERIFY(!c.connected()); // failed alone is not stopped: the child may still be cleaning up.
+        c.close();
+        QCoreApplication::processEvents();
+        QCOMPARE(closed.count(), 0);
+        engine.failAndStop("ENGINE_IO_FAILED", "Cleanup finished.");
+        QTRY_COMPARE(closed.count(), 1);
+    }
+    void closeWithoutStartCompletesOnce() {
+        FakeEngineClient engine; LauncherController c(&engine);
+        QSignalSpy closed(&c, &LauncherController::closed);
+        c.close(); c.close();
+        QVERIFY(engine.shutdownRequested);
+        QCOMPARE(engine.calls.size(), 0);
+        QTRY_COMPARE(closed.count(), 1);
+        QCoreApplication::processEvents();
+        QCOMPARE(closed.count(), 1);
+    }
+    void duplicateCloseAndLateStopEmitClosedOnce() {
+        FakeEngineClient engine; LauncherController c(&engine); c.start(); engine.reply("snapshot", readySnapshot());
+        QSignalSpy closed(&c, &LauncherController::closed);
+        c.close();
+        engine.failAndStop("ENGINE_UNAVAILABLE", "Stopped during close.");
+        c.close(); c.close();
+        QTRY_COMPARE(closed.count(), 1);
+        QCoreApplication::processEvents();
+        QCOMPARE(closed.count(), 1);
+    }
+    void stoppedEngineWindowCloseCompletes() {
+        FakeEngineClient engine; LauncherController c(&engine); MainWindow window(&c);
+        window.show(); QCoreApplication::processEvents();
+        engine.failAndStop("ENGINE_NOT_FOUND", "The bundled engine is missing. Restore the portable package.");
+        window.close(); // The window X must actually close even though no stop notification will follow.
+        QTRY_VERIFY(!window.isVisible());
     }
     void invalidConfigurationCanBeEdited() {
         FakeEngineClient engine; LauncherController c(&engine); c.start();

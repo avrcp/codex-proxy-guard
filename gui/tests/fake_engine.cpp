@@ -34,7 +34,8 @@ int main(int argc, char **argv)
             respond({{"protocol_version", 1}, {"engine_version", "test-only"},
                 {"capabilities", QJsonArray{"snapshot", "set_proxy", "backend_proxy_consent", "launch", "repair", "cancel"}}});
         } else if (method == "snapshot") {
-            respond({{"config_readiness", "ready"}});
+            respond({{"config_readiness", "ready"},
+                     {"actions", QJsonObject{{"can_edit_proxy", true}, {"can_refresh", true}}}});
         } else if (method == "set_proxy") {
             const auto scenario = params.value("host").toString();
             if (scenario == "crash") return 17;

@@ -77,7 +77,8 @@ LauncherController::LauncherController(IEngineClient *engine, QObject *parent)
         connected_ = false;
         pending_ = false;
         operation_ = 0;
-        if (closing_) emit closed();
+        engineStopped_ = true;
+        if (closing_) completeCloseIfStopped();
         else emit changed();
     });
 }
@@ -98,6 +99,9 @@ void LauncherController::start() {
     pending_ = true;
     message_ = "Connecting to engine…";
     emit changed();
+    // start() may synchronously report failure and the terminal stop; the
+    // previous stop fact must not survive into the new engine lifetime.
+    engineStopped_ = false;
     engine_->start();
 }
 void LauncherController::send(const QString &method, const QJsonObject &params) {
@@ -149,6 +153,17 @@ void LauncherController::close() {
     message_ = "Closing safely…";
     emit changed();
     engine_->shutdown();
+    // The engine may already be in its terminal stopped state (start failure,
+    // crash cleanup finished earlier). No further stopped notification will
+    // arrive, so the close must complete from the recorded terminal fact.
+    completeCloseIfStopped();
+}
+void LauncherController::completeCloseIfStopped() {
+    if (!closing_ || !engineStopped_ || closeCompletionQueued_) return;
+    closeCompletionQueued_ = true;
+    QMetaObject::invokeMethod(this, [this] {
+        emit closed();
+    }, Qt::QueuedConnection);
 }
 void LauncherController::report(const QString &code, const QString &message) {
     errorCode_ = code; errorMessage_ = message;

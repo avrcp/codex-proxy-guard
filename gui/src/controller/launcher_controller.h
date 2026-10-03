@@ -34,12 +34,15 @@ signals:
 private:
     void send(const QString &method, const QJsonObject &params = {});
     void report(const QString &code, const QString &message);
+    void completeCloseIfStopped();
     IEngineClient *engine_;
     QJsonObject snapshot_;
     QJsonObject receipt_;
     bool connected_ = false;
     bool pending_ = false;
     bool closing_ = false;
+    bool engineStopped_ = true;
+    bool closeCompletionQueued_ = false;
     quint64 operation_ = 0;
     QString message_ = QStringLiteral("Connecting to engine…");
     QString errorCode_;
