@@ -95,7 +95,7 @@ function Assert-OfficialQtSdk {
 }
 
 # Read GUI output through a bounded pipe even though it is a Windows subsystem EXE.
-function Invoke-Smoke([string] $File, [string] $Arguments, [string] $InputData = '') {
+function Invoke-Smoke([string] $File, [string] $Arguments, [string] $InputData = '', [int] $OutputLimit = 65536) {
     $Start = New-Object Diagnostics.ProcessStartInfo
     $Start.FileName = $File
     $Start.Arguments = $Arguments
@@ -132,7 +132,7 @@ function Invoke-Smoke([string] $File, [string] $Arguments, [string] $InputData =
                 if (-not $Done[$Index] -and $Reads[$Index].IsCompleted) {
                     $Count = $Reads[$Index].GetAwaiter().GetResult()
                     if ($Count -eq 0) { $Done[$Index] = $true; continue }
-                    if ($Texts[$Index].Length + $Count -gt 65536) { throw 'Oversized smoke output' }
+                    if ($Texts[$Index].Length + $Count -gt $OutputLimit) { throw 'Oversized smoke output' }
                     $null = $Texts[$Index].Append($Buffers[$Index], 0, $Count)
                     $Reads[$Index] = $Readers[$Index].ReadAsync($Buffers[$Index], 0, 1024)
                 }
@@ -430,8 +430,10 @@ try {
         Remove-Item Env:QT_QPA_PLATFORM -ErrorAction SilentlyContinue
         if ((Get-Hash "$Output\CodexProxyGuard.exe") -ne $EngineHash) { throw 'Packaged executable hash changed during verification.' }
         $BridgeSmoke = Invoke-BridgeSmoke "$Output\CodexProxyGuard.exe" $Version $Commit
-        $Licenses = Invoke-Smoke "$Output\CodexProxyGuard.exe" 'licenses'
-        if ($Licenses -notmatch 'MIT License' -or $Licenses -notmatch 'THIRD_PARTY_NOTICES' -or $Licenses -notmatch 'LGPL-3.0-only') { throw 'Embedded licenses output is incomplete.' }
+        # The full embedded notice set is several hundred kilobytes; the bound
+        # stays explicit instead of unbounded.
+        $Licenses = Invoke-Smoke "$Output\CodexProxyGuard.exe" 'licenses' '' 2097152
+        if ($Licenses -notmatch 'MIT License' -or $Licenses -notmatch 'THIRD_PARTY_NOTICES' -or $Licenses -notmatch 'LGPL-3.0-only' -or $Licenses -notmatch 'GPL-3.0-only' -or $Licenses -notmatch 'toml') { throw 'Embedded licenses output is incomplete.' }
         # Import-table gate: normal and delay imports may not depend on Qt,
         # MSVC dynamic runtime or unexpected third-party DLLs. Normal Windows
         # system DLLs and API sets are expected and allowed.

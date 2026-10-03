@@ -13,20 +13,22 @@ target_link_libraries(CodexProxyGuard PRIVATE guard_startup guard_gui guard_engi
 # and every Qt license text from the pinned SDK manifest directory. The
 # headless `licenses` command streams these without GUI, config or network.
 file(GLOB CPG_LICENSE_FILES CONFIGURE_DEPENDS
-    "${CMAKE_SOURCE_DIR}/LICENSE"
-    "${CMAKE_SOURCE_DIR}/THIRD_PARTY_NOTICES.md"
     "${CMAKE_SOURCE_DIR}/licenses/Qt/*.txt"
     "${CMAKE_SOURCE_DIR}/licenses/Qt/*.json")
 file(GLOB_RECURSE CPG_THIRD_PARTY_NOTICE_FILES CONFIGURE_DEPENDS
     "${CMAKE_SOURCE_DIR}/licenses/Qt/third-party/*")
 list(APPEND CPG_LICENSE_FILES ${CPG_THIRD_PARTY_NOTICE_FILES})
-list(FILTER CPG_LICENSE_FILES EXCLUDE REGEX "sdk-6\\.8\\.3-msvc2022-x64\\.json$")
+list(FILTER CPG_LICENSE_FILES EXCLUDE REGEX "sdk-6\.8\.3-msvc2022-x64\.json$")
 if(NOT CPG_LICENSE_FILES)
     message(FATAL_ERROR "No license files found to embed")
 endif()
 qt_add_resources(CodexProxyGuard "notices"
     PREFIX "/licenses"
     BASE "${CMAKE_SOURCE_DIR}"
+    FILES "${CMAKE_SOURCE_DIR}/LICENSE" "${CMAKE_SOURCE_DIR}/THIRD_PARTY_NOTICES.md")
+qt_add_resources(CodexProxyGuard "qt_notices"
+    PREFIX "/licenses"
+    BASE "${CMAKE_SOURCE_DIR}/licenses"
     FILES ${CPG_LICENSE_FILES})
 if(MSVC)
     target_compile_options(CodexProxyGuard PRIVATE /W4 /WX /utf-8 /permissive-)
