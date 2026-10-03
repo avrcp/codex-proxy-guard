@@ -120,14 +120,20 @@ unchanged from above: live Desktop activation, live shared-daemon interruption,
 clean Windows VM, Windows 10, UNC, high-DPI/screen-reader and signing acceptance
 (V1 manual matrix remains pending operator authorization).
 
-Final release artifact: `scripts/build-portable.cmd` ran from the clean merge
-commit `ba176b1` on `main` (`git_dirty=false`; the script re-ran all seven
-suites, 100% passed). `dist/gui/build-info.json` records product `0.6.0-rc.1`,
-Qt 6.8.3, C++20 engine, GUI and engine commit `ba176b1`, deployed Qt DLL hashes
+Final release artifact: after the packaging-script hardening (`ef159bf`), the
+whole `dist/` tree was rebuilt from scratch. `scripts/build-portable.cmd` ran
+from clean commit `ef159bf` on `main` (`git_dirty=false`; the script re-ran all
+seven suites, 100% passed, and — new in this round — executed
+`scripts/verify-package.py` itself as the final gate: 129 manifest members,
+ZIP CRC passed). `dist/gui/build-info.json` records product `0.6.0-rc.1`, Qt
+6.8.3, C++20 engine, GUI and engine commit `ef159bf`, deployed Qt DLL hashes
 equal to the verified official SDK, and engine bridge smoke (hello/shutdown
 passed; stdin held open; isolated config unchanged). ZIP:
 `CodexProxyGuard-0.6.0-rc.1-windows-x86_64.zip`, SHA-256
-`914e97440c46d0cba978f790f841ee448992460cd094613f474ac4d29c448eda`
-(member manifest in `dist/gui/SHA256SUMS.txt`). Rust toolchain-era working-tree
-leftovers (`target/` cache markers, fixtures and logs, `aqtinstall.log`) were
-removed after packaging; only C++ build outputs remain.
+`16e0de0d542e31b9b8a01a6114158c9c76d55d98772090d85f5c4ed87ba67639`
+(independently recomputed; member manifest in `dist/gui/SHA256SUMS.txt`). The
+earlier `ba176b1` ZIP was discarded together with the whole old `dist/` tree;
+the canonical script now also removes its per-run Qt SDK extraction and smoke
+scratch directories, and `target/` holds no Rust-era artifacts (`CACHEDIR.TAG`,
+cargo `debug`/`release`/target-triple directories, rust test logs and probe
+fixtures were deleted; `aqtinstall.log` removed from the repository root).
