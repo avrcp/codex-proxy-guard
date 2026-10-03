@@ -1,4 +1,6 @@
 #include "bridge.h"
+#include <QDir>
+#include <QFile>
 #include <QJsonDocument>
 #include <QProcess>
 #include <QTemporaryDir>
@@ -141,6 +143,28 @@ private slots:
         QVERIFY(process.waitForFinished(5000)); QCOMPARE(process.exitCode(), 0);
         const auto info = QJsonDocument::fromJson(process.readAllStandardOutput()).object();
         QCOMPARE(info.value("language").toString(), "C++20"); QVERIFY(!QFile::exists(path));
+    }
+    void licensesCommandStreamsTheEmbeddedNotices() {
+        // The GUI licenses viewer consumes this exact stream, so its content
+        // contract is anchored here against the production executable.
+        QProcess process; process.start(TARGET_ENGINE_PATH, {"licenses"});
+        QVERIFY(process.waitForFinished(10000)); QCOMPARE(process.exitCode(), 0);
+        const QByteArray output = process.readAllStandardOutput();
+        QVERIFY(output.size() > 100 * 1024);   // measured corpus ≈ 380 KiB at 0.6.1-rc.1
+        QVERIFY(output.contains("===== LICENSE ====="));
+        QVERIFY(output.contains("===== THIRD_PARTY_NOTICES.md ====="));
+        QVERIFY(output.endsWith("\n-----\n\n"));
+    }
+    void renamedExecutableInUnicodeDirectoryStaysHeadless() {
+        QTemporaryDir dir;
+        const QDir target(QDir(dir.path()).filePath(QStringLiteral("许 可 目录")));
+        QVERIFY(target.mkpath("."));
+        const QString copied = target.filePath(QStringLiteral("守卫 exe.exe"));
+        QVERIFY(QFile::copy(TARGET_ENGINE_PATH, copied));
+        QProcess process; process.start(copied, {"licenses"});
+        QVERIFY(process.waitForStarted(5000)); QVERIFY(process.waitForFinished(10000));
+        QCOMPARE(process.exitCode(), 0);
+        QVERIFY(!process.readAllStandardOutput().isEmpty());
     }
 };
 QTEST_GUILESS_MAIN(BridgeTests)

@@ -65,8 +65,9 @@ protocol.
   `licenses` notice streamer. CLI, console and bridge share the same core
   transactions and launch pipeline.
 - `gui/src`: process client, protocol decoder, controller, accessible Qt Widgets,
-  and `gui_entry.cpp` (`runGui`) performing GUI initialization for the QApplication
-  the entry point constructed.
+  the offline licenses viewer (a short-lived same-EXE `licenses` child with bounded
+  output and deadlines) and `gui_entry.cpp` (`runGui`) performing GUI initialization
+  for the QApplication the entry point constructed.
 - `app/`: the single production entry, role classification and the embedded
   notice resources.
 
@@ -133,7 +134,11 @@ system DLLs and API sets are the only accepted dependencies.
 
 Notices are embedded as resources (project MIT license, third-party notices and
 the complete Qt license text set) and streamed by the `licenses` command without
-GUI, configuration or network access. Corresponding source ships in the separate
+GUI, configuration or network access. The GUI's Help → About "Licenses /
+Third-party notices" viewer displays the same stream offline by spawning this
+executable's `licenses` role once (never the bridge protocol) and decoding the
+complete bounded byte buffer in one pass; closing the window aborts and reaps
+only that Guard-owned child. Corresponding source ships in the separate
 source-compliance archive described by `THIRD_PARTY_NOTICES.md`; replacing Qt in
 a static build means rebuilding the static SDK per `docs/STATIC_QT_REBUILD.md`.
 

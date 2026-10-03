@@ -6,6 +6,7 @@ class QPushButton;
 class QProgressBar;
 namespace guard {
 class InfoRow;
+class LicensesDialog;
 class ProxySettingsDialog;
 class MainWindow final : public QMainWindow {
     Q_OBJECT
@@ -19,6 +20,7 @@ protected:
 private:
     void render();
     void proxyDialog();
+    void licensesDialog();
     void backendDialog();
     void repairDialog();
     void errorDialog();
@@ -29,6 +31,7 @@ private:
     QPushButton *launch_, *edit_, *backend_, *repair_, *refresh_, *cancel_, *restart_, *details_;
     QProgressBar *progress_;
     ProxySettingsDialog *proxyDialog_ = nullptr;
+    LicensesDialog *licensesDialog_ = nullptr;
     bool closeReady_ = false;
 };
 }

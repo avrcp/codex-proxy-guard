@@ -1,4 +1,5 @@
 #include "main_window.h"
+#include "licenses_dialog.h"
 #include "proxy_settings_dialog.h"
 #include "theme.h"
 #include "widgets/info_row.h"
@@ -267,7 +268,27 @@ void MainWindow::errorDialog() {
     }
 }
 void MainWindow::aboutDialog() {
-    QMessageBox::about(this, "About Codex Proxy Guard", QStringLiteral("Codex Proxy Guard %1\nQt %2 · protocol 1\n\nEnter: Launch  ·  C / Ctrl+,: Proxy\nB: Codex proxy  ·  D: Repair\nR / F5: Refresh  ·  Esc: Close dialog\n\nProxy preparation is not network verification.\nClosing Guard never terminates Desktop.\n\nApplication: MIT · Qt: LGPLv3\nSee THIRD_PARTY_NOTICES.md and licenses in the portable folder.").arg(CPG_PRODUCT_VERSION, qVersion()));
+    QDialog dialog(this);
+    dialog.setWindowTitle("About Codex Proxy Guard");
+    dialog.setMinimumWidth(430);
+    auto *layout = new QVBoxLayout(&dialog);
+    layout->setSpacing(16);
+    auto *about = textLabel(QStringLiteral("Codex Proxy Guard %1\nQt %2 · protocol 1\n\nEnter: Launch  ·  C / Ctrl+,: Proxy\nB: Codex proxy  ·  D: Repair\nR / F5: Refresh  ·  Esc: Close dialog\n\nProxy preparation is not network verification.\nClosing Guard never terminates Desktop.\n\nApplication: MIT · Qt: LGPLv3\nComplete license texts are embedded in this executable.").arg(CPG_PRODUCT_VERSION, qVersion()), &dialog);
+    about->setTextInteractionFlags(Qt::TextSelectableByMouse | Qt::TextSelectableByKeyboard);
+    layout->addWidget(about);
+    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Close, &dialog);
+    auto *licenses = buttons->addButton("Licenses / Third-party notices", QDialogButtonBox::ActionRole);
+    licenses->setAccessibleName("Open the embedded licenses and third-party notices");
+    // The licenses window is modeless; the About dialog is modal, so it steps
+    // aside instead of blocking the reader it just opened.
+    connect(licenses, &QPushButton::clicked, &dialog, [this, &dialog] { dialog.close(); licensesDialog(); });
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    layout->addWidget(buttons);
+    dialog.exec();
+}
+void MainWindow::licensesDialog() {
+    if (!licensesDialog_) licensesDialog_ = new LicensesDialog(this);
+    licensesDialog_->present();
 }
 void MainWindow::closeEvent(QCloseEvent *event) {
     if (closeReady_) { event->accept(); return; }

@@ -18,6 +18,8 @@ GUI 可修改 loopback 地址与端口、刷新本地状态、授权或撤销后
 
 修复启动每次单独确认，可执行一次公开的 `codex app-server daemon stop`，可能中断其他客户端共享任务。注册应用必须先授权并成功准备代理块。关闭 Guard 不会终止 Desktop；提交激活后取消可能只能报告结果未知，不能自动重试。即使引擎已离线或已崩溃，关闭窗口仍会正常完成，无需任务管理器。
 
+许可与第三方声明全部内嵌在 EXE 内，不依赖 portable 目录或网络：GUI 从 Help → About 打开 "Licenses / Third-party notices" 离线查看、选择与复制完整文本；读取由 GUI 以自身 EXE 的 headless `licenses` 角色派生一个短期子进程完成（有界输出与超时，关闭窗口即回收），CLI 侧 `licenses` 子命令输出同一内容。
+
 ## CLI 与控制台
 
 无参数启动进入 GUI。`--config PATH`（无子命令）以指定配置启动 GUI，并把同一绝对路径传给自身桥进程；`--smoke-test` 构造并关闭窗口（测试用）。所有 headless 角色共用同一个 EXE：

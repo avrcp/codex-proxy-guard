@@ -11,10 +11,12 @@ qt_standard_project_setup()
 # CMakeLists only; this subdirectory inherits them (single source of truth).
 add_library(guard_gui STATIC
     src/engine/engine_bridge.cpp src/engine/engine_bridge.h
+    src/engine/licenses_reader.cpp src/engine/licenses_reader.h
     src/engine/protocol.cpp src/engine/protocol.h
     src/engine/snapshot.cpp src/engine/snapshot.h
     src/controller/launcher_controller.cpp src/controller/launcher_controller.h
     src/gui_entry.cpp src/gui_entry.h
+    src/ui/licenses_dialog.cpp src/ui/licenses_dialog.h
     src/ui/main_window.cpp src/ui/main_window.h
     src/ui/proxy_settings_dialog.cpp src/ui/proxy_settings_dialog.h
     src/ui/theme.cpp src/ui/theme.h
@@ -35,7 +37,11 @@ if(BUILD_TESTING)
     find_package(Qt6 6.8 REQUIRED COMPONENTS Test)
     add_executable(fake_engine tests/fake_engine.cpp)
     target_link_libraries(fake_engine PRIVATE Qt6::Core)
-    foreach(test_name protocol_tests controller_tests engine_bridge_tests)
+    # Scenario double for the licenses reader: deterministic stdout/stderr
+    # shapes (split multi-byte chunks, floods, hangs) without any real EXE.
+    add_executable(fake_licenses tests/fake_licenses.cpp)
+    target_link_libraries(fake_licenses PRIVATE Qt6::Core)
+    foreach(test_name protocol_tests controller_tests engine_bridge_tests licenses_tests)
         qt_add_executable(${test_name} tests/${test_name}.cpp)
         target_link_libraries(${test_name} PRIVATE guard_gui Qt6::Test)
         if(MSVC)
@@ -58,7 +64,9 @@ if(BUILD_TESTING)
     endforeach()
     if(MSVC)
         target_compile_options(fake_engine PRIVATE /W4 /WX /utf-8 /permissive-)
+        target_compile_options(fake_licenses PRIVATE /W4 /WX /utf-8 /permissive-)
     endif()
     add_dependencies(engine_bridge_tests fake_engine)
     add_dependencies(controller_tests fake_engine)
+    add_dependencies(licenses_tests fake_licenses)
 endif()
