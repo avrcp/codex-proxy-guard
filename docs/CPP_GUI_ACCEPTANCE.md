@@ -123,6 +123,19 @@ The remediation raised `border` to dark `#6a88a3` / light `#6b7f8f`; that change
 knock-on collision with the progress chunk (1.72 / 1.55) was found by recomputation
 and fixed in the same edit, not by eye.
 
+## Static release built from this remediation (2026-10-03)
+
+`scripts/build-portable.cmd -StaticQt` (pinned SDK `4b51c65c2f89e9b0`) ran from the
+clean, pushed commit `6923ebc0024686f424f110d952858097d17c4213`: all 10 CTest suites
+green on the static build, then promoted to
+`dist/releases/0.6.1-rc.1-6923ebc0/CodexProxyGuard.exe` (18,290,688 bytes,
+SHA-256 `aecf9efb4defdf66241cbb5fca16e6942fc729a4d177f9b8da42efd38da84c12`,
+independently recomputed after packaging; the embedded build-info was executed from
+the packaged EXE by the verifier). Import-table scan of the packaged EXE: Windows
+system DLLs only — no Qt, MSVC CRT or third-party DLL dependencies, matching the
+`qt_linkage: static` / `crt_linkage: static` manifest. Unsigned; Authenticode not
+claimed.
+
 ## Explicitly not claimed
 
 - Assistive screen-reader exercise (NVDA/Narrator), Windows 10, clean-machine and
