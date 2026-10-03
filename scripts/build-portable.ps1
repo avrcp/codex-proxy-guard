@@ -434,16 +434,22 @@ try {
         # stays explicit instead of unbounded.
         $Licenses = Invoke-Smoke "$Output\CodexProxyGuard.exe" 'licenses' '' 2097152
         if ($Licenses -notmatch 'MIT License' -or $Licenses -notmatch 'THIRD_PARTY_NOTICES' -or $Licenses -notmatch 'LGPL-3.0-only' -or $Licenses -notmatch 'GPL-3.0-only' -or $Licenses -notmatch 'toml') { throw 'Embedded licenses output is incomplete.' }
+        $Env:PATH = $OriginalPath
         # Import-table gate: normal and delay imports may not depend on Qt,
         # MSVC dynamic runtime or unexpected third-party DLLs. Normal Windows
         # system DLLs and API sets are expected and allowed.
-        $Dumpbin = Get-Command dumpbin.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-        if (-not $Dumpbin) { throw 'dumpbin.exe is required for the static import-table gate (run from a VS developer environment).' }
-        $Dependents = (& $Dumpbin.Source /DEPENDENTS "$Output\CodexProxyGuard.exe" | Select-String -Pattern '^\s+(\S+\.dll)$').Matches | ForEach-Object { $_.Value.Trim() }
+        # VsDevCmd does not necessarily expose the VC tools bin on PATH; the
+        # import gate locates dumpbin through the resolved MSVC toolchain.
+        $MsvcForDumpbin = "${Env:VCToolsVersion}"
+        if ([string]::IsNullOrWhiteSpace($MsvcForDumpbin)) {
+            $MsvcForDumpbin = (Get-Content -LiteralPath (Join-Path $Vs 'VC\Auxiliary\Build\Microsoft.VCToolsVersion.default.txt') -Raw).Trim()
+        }
+        $DumpbinPath = Join-Path $Vs ("VC\Tools\MSVC\" + $MsvcForDumpbin + "\bin\Hostx64\x64\dumpbin.exe")
+        if (-not (Test-Path -LiteralPath $DumpbinPath -PathType Leaf)) { throw "dumpbin.exe is required for the static import-table gate: $DumpbinPath" }
+        $Dependents = (& $DumpbinPath /DEPENDENTS "$Output\CodexProxyGuard.exe" | Select-String -Pattern '^\s+(\S+\.dll)$').Matches | ForEach-Object { $_.Value.Trim() }
         $Forbidden = @($Dependents | Where-Object { $_ -match '^(Qt6|msvcp140|vcruntime140|concrt140|vccorlib140)' -or $_ -match '^(libgcc|libstdc\+\+|libwinpthread|icu|libssl|libcrypto)' })
         if ($Forbidden.Count -gt 0) { throw "Static executable must not import dynamic dependencies: $($Forbidden -join ', ')" }
         $ImportScan = @{ dependents = @($Dependents); forbidden = @(); tool = 'dumpbin /DEPENDENTS' }
-        $Env:PATH = $OriginalPath
         $DeployedQt = [ordered]@{}
         $Files = [ordered]@{ 'CodexProxyGuard.exe' = $EngineHash }
         $Info = [ordered]@{
@@ -464,6 +470,9 @@ try {
         Compress-Directory $Output $RuntimeZip -Files @('CodexProxyGuard.exe')
         Write-Utf8 "$RuntimeZip.sha256" "$(Get-Hash $RuntimeZip)  $RuntimeZipName"
 
+        # The verifier runs inside the staging directory before promotion, so
+        # the compliance archive must be staged beside the transport ZIP.
+        $ComplianceZip = Join-Path $Output $ComplianceZipName
         $Compliance = New-SourceCompliance $Commit
         Write-Utf8 "$ComplianceZip.sha256" "$($Compliance.sha256)  $ComplianceZipName"
         $ReleaseDirectory = Join-Path $Root ("dist\releases\$Version-" + $Commit.Substring(0, 8))

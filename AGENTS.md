@@ -17,14 +17,23 @@ stale or unhealthy index.
   owned helpers and native application-model activation/identity observation.
 - `backend/src/launch.*`: proxy plans/environment, startup locking, public daemon
   compatibility and shared launch orchestration.
-- `backend/src/bridge.*` and `main.cpp`: foreground state boundary, versioned
-  stdio bridge, minimal CLI and interactive console.
-- `gui/`: Qt Widgets, controller and child-process client; no system-operation
-  duplication. All production code is C++20; no Rust/FFI fallback.
+- `backend/src/bridge.*` and `cli.*`: foreground state boundary, versioned
+  stdio bridge, minimal CLI, `licenses` notice streamer and interactive console.
+- `gui/`: Qt Widgets, controller and child-process client plus `gui_entry.*`;
+  no system-operation duplication. All production code is C++20; no Rust/FFI
+  fallback.
+- `app/`: the single production entry point. `startup_mode.*` classifies the
+  Unicode command line into the GUI or headless role before any Application
+  object is constructed; `main.cpp` then builds exactly one QApplication or
+  QCoreApplication. GUI and bridge are separate processes of the same
+  executable file (`applicationFilePath()` relaunch); the activation worker
+  spawns the same way. `guard_gui` never links `guard_engine` business code.
 
 Preserve the state boundary `Action -> candidate reduce -> authorize -> commit ->
 dispatch -> TaskResult`. Only one foreground operation may be active. Guard shutdown
-must not terminate Desktop.
+must not terminate Desktop. Guard reaps only its own children through held
+process handles — never by executable name (GUI, bridge and worker share one
+EXE).
 
 ## Security invariants
 
@@ -95,11 +104,16 @@ the shared daemon.
 
 ```powershell
 codegraph status .
-.\scripts\test-cpp.ps1
+.\scripts\test-cpp.ps1          # dynamic SDK development build + all suites
+.\scripts\test-cpp.ps1 -StaticQt -QtRoot target\qt-static\<key>\install -BuildDirectory target\cpp-static-dev
 git diff --check
-.\scripts\build-portable.cmd
+.\scripts\build-portable.cmd -StaticQt   # canonical single-file release (clean tree)
 ```
 
-Windows portable artifacts must always come from the canonical script. Completion also
-requires release build/package smoke, SHA/build-info verification, diff review, and
-documentation synchronization.
+Windows portable artifacts must always come from the canonical script; the
+static single-file release additionally requires the pinned static Qt SDK
+(`scripts\build-qt-static.ps1`, cached under `target\qt-static\<recipe-key>`).
+Completion also requires release build/package smoke, SHA/build-info
+verification (verifier executes the packaged EXE), import-table scan, diff
+review, and documentation synchronization. Automated tests must never touch a
+real Codex Home, start the real Desktop or stop a shared daemon.

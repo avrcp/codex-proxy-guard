@@ -2,8 +2,49 @@
 
 The application is C++20 throughout, using Qt 6.8.3 and the Windows SDK. The
 Qt Widgets GUI remains isolated from system operations by a versioned stdio
-bridge. Both executables are built by the root CMake project with MSVC /W4 /WX.
-There is no Rust, FFI, Qt Network, private Codex IPC or telemetry component.
+bridge. There is exactly one production executable — `CodexProxyGuard.exe` —
+which selects its process role from structured argument classification before
+any Application object exists. It is built by the root CMake project with MSVC
+/W4 /WX and links the pinned static Qt SDK with the static CRT (/MT) for the
+release profile. There is no Rust, FFI, Qt Network, private Codex IPC or
+telemetry component.
+
+## One executable, several process roles
+
+```text
+CodexProxyGuard.exe                       GUI process: QApplication
+  └─ CodexProxyGuard.exe bridge           engine process: QCoreApplication
+       └─ CodexProxyGuard.exe
+            internal-activate-package     short-lived activation worker
+```
+
+`app/main.cpp` is the single production entry point. It reads the Unicode
+command line (`GetCommandLineW`/`CommandLineToArgvW`), classifies it with
+`app/startup_mode.cpp` (pure function, unit-tested in `app/tests`), and only
+then constructs exactly one application object: `QApplication` for the GUI role
+(no arguments, `--config` without a command, `--smoke-test`) or
+`QCoreApplication` for headless roles (`bridge`, `internal-activate-package`,
+`build-info`/`--build-info`, `launch`, `init-config`, `config-path`,
+`console`, `licenses`, `--help`, `--version`). Contradictory or unknown
+argument combinations exit nonzero before any Application exists. Option
+values are consumed as values, so a `--config` path containing `bridge` or
+`--smoke-test` cannot flip the role.
+
+The GUI relaunches its own file (`QCoreApplication::applicationFilePath()`)
+with the `bridge` argument; the activation worker is spawned the same way
+inside `platform.cpp`. Test seams inject a fake engine path through a
+dedicated constructor only — production never overrides the relaunch target.
+The same binary hosting several roles does not grant the GUI any direct
+system-operation channel: `guard_gui` still links no engine business code; only
+the final `app` aggregation target links both libraries.
+
+The Windows GUI subsystem is kept (no console flash on double-click) while
+headless roles use the inherited standard handles through bounded Win32 I/O;
+the bridge protocol itself is unchanged (NDJSON schema 1, 128 KiB frames).
+Headless roles never initialize a QPA platform — a bogus `QT_QPA_PLATFORM`
+does not affect `build-info`, the bridge or worker rejection. The `licenses`
+command streams embedded notice resources over Win32 stdout outside the frame
+protocol.
 
 ## Modules
 
@@ -20,9 +61,14 @@ There is no Rust, FFI, Qt Network, private Codex IPC or telemetry component.
   foreground effect, task-result application, session confirmation tokens and
   bounded NDJSON transport. The owner thread mutates session state; workers receive
   configuration/cancellation snapshots.
-- `backend/src/main.cpp`: minimal CLI and line-oriented console. Both use the same
-  core transactions and launch pipeline as the bridge.
-- `gui/src`: process client, protocol decoder, controller, accessible Qt Widgets.
+- `backend/src/cli.cpp`: minimal CLI and line-oriented console (`runCli`) plus the
+  `licenses` notice streamer. CLI, console and bridge share the same core
+  transactions and launch pipeline.
+- `gui/src`: process client, protocol decoder, controller, accessible Qt Widgets,
+  and `gui_entry.cpp` (`runGui`) performing GUI initialization for the QApplication
+  the entry point constructed.
+- `app/`: the single production entry, role classification and the embedded
+  notice resources.
 
 ## State and execution
 
@@ -51,7 +97,7 @@ Every launch revalidates configuration/elevation and freshly discovers Desktop.
 A per-user cross-process lock serializes startup and holds a short post-submission
 cooldown. Running or uninspectable Desktop roots block launch. Registered targets
 require a FullTrust manifest entry and dynamic AUMID, then use AO_NONE through a
-short-lived `internal-activate-package` worker in the engine executable.
+short-lived `internal-activate-package` worker spawned from the same executable.
 The worker needs no package identity. It observes the returned PID via a held
 process handle and never owns Desktop's lifetime. Failure after submission may
 mean an already-started Desktop; there is no retry or bare-EXE fallback.
@@ -66,16 +112,45 @@ start/restart/update/bootstrap paths.
 The embedded `resources/appx-discovery.ps1` emits schema 1 JSON with explicit
 serialization depth and optional null manifest attributes. C++ strictly validates
 records, executable containment and target identity. Helper outputs/time are
-bounded; cancellation kills and reaps only direct Guard-owned helpers.
+bounded; cancellation kills and reaps only direct Guard-owned helpers. Processes
+are always managed through held handles of Guard's own children — never by
+executable name, which matters now that GUI, engine and worker share one EXE.
+
+## Static linking and plugins
+
+The release profile (`CPG_STATIC_QT`) links the pinned static Qt 6.8.3 SDK
+(built by `scripts/build-qt-static.ps1` with `-release -static -static-runtime`)
+and the static CRT for every target; a dynamic SDK mixed with /MT fails
+configuration via imported-target type checks. `QT_STATIC` itself is only ever
+defined by Qt's static package files. The production executable imports an
+explicitly verified static plugin set — Windows QPA integration, gif/ico/jpeg
+image codecs and the modern Windows style — through `qt_import_plugins(...,
+NO_DEFAULT)`. Test executables import only the offscreen integration they run
+under (`QT_QPA_PLATFORM=offscreen`); production never links offscreen. The
+release import-table gate (dumpbin /DEPENDENTS) rejects any Qt6*, msvcp140*,
+vcruntime140*, concrt140* or unexpected third-party DLL import; normal Windows
+system DLLs and API sets are the only accepted dependencies.
+
+Notices are embedded as resources (project MIT license, third-party notices and
+the complete Qt license text set) and streamed by the `licenses` command without
+GUI, configuration or network access. Corresponding source ships in the separate
+source-compliance archive described by `THIRD_PARTY_NOTICES.md`; replacing Qt in
+a static build means rebuilding the static SDK per `docs/STATIC_QT_REBUILD.md`.
 
 ## Verification
 
 Backend QtTest suites cover configuration/env transactions and leases, strict
 protocol and discovery fixtures, worker rejection, helper timeout/cancellation,
 CLI resolution, launch ordering and failed preparation, plus real bridge pipe
-shutdown. Existing GUI protocol/controller/process tests cover frontend lifecycle.
-`test-cpp.ps1` runs all suites. `build-portable.cmd` repeats release tests and
-checks portable runtime loading, source provenance and checksums.
+shutdown. Existing GUI protocol/controller/process tests cover frontend lifecycle,
+and `app_startup_mode` covers role classification (including values containing
+role words, separators and contradictory modes). `test-cpp.ps1` runs all suites
+against a dynamic SDK, or with `-StaticQt` against the pinned static prefix.
+`build-portable.cmd -StaticQt` repeats release tests, checks the single-file
+runtime in an isolated directory with a System32-only PATH, executes the packaged
+executable's embedded build-info, scans imports, and re-verifies every artifact
+through `scripts/verify-package.py --schema static-single` before promotion to
+`dist/releases/<version>-<commit>`.
 
 The version-2 config schema survives migration for data safety. The old full-screen
 Rust TUI is replaced by the console; no source/binary fallback to Rust remains.

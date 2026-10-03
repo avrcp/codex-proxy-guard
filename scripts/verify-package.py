@@ -277,7 +277,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('archive', type=pathlib.Path)
     parser.add_argument('--expected-commit', required=True)
-    parser.add_argument('--schema', choices=('auto', 'legacy', 'dynamic-split'),
+    parser.add_argument('--schema', choices=('auto', 'legacy', 'dynamic-split', 'static-single'),
                         default='auto')
     parser.add_argument('--qt-source-sha256', default=QT_SOURCE_SHA256,
                         help='Expected Qt source archive digest (default: the pinned '
