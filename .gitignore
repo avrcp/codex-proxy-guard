@@ -13,6 +13,10 @@
 # Temporary scratch docs
 docs/tmp/
 
+# Machine-local review notes and assistant memory (not release inputs)
+docs/UI_UX_AUDIT_2026-10-03.md
+.workbuddy/
+
 # Windows / OS generated files
 # (All project EXEs live under /target or /dist; do not add binary fixtures without updating this.)
 *.pdb
