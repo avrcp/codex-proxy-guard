@@ -32,15 +32,15 @@ Status: **PASS**.
 | S1 dynamic split | 0.6.0-rc.1 @ 5149655 | 31.882 MiB ZIP (127 members) | 2 | 15 | PASS (built & verified) |
 | S2 unified dynamic | 0.6.0-rc.1 @ 479ad12 | 31.882 MiB ZIP (114 members) | 1 | 11 | PASS (built & verified) |
 | S3/S4 static plugins | (dev build) | EXE 17.408 MiB | 1 | 0 | PASS |
-| S5 static single release | 0.6.1-rc.1 @ b972f30e | 7.937 MiB ZIP (1 member) | 1 | 0 | **PASS (promoted)** |
+| S5 static single release | 0.6.1-rc.1 @ f6a87e7 (main) | 7.937 MiB ZIP (1 member) | 1 | 0 | **PASS (promoted)** |
 
-Final release promoted to `dist/releases/0.6.1-rc.1-b972f30e/`:
+Final release promoted to `dist/releases/0.6.1-rc.1-f6a87e76/` (built from the merged, pushed main HEAD):
 
 | Artifact | Bytes | MiB | SHA-256 (prefix) |
 |---|---:|---:|---|
-| `CodexProxyGuard.exe` | 18,253,824 | 17.408 | `b892b041441ae180…` (full value in `SHA256SUMS.txt`) |
-| Transport ZIP (EXE only) | 8,322,192 | 7.937 | recorded in sidecar |
-| Source-compliance ZIP | 49,040,687 | 46.77 | recorded in sidecar (276 members) |
+| `CodexProxyGuard.exe` | 18,253,824 | 17.408 | `47498864139511f6…` (full value in `SHA256SUMS.txt`) |
+| Transport ZIP (EXE only) | 8,322,199 | 7.937 | recorded in sidecar |
+| Source-compliance ZIP | 49,044,092 | 46.77 | recorded in sidecar (277 members) |
 
 The EXE lands under the 25 MiB optimization target from the manual (§9.5)
 without disabling exceptions, accessibility, IME/font capability or removing
@@ -70,7 +70,7 @@ any notice; no aggressive LTCG/MinSizeRel experiment was needed.
   single-member ZIP, sidecar and manifest digests, embedded build-info
   obtained by executing the extracted EXE under a scratch PATH, recipe-key
   linkage between release manifest and compliance archive, upstream Qt source
-  digest, all 276 compliance member hashes. PASS.
+  digest, all 277 compliance member hashes. PASS.
 - **Dirty-tree gate**: the release profile refused a dirty working tree during
   development (observed, not just asserted). PASS.
 - **Promotion safety**: staging under `target/`; release directory created
