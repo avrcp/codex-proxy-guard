@@ -1,5 +1,6 @@
 #include "licenses_dialog.h"
 #include "engine/licenses_reader.h"
+#include "theme.h"
 #include <QApplication>
 #include <QClipboard>
 #include <QDialogButtonBox>
@@ -84,6 +85,7 @@ void LicensesDialog::render()
     switch (reader_->state()) {
     case LicensesReader::State::Idle:
     case LicensesReader::State::Loading:
+        setDynamicProperty(status_, "error", false);
         status_->setText("Loading embedded license texts…");
         retry_->setVisible(false);
         copy_->setEnabled(false);
@@ -91,6 +93,7 @@ void LicensesDialog::render()
         break;
     case LicensesReader::State::Ready: {
         const QString text = reader_->text();
+        setDynamicProperty(status_, "error", false);
         status_->setText(QStringLiteral("Loaded %1 characters.").arg(QString::number(text.size())));
         if (text != loadedText_) { viewer_->setPlainText(text); loadedText_ = text; }
         retry_->setVisible(false);
@@ -98,6 +101,7 @@ void LicensesDialog::render()
         break;
     }
     case LicensesReader::State::Failed:
+        setDynamicProperty(status_, "error", true);
         status_->setText(reader_->errorText());
         if (!loadedText_.isEmpty()) { viewer_->setPlainText(QString()); loadedText_.clear(); }
         retry_->setVisible(true);

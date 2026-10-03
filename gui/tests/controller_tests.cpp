@@ -2,6 +2,7 @@
 #include "ui/main_window.h"
 #include "ui/proxy_settings_dialog.h"
 #include "ui/theme.h"
+#include "ui/widgets/info_row.h"
 #include <QDir>
 #include <QLabel>
 #include <QLineEdit>
@@ -9,8 +10,11 @@
 #include <QStyleHints>
 #include <QJsonArray>
 #include <QPushButton>
+#include <QShortcut>
 #include <QSignalSpy>
 #include <QtTest>
+#include <algorithm>
+#include <cmath>
 
 using namespace guard;
 class FakeEngineClient final : public IEngineClient {
@@ -262,8 +266,12 @@ private slots:
             emit engine.requestFailed(2, "set_proxy", code, "The engine rejected this save.", false);
             QVERIFY(dialog.isVisible()); // The dialog stays open…
             QCOMPARE(host->text(), "192.0.2.1"); QCOMPARE(port->value(), 7890); // …with the user's input.
+            // The human message leads in the status text; the machine code is
+            // reachable on the same label's tooltip (UI/UX finding #4).
             bool shown = false;
-            for (auto *label : dialog.findChildren<QLabel *>()) shown = shown || label->text().contains(code);
+            for (auto *label : dialog.findChildren<QLabel *>())
+                shown = shown || (label->text().contains("engine rejected this save")
+                                  && label->toolTip().contains(code));
             QVERIFY2(shown, "The rejection must be visible inside the dialog.");
             save->click(); // Retry is an explicit user action from the restored editing state.
             QCOMPARE(engine.calls.last().method, "set_proxy");
@@ -392,6 +400,146 @@ private slots:
         c.start(); engine.reply("snapshot", readySnapshot()); QVERIFY(launch->isEnabled());
         c.launch(); QVERIFY(!launch->isEnabled());
         QVERIFY(launch->text().contains("Working"));
+    }
+    // Finding #1: a disabled Launch used to be unexplained because the window
+    // never surfaced config_readiness or elevation, which the engine already
+    // parses. Each blocked precondition must be readable without opening
+    // Details.
+    void blockedLaunchStatesItsReason() {
+        const auto reasonFor = [](const QJsonObject &snapshot) {
+            FakeEngineClient engine; LauncherController c(&engine); MainWindow window(&c);
+            auto *launch = window.findChild<QPushButton *>("launch");
+            c.start(); engine.reply("snapshot", snapshot);
+            if (!launch->isEnabled()) return launch->toolTip();
+            for (auto *label : window.findChildren<QLabel *>())
+                if (label->toolTip().contains("Launch is unavailable")) return label->toolTip();
+            return QString();
+        };
+        auto elevated = readySnapshot(); elevated.insert("elevation", "elevated");
+        QVERIFY(reasonFor(elevated).contains("elevated"));
+        auto unverified = readySnapshot(); unverified.insert("elevation", "unknown");
+        QVERIFY(reasonFor(unverified).contains("verify"));
+        auto unready = readySnapshot(); unready.insert("config_readiness", "repair_required");
+        QVERIFY(reasonFor(unready).contains("not ready"));
+        auto missing = readySnapshot();
+        missing.insert("desktop", QJsonObject{{"state", "missing"}, {"display_name", ""}, {"package_version", ""}});
+        QVERIFY(reasonFor(missing).contains("not discovered"));
+        auto running = readySnapshot();
+        running.insert("process", QJsonObject{{"state", "running"}});
+        QVERIFY(reasonFor(running).contains("already running"));
+        auto oddMethod = readySnapshot();
+        oddMethod.insert("launch", QJsonObject{{"method", "brand_new_method"}});
+        QVERIFY(reasonFor(oddMethod).contains("does not recognize"));
+        // Several blockers at once must all be reported, not just the first.
+        auto combined = readySnapshot();
+        combined.insert("elevation", "elevated"); combined.insert("config_readiness", "repair_required");
+        const auto both = reasonFor(combined);
+        QVERIFY(both.contains("elevated")); QVERIFY(both.contains("not ready"));
+        // A launchable state states no blocker at all.
+        QVERIFY(reasonFor(readySnapshot()).isEmpty());
+    }
+    // Finding #2/#3: the theme must keep every outline and focus ring at or
+    // above the WCAG 2.x non-text threshold, and stay legible in both schemes.
+    void themeFillsClearContrastFloors() {
+        const auto cr = [](const QColor &a, const QColor &b) {
+            const auto channel = [](qreal c) { return c <= 0.04045 ? c / 12.92 : std::pow((c + 0.055) / 1.055, 2.4); };
+            const auto lum = [&channel](const QColor &c) {
+                return 0.2126 * channel(c.redF()) + 0.7152 * channel(c.greenF()) + 0.0722 * channel(c.blueF());
+            };
+            const auto la = lum(a), lb = lum(b);
+            return (std::max(la, lb) + 0.05) / (std::min(la, lb) + 0.05);
+        };
+        for (const auto scheme : {Qt::ColorScheme::Light, Qt::ColorScheme::Dark}) {
+            QGuiApplication::styleHints()->setColorScheme(scheme);
+            applyTheme(*qobject_cast<QApplication *>(QCoreApplication::instance()));
+            const auto t = ThemeTokens::system();
+            // Every surface the border token lands on must clear 3:1.
+            for (const auto &surface : {t.window, t.surface, t.hover})
+                QVERIFY2(cr(t.border, surface) >= 3.0, qPrintable(QStringLiteral("border on surface failed")));
+            // Focus rings: accent on the control fill, window on the accent fill.
+            QVERIFY(cr(t.accent, t.surface) >= 3.0);
+            QVERIFY(cr(t.accent, t.hover) >= 3.0);
+            QVERIFY(cr(t.window, t.accent) >= 3.0);
+            // The progress chunk must stay readable on its track, and the
+            // track must stay visible against the window.
+            QVERIFY(cr(t.text, t.border) >= 3.0);
+            QVERIFY(cr(t.border, t.window) >= 3.0);
+            // Body and secondary text keep their 4.5:1 floors.
+            for (const auto &surface : {t.window, t.surface, t.hover}) {
+                QVERIFY(cr(t.text, surface) >= 4.5);
+                QVERIFY(cr(t.secondary, surface) >= 4.5);
+            }
+        }
+        QGuiApplication::styleHints()->setColorScheme(Qt::ColorScheme::Dark);
+        applyTheme(*qobject_cast<QApplication *>(QCoreApplication::instance()));
+    }
+    // Findings #4/#6: the status line must show the human message, must not
+    // grow the window, and must flag itself as an error rather than as an
+    // idle note.
+    void statusLineStaysReadableAndBounded() {
+        FakeEngineClient engine; LauncherController c(&engine); MainWindow window(&c);
+        window.resize(480, 400); window.show(); QCoreApplication::processEvents();
+        c.start(); engine.reply("snapshot", readySnapshot()); QCoreApplication::processEvents();
+        auto *status = window.findChild<ElidedLabel *>("status");
+        QVERIFY(status);
+        emit engine.requestFailed(2, "launch", "ENGINE_SHUTDOWN_TIMEOUT",
+            "Activated into an existing Desktop instance; whether this launch's proxy settings were "
+            "re-applied is unconfirmed. Exit Desktop fully, then launch from Guard again. Network "
+            "coverage is not verified.", false);
+        QCoreApplication::processEvents();
+        QVERIFY2(window.height() <= 400, "a long status message must not grow the window");
+        QVERIFY2(status->accessibleName().contains("existing Desktop instance")
+                 || status->toolTip().contains("existing Desktop instance"),
+                 "the human message must be reachable, not only the machine code");
+    }
+    // Finding #12: an unrecognized engine token stays visible instead of being
+    // flattened to "Unknown", which hid the very thing a support log needs.
+    void unknownEngineTokensAreNotFlattened() {
+        FakeEngineClient engine; LauncherController c(&engine); MainWindow window(&c);
+        c.start();
+        auto unknown = readySnapshot();
+        unknown.insert("coverage", QJsonObject{{"state", "brand_new_state"}});
+        unknown.insert("launch", QJsonObject{{"method", "brand_new_method"}});
+        engine.reply("snapshot", unknown);
+        QCoreApplication::processEvents();
+        bool sawCoverage = false, sawMethod = false;
+        for (auto *label : window.findChildren<ElidedLabel *>()) {
+            const auto text = label->accessibleName();
+            if (text.contains("brand_new_state")) sawCoverage = true;
+            if (text.contains("brand_new_method")) sawMethod = true;
+        }
+        QVERIFY2(sawCoverage, "an unrecognized coverage state must stay visible");
+        QVERIFY2(sawMethod, "an unrecognized launch method must stay visible");
+    }
+    // Finding #8: the primary action owns the first tab stop; the row-level Edit
+    // is reachable by mouse and by accelerator but must not intercept Tab.
+    void primaryActionOwnsFirstTabStop() {
+        FakeEngineClient engine; LauncherController c(&engine); MainWindow window(&c);
+        c.start(); engine.reply("snapshot", readySnapshot());
+        window.show(); window.activateWindow(); QCoreApplication::processEvents();
+        auto *launch = window.findChild<QPushButton *>("launch");
+        QVERIFY(launch);
+        QVERIFY2(launch->focusPolicy() != Qt::NoFocus, "Launch must stay keyboard reachable");
+        QTRY_COMPARE(window.focusWidget(), static_cast<QWidget *>(launch));
+        QPushButton *edit = nullptr;
+        for (auto *button : window.findChildren<QPushButton *>())
+            if (button->text() == "Edit") edit = button;
+        QVERIFY(edit);
+        QVERIFY2(edit->focusPolicy() == Qt::NoFocus, "the row Edit must stay out of the tab chain");
+    }
+    // Finding #7: the About shortcut table is derived from the registered
+    // QShortcut objects, so a documented key without a binding — or a binding
+    // missing from the table — cannot appear.
+    void aboutShortcutsMatchRegisteredBindings() {
+        FakeEngineClient engine; LauncherController c(&engine); MainWindow window(&c);
+        const auto text = window.aboutText();
+        QVERIFY(!text.isEmpty());
+        const auto bindings = window.findChildren<QShortcut *>();
+        QVERIFY(bindings.size() >= 10);
+        for (auto *binding : bindings) {
+            const auto key = binding->key().toString(QKeySequence::NativeText);
+            QVERIFY2(text.contains(key), qPrintable(QStringLiteral("About table omits bound key: %1").arg(key)));
+        }
     }
     void renderReviewFixtures() {
         const auto output = qEnvironmentVariable("CPG_SCREENSHOT_DIR");

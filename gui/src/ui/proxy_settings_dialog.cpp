@@ -1,4 +1,5 @@
 #include "proxy_settings_dialog.h"
+#include "theme.h"
 #include "controller/launcher_controller.h"
 
 #include <QDialogButtonBox>
@@ -57,12 +58,17 @@ ProxySettingsDialog::ProxySettingsDialog(LauncherController *controller, QWidget
     connect(controller_, &LauncherController::proxySaveFailed, this,
             [this](const QString &code, const QString &message) {
                 restoreEditing();
-                status_->setText(QString("%1: %2 Your edits are preserved; adjust and Save again.")
-                                     .arg(code, message));
+                // The engine message leads; the code moves into the tooltip so
+                // a rejected save is readable without decoding a token.
+                setDynamicProperty(status_, "error", true);
+                status_->setText(QString("%1 Your edits are preserved; adjust and Save again.").arg(message));
+                status_->setToolTip(code);
             });
     connect(controller_, &LauncherController::proxySaveOutcomeUnknown, this, [this](const QString &reason) {
         state_ = State::OutcomeUnknown;
         setControlsEnabled(true);
+        setDynamicProperty(status_, "error", true);
+        status_->setToolTip(QString());
         status_->setText(QString(
             "%1 interrupted the save; whether it was written is unconfirmed. Do not resubmit "
             "blindly: reconnect, refresh, and verify the stored settings before deciding.")
@@ -78,6 +84,8 @@ void ProxySettingsDialog::reset()
     host_->setText(proxy.value("host").toString("127.0.0.1"));
     port_->setValue(proxy.value("port").toInt(10808));
     status_->clear();
+    status_->setToolTip(QString());
+    setDynamicProperty(status_, "error", false);
     setControlsEnabled(true);
 }
 
@@ -90,11 +98,17 @@ void ProxySettingsDialog::reject()
 void ProxySettingsDialog::submit()
 {
     if (state_ != State::Editing) return; // One save at a time; Enter or double clicks do not duplicate.
+    // Every branch below blocks the save, so each one must say why in the
+    // error tone rather than leaving the dialog looking untouched.
     if (host_->text().trimmed().isEmpty()) {
-        status_->setText("Enter a proxy host.");
+        setDynamicProperty(status_, "error", true);
+        status_->setToolTip(QString());
+        status_->setText("Enter a proxy host. Guard accepts a local HTTP or Mixed proxy only.");
         return;
     }
     if (!controller_->setProxy(host_->text().trimmed(), port_->value())) {
+        setDynamicProperty(status_, "error", true);
+        status_->setToolTip(QString());
         status_->setText("The engine cannot accept this request now. Refresh, then try again.");
         return;
     }
@@ -105,6 +119,8 @@ void ProxySettingsDialog::setSaving()
 {
     state_ = State::Saving;
     setControlsEnabled(false);
+    setDynamicProperty(status_, "error", false);
+    status_->setToolTip(QString());
     status_->setText("Saving…");
 }
 

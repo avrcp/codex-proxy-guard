@@ -55,3 +55,4 @@ $RECYCLE.BIN/
 .vs/
 *.suo
 *.user
+artifacts/
