@@ -135,6 +135,37 @@ keyboard, screen reader, 480×400 layout, clean Windows machine) remain
 NOT_RUN as listed below; `licenses_tests` run under the offscreen QPA, which
 is not a substitute for those checks.
 
+### Promoted release for this rectification
+
+Built by `scripts/build-portable.cmd -StaticQt` from clean `1f19f229`
+(executed in a temporary git worktree because the main tree carries local,
+now-ignored review notes; the artifacts correspond to the pushed commit, as
+their embedded build-info confirms). Promoted to
+`dist/releases/0.6.1-rc.1-1f19f229/`:
+
+| Artifact | Bytes | MiB | SHA-256 |
+|---|---:|---:|---|
+| `CodexProxyGuard.exe` | 18,268,672 | 17.423 | `fa6afc1c6efb8eb9128556518dbfe679de2212277b7e372d78698f8c77a81485` |
+| Transport ZIP (EXE only) | 8,326,199 | 7.941 | `31d2b1ee01516240f4230c20a6ea5c7487cf7c2926e6cbf548c2d78546e2b5f5` |
+| Source-compliance ZIP | 49,056,663 | 46.78 | `b5a5d929980b026348ea2a333e19188076ca3c76527ddcb361f6f17dd52bebfe` |
+
+- Release manifest: `0.6.1-rc.1`, commit `1f19f229`, `dirty=false`, static
+  Qt + static CRT, recipe key `4b51c65c2f89e9b0`, compliance archive with
+  283 members.
+- `verify-package.py --schema static-single`: PASS (single-member transport
+  ZIP, CRC, sidecar and manifest digests, embedded build-info obtained by
+  executing the packaged EXE).
+- Suites inside the release build: 10/10 CTest PASS (includes the licenses
+  matrix above against the release binaries).
+- Import table (`dumpbin /DEPENDENTS`): Windows system DLLs and API sets
+  only — no `Qt6*`, `msvcp140*`, `vcruntime140*`, `concrt140*` or
+  third-party import. PASS.
+- Packaged-EXE smoke: `licenses` exits 0 and streams `===== LICENSE =====`
+  first; `--build-info` reports `1f19f229` / `dirty=false`.
+- Size delta vs the `f6a87e76` EXE: +14,848 bytes (18,253,824 → 18,268,672),
+  attributable to the added viewer code; no license duplication, plugin set
+  or packaging change.
+
 ## Not executed (remains NOT_RUN)
 
 | Item | Status | Note |
