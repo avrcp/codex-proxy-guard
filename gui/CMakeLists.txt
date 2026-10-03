@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(CodexProxyGuardGui VERSION 0.6.0 LANGUAGES CXX)
+project(CodexProxyGuardGui VERSION 0.6.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -7,9 +7,8 @@ set(CMAKE_AUTOMOC ON)
 find_package(Qt6 6.8 REQUIRED COMPONENTS Core Gui Widgets)
 qt_standard_project_setup()
 
-set(CPG_PRODUCT_VERSION "0.6.0-rc.1" CACHE STRING "Product version")
-set(CPG_BUILD_COMMIT "unknown" CACHE STRING "Source commit")
-set(CPG_BUILD_DIRTY "true" CACHE STRING "Source dirty flag")
+# The product version/cache provenance definitions live in the top-level
+# CMakeLists only; this subdirectory inherits them (single source of truth).
 add_library(guard_gui STATIC
     src/engine/engine_bridge.cpp src/engine/engine_bridge.h
     src/engine/protocol.cpp src/engine/protocol.h
@@ -41,6 +40,18 @@ if(BUILD_TESTING)
         target_link_libraries(${test_name} PRIVATE guard_gui Qt6::Test)
         if(MSVC)
             target_compile_options(${test_name} PRIVATE /W4 /WX /utf-8 /permissive-)
+        endif()
+        if(CPG_STATIC_QT)
+            # The CTest environment uses QT_QPA_PLATFORM=offscreen. Static
+            # executables only contain the plugins they explicitly import, so
+            # test targets get the offscreen integration instead of the
+            # production Windows set; production never links offscreen.
+            if(NOT TARGET Qt6::QOffscreenIntegrationPlugin)
+                message(FATAL_ERROR "Static Qt test plugin missing: Qt6::QOffscreenIntegrationPlugin")
+            endif()
+            qt_import_plugins(${test_name}
+                NO_DEFAULT
+                INCLUDE Qt6::QOffscreenIntegrationPlugin)
         endif()
         add_test(NAME ${test_name} COMMAND ${test_name})
         set_tests_properties(${test_name} PROPERTIES TIMEOUT 60 ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
