@@ -10,10 +10,15 @@ Qt Test is used only for tests and is not a runtime dependency. Qt is copyright
 The Qt Company Ltd. and other contributors. The distributed Qt libraries are used
 under the GNU Lesser General Public License version 3 (LGPLv3).
 
-The full LGPLv3 and GPLv3 texts are included in `licenses/Qt/`. Qt's corresponding
-source, build scripts and bundled third-party copyright/license notices are
-included in the portable ZIP as `sources/qtbase-everywhere-src-6.8.3.tar.xz`.
-Its SHA-256 is recorded in `build-info.json`. The upstream source is available at:
+The full LGPLv3 and GPLv3 texts are included in `licenses/Qt/` in the runtime
+archive. Qt's corresponding source, build scripts and bundled third-party
+copyright/license notices are provided as the separate
+`CodexProxyGuard-<version>-source-compliance.zip` distributed beside the runtime
+archive at the same location: the upstream QtBase 6.8.3 release tarball
+(`upstream/qtbase-everywhere-src-6.8.3.tar.xz`) plus recipes, the application
+source snapshot and rebuild instructions (`REBUILD.md`, `SOURCE_ACCESS.txt`).
+Its SHA-256 is recorded in `release-manifest.json` and the package
+`build-info.json`; the upstream source is also available at:
 
 https://download.qt.io/archive/qt/6.8/6.8.3/submodules/qtbase-everywhere-src-6.8.3.tar.xz
 

@@ -1,11 +1,16 @@
 <#
 .SYNOPSIS
-Builds and verifies the Windows x64 Qt GUI portable directory and ZIP.
+Builds and verifies the Windows x64 Qt GUI portable split release.
 .DESCRIPTION
 Requires MSVC x64, Visual Studio CMake/Ninja, Python 3 and py7zr. The complete
 pinned Qt SDK is extracted from its verified official archive for each build and
-removed afterwards; only the archive cache under target/qt-source persists. The
-produced ZIP is re-verified in place by scripts/verify-package.py before success.
+removed afterwards; only the archive cache under target/qt-source persists.
+
+The release is split: a runtime ZIP users run and a source-compliance ZIP
+(application source snapshot, upstream Qt source, licenses, recipes and rebuild
+instructions) shipped beside it. Both are bound together by release-manifest.json
+and re-verified from scratch by scripts/verify-package.py. The full profile
+refuses a dirty working tree; use scripts/test-cpp.ps1 for development builds.
 #>
 param([string] $Version = '0.6.0-rc.1')
 
@@ -22,6 +27,9 @@ $QtRoot = Join-Path $Root ('target\qt-sdk-' + [Guid]::NewGuid().ToString('N'))
 $SdkManifestPath = Join-Path $Root 'licenses\Qt\sdk-6.8.3-msvc2022-x64.json'
 $SdkManifest = Get-Content -LiteralPath $SdkManifestPath -Raw | ConvertFrom-Json
 if ($SdkManifest.schema_version -ne 1 -or $SdkManifest.qt_version -ne $QtVersion -or $SdkManifest.source_sha256 -ne $SourceHash) { throw 'Qt binary/source manifest mismatch.' }
+$RuntimeZip = Join-Path $Root "dist\CodexProxyGuard-$Version-windows-x86_64-dynamic.zip"
+$ComplianceZip = Join-Path $Root "dist\CodexProxyGuard-$Version-source-compliance.zip"
+$ReleaseManifest = Join-Path $Root 'dist\release-manifest.json'
 
 function Invoke-Checked([string] $File, [string[]] $Arguments) {
     & $File @Arguments
@@ -48,6 +56,20 @@ function Get-SourceFingerprint {
         if (Test-Path -LiteralPath $Path -PathType Leaf) { "$Name $(Get-Hash $Path)" } else { "$Name deleted" }
     }
     return ($Entries -join "`n")
+}
+
+function Get-ToolchainRecord {
+    # VsDevCmd exports VCToolsVersion/WindowsSDKVersion into this process; fall
+    # back to the pinned default file when a toolchain omits the variable.
+    $Msvc = "${Env:VCToolsVersion}"
+    if ([string]::IsNullOrWhiteSpace($Msvc)) {
+        $Msvc = (Get-Content -LiteralPath (Join-Path $Vs 'VC\Auxiliary\Build\Microsoft.VCToolsVersion.default.txt') -Raw).Trim()
+    }
+    return @{
+        msvc = "MSVC $Msvc"; windows_sdk = "$Env:WindowsSDKVersion"
+        cmake = (& $CMake --version | Select-Object -First 1); ninja = (& $Ninja --version)
+        python = (& $Python.Source --version); qt_version = $QtVersion
+    }
 }
 
 function Assert-OfficialQtSdk {
@@ -137,6 +159,127 @@ function Invoke-BridgeSmoke([string] $File, [string] $Version, [string] $Commit)
     }
 }
 
+function Compress-Directory([string] $Directory, [string] $ZipPath) {
+    if (Test-Path -LiteralPath $ZipPath) { Remove-Item -LiteralPath $ZipPath -Force }
+    Compress-Archive -Path "$Directory\*" -DestinationPath $ZipPath -CompressionLevel Optimal
+}
+
+# Build the source-compliance side asset in an isolated staging directory.
+function New-SourceCompliance([string] $Commit) {
+    $Stage = Join-Path $Root ('target\source-compliance-' + [Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path "$Stage\app", "$Stage\upstream", "$Stage\patches", "$Stage\recipes", "$Stage\licenses" -Force | Out-Null
+    try {
+        # Snapshot the exact clean commit; this includes vendored toml++, CMake,
+        # resources, generators, build and verification scripts.
+        $AppArchive = Join-Path $Stage 'app.zip'
+        Invoke-Checked git @('-C', $Root, 'archive', '--format=zip', '-o', $AppArchive, $Commit)
+        Expand-Archive -LiteralPath $AppArchive -DestinationPath "$Stage\app"
+        Remove-Item -LiteralPath $AppArchive -Force
+
+        $SourceCache = Join-Path $Root "target\qt-source\$SourceName"
+        New-Item -ItemType Directory -Path (Split-Path $SourceCache) -Force | Out-Null
+        if (-not (Test-Path -LiteralPath $SourceCache)) {
+            Write-Host "Downloading corresponding Qt source: $SourceUrl"
+            Invoke-WebRequest -UseBasicParsing -Uri $SourceUrl -OutFile $SourceCache -TimeoutSec 900
+        }
+        if ((Get-Hash $SourceCache) -ne $SourceHash) { throw 'Qt source archive SHA-256 mismatch; remove the cached archive and retry.' }
+        Copy-Item -LiteralPath $SourceCache -Destination "$Stage\upstream"
+
+        Write-Utf8 "$Stage\patches\README.txt" "No Qt patches are applied. The pinned upstream qtbase $QtVersion release tarball (SHA-256 $SourceHash) is built and deployed unmodified from the official binary SDK archive."
+        Write-Utf8 "$Stage\recipes\toolchain.json" ((Get-ToolchainRecord) | ConvertTo-Json)
+        Write-Utf8 "$Stage\recipes\packaging.json" (@{
+                entry_point = 'scripts/build-portable.ps1'
+                qt_sdk_archive_url = $SdkManifest.archive_url
+                qt_sdk_archive_sha256 = $SdkManifest.archive_sha256
+                qt_sdk_manifest = 'licenses/Qt/sdk-6.8.3-msvc2022-x64.json'
+                qt_source_url = $SourceUrl; qt_source_sha256 = $SourceHash
+            } | ConvertTo-Json)
+        Copy-Item -LiteralPath (Join-Path $Root 'LICENSE'), (Join-Path $Root 'THIRD_PARTY_NOTICES.md') -Destination "$Stage\licenses"
+        New-Item -ItemType Directory -Path "$Stage\licenses\Qt" -Force | Out-Null
+        Get-ChildItem -LiteralPath (Join-Path $Root 'licenses\Qt') | Copy-Item -Destination "$Stage\licenses\Qt" -Recurse
+        New-Item -ItemType Directory -Path "$Stage\licenses\tomlplusplus" -Force | Out-Null
+        Copy-Item -LiteralPath (Join-Path $Root 'backend\third_party\toml++\LICENSE') -Destination "$Stage\licenses\tomlplusplus"
+
+        Write-Utf8 "$Stage\REBUILD.md" @"
+Rebuilding Codex ProxyGuard $Version from this compliance package
+=================================================================
+
+Prerequisites (not redistributed here; obtain from their official sources):
+
+- Visual Studio 2022 or newer with the MSVC x64 C++ toolchain and the bundled
+  CMake + Ninja (versions recorded in recipes/toolchain.json).
+- Windows 10/11 SDK (version recorded in recipes/toolchain.json).
+- Python 3 with py7zr (``python -m pip install --user py7zr``).
+- The official Qt $QtVersion MSVC 2022 x64 binary SDK archive referenced by
+  recipes/packaging.json (its URL and SHA-256 are pinned there).
+
+Steps:
+
+1. Extract ``app/`` to an empty directory and open it.
+2. Verify/extract the official Qt SDK and build the portable package:
+   ``powershell -File scripts\build-portable.ps1 -Version $Version``
+   The script downloads the pinned Qt SDK archive itself (or reuses the cache
+   under target\qt-source), verifies every file hash against
+   licenses/Qt/sdk-6.8.3-msvc2022-x64.json, builds, tests, packages and
+   re-verifies the split release.
+3. Run the C++ test suites alone with ``powershell -File scripts\test-cpp.ps1``
+   (pass your Qt SDK root via -QtRoot).
+
+Replacing or rebuilding Qt from source:
+
+- The corresponding Qt source archive is provided in upstream/ with its
+  SHA-256; Qt's own build instructions apply. This dynamic build deploys the
+  Qt shared libraries recorded in the release manifest, so a rebuilt Qt of the
+  same version can replace them per THIRD_PARTY_NOTICES.md. Verify any such
+  replacement with scripts/verify-package.py adjusted to the new provenance.
+- app/ is the complete application source of commit $Commit; no generated or
+  hidden inputs are required beyond the prerequisites above.
+"@
+        Write-Utf8 "$Stage\SOURCE_REVISION.txt" "CodexProxyGuard application source commit: $Commit`nQt source: qtbase $QtVersion official release tarball`nQt source SHA-256: $SourceHash"
+        Write-Utf8 "$Stage\SOURCE_ACCESS.txt" @"
+Corresponding source availability for this release:
+
+- CodexProxyGuard-$Version-source-compliance.zip (this archive) contains the
+  complete application source snapshot, the upstream Qt source archive,
+  licenses, recipes and rebuild instructions.
+- It is distributed at the same location as the runtime archive
+  CodexProxyGuard-$Version-windows-x86_64-dynamic.zip (same release channel,
+  no additional registration or fee is required to obtain it).
+- The Qt source archive is also available upstream at:
+  $SourceUrl
+- Verification: SHA-256 values for every file are recorded in manifest.json
+  inside this archive and in release-manifest.json shipped beside the
+  runtime ZIP.
+
+publication_pending: this text records how corresponding source is provided.
+Whether a specific distribution channel has actually published both archives
+is tracked by the release checklist, not by this file.
+"@
+        $ComplianceFiles = [ordered]@{}
+        foreach ($File in (Get-ChildItem -LiteralPath $Stage -Recurse -File | Sort-Object FullName)) {
+            $Relative = $File.FullName.Substring($Stage.Length + 1).Replace('\', '/')
+            $ComplianceFiles[$Relative] = Get-Hash $File.FullName
+        }
+        Write-Utf8 "$Stage\manifest.json" (@{
+                schema_version = 1; product_version = $Version; source_commit = $Commit
+                qt_source = @{ name = $SourceName; sha256 = $SourceHash; url = $SourceUrl }
+                files_sha256 = $ComplianceFiles
+            } | ConvertTo-Json -Depth 4)
+        # manifest.json hashes every other member; regenerate its own exclusion
+        # by listing files first (manifest.json itself is verified via the
+        # release manifest after compression).
+        Compress-Directory $Stage $ComplianceZip
+        return @{
+            zip     = $ComplianceZip
+            sha256  = (Get-Hash $ComplianceZip)
+            bytes   = (Get-Item -LiteralPath $ComplianceZip).Length
+            members = $ComplianceFiles.Count + 1
+        }
+    } finally {
+        Remove-Item -LiteralPath $Stage -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 Push-Location $Root
 $OriginalPath = $Env:PATH
 $OriginalQtPluginPath = $Env:QT_PLUGIN_PATH
@@ -179,8 +322,9 @@ try {
     $StatusBefore = (@(& git status --porcelain=v1 --untracked-files=all) -join "`n")
     if ($LASTEXITCODE -ne 0) { throw 'Cannot read source status.' }
     $Dirty = [bool]($StatusBefore.Length -gt 0)
+    if ($Dirty) { throw 'The split release requires a clean working tree; commit or stash first. Development builds use scripts/test-cpp.ps1.' }
 
-    Invoke-Checked $CMake @('--fresh', '-S', $Root, '-B', $Build, '-G', 'Ninja', "-DCMAKE_MAKE_PROGRAM=$Ninja", '-DCMAKE_BUILD_TYPE=Release', "-DCMAKE_PREFIX_PATH=$QtRoot", "-DQt6_DIR=$QtRoot/lib/cmake/Qt6", '-DBUILD_TESTING=ON', "-DCPG_PRODUCT_VERSION=$Version", "-DCPG_BUILD_COMMIT=$Commit", "-DCPG_BUILD_DIRTY=$($Dirty.ToString().ToLowerInvariant())")
+    Invoke-Checked $CMake @('--fresh', '-S', $Root, '-B', $Build, '-G', 'Ninja', "-DCMAKE_MAKE_PROGRAM=$Ninja", '-DCMAKE_BUILD_TYPE=Release', "-DCMAKE_PREFIX_PATH=$QtRoot", "-DQt6_DIR=$QtRoot/lib/cmake/Qt6", '-DBUILD_TESTING=ON', "-DCPG_PRODUCT_VERSION=$Version", "-DCPG_BUILD_COMMIT=$Commit", "-DCPG_BUILD_DIRTY=false")
     Invoke-Checked $CMake @('--build', $Build, '--config', 'Release', '--parallel')
     Invoke-Checked $CTest @('--test-dir', $Build, '-C', 'Release', '--output-on-failure', '--no-tests=error')
 
@@ -188,7 +332,7 @@ try {
     $ExpectedOutput = [IO.Path]::GetFullPath((Join-Path $Root 'dist\gui'))
     if ($Output -ne $ExpectedOutput -or -not $Output.StartsWith($Root + '\', [StringComparison]::OrdinalIgnoreCase)) { throw 'Unsafe package directory.' }
     if (Test-Path -LiteralPath $Output) { Remove-Item -LiteralPath $Output -Recurse -Force }
-    New-Item -ItemType Directory -Path "$Output\engine", "$Output\sources" -Force | Out-Null
+    New-Item -ItemType Directory -Path "$Output\engine" -Force | Out-Null
     Copy-Item -LiteralPath "$Build\gui\CodexProxyGuard.exe" -Destination $Output
     Copy-Item -LiteralPath "$Build\backend\codex-proxy-guard.exe" -Destination "$Output\engine\codex-proxy-guard.exe"
     $EngineHash = Get-Hash "$Output\engine\codex-proxy-guard.exe"
@@ -228,16 +372,6 @@ try {
     New-Item -ItemType Directory -Path "$Output\licenses\tomlplusplus" -Force | Out-Null
     Copy-Item -LiteralPath 'backend\third_party\toml++\LICENSE' -Destination "$Output\licenses\tomlplusplus"
 
-    $SourceCache = Join-Path $Root "target\qt-source\$SourceName"
-    New-Item -ItemType Directory -Path (Split-Path $SourceCache) -Force | Out-Null
-    if (-not (Test-Path -LiteralPath $SourceCache)) {
-        Write-Host "Downloading corresponding Qt source: $SourceUrl"
-        Invoke-WebRequest -UseBasicParsing -Uri $SourceUrl -OutFile $SourceCache -TimeoutSec 900
-    }
-    if ((Get-Hash $SourceCache) -ne $SourceHash) { throw 'Qt source archive SHA-256 mismatch; remove the cached archive and retry.' }
-    Copy-Item -LiteralPath $SourceCache -Destination "$Output\sources"
-    Write-Utf8 "$Output\sources\README.txt" "QtBase $QtVersion corresponding source (including bundled third-party notices).`nOriginal source: $SourceUrl`nSHA-256: $SourceHash`nSee THIRD_PARTY_NOTICES.md for rebuilding/replacing Qt shared libraries."
-
     foreach ($Required in @('Qt6Core.dll', 'Qt6Gui.dll', 'Qt6Widgets.dll', 'platforms\qwindows.dll', 'msvcp140.dll', 'vcruntime140.dll', 'vcruntime140_1.dll', 'engine\Qt6Core.dll', 'engine\msvcp140.dll', 'engine\vcruntime140.dll')) {
         if (-not (Test-Path -LiteralPath "$Output\$Required" -PathType Leaf)) { throw "Incomplete deployment: $Required" }
     }
@@ -246,9 +380,9 @@ try {
     Remove-Item Env:QT_PLUGIN_PATH -ErrorAction SilentlyContinue
     $GuiSmoke = Invoke-Smoke "$Output\CodexProxyGuard.exe" '--smoke-test'
     $GuiEmbedded = (Invoke-Smoke "$Output\CodexProxyGuard.exe" '--build-info') | ConvertFrom-Json
-    if ($GuiEmbedded.git_commit -ne $Commit -or [bool]$GuiEmbedded.git_dirty -ne $Dirty -or $GuiEmbedded.product_version -ne $Version -or $GuiEmbedded.qt_version -ne $QtVersion -or $GuiEmbedded.protocol_version -ne 1) { throw 'GUI embedded provenance mismatch.' }
+    if ($GuiEmbedded.git_commit -ne $Commit -or [bool]$GuiEmbedded.git_dirty -ne $false -or $GuiEmbedded.product_version -ne $Version -or $GuiEmbedded.qt_version -ne $QtVersion -or $GuiEmbedded.protocol_version -ne 1) { throw 'GUI embedded provenance mismatch.' }
     $EngineEmbedded = (Invoke-Smoke "$Output\engine\codex-proxy-guard.exe" 'build-info') | ConvertFrom-Json
-    if ($EngineEmbedded.commit -ne $Commit -or [bool]$EngineEmbedded.dirty -ne $Dirty -or $EngineEmbedded.version -ne $Version -or $EngineEmbedded.language -ne 'C++20' -or $EngineEmbedded.qt_version -ne $QtVersion -or $EngineEmbedded.protocol_version -ne 1) { throw 'Packaged engine provenance mismatch.' }
+    if ($EngineEmbedded.commit -ne $Commit -or [bool]$EngineEmbedded.dirty -ne $false -or $EngineEmbedded.version -ne $Version -or $EngineEmbedded.language -ne 'C++20' -or $EngineEmbedded.qt_version -ne $QtVersion -or $EngineEmbedded.protocol_version -ne 1) { throw 'Packaged engine provenance mismatch.' }
     if ((Get-Hash "$Output\engine\codex-proxy-guard.exe") -ne $EngineHash) { throw 'Packaged engine hash changed during deployment.' }
     $BridgeSmoke = Invoke-BridgeSmoke "$Output\engine\codex-proxy-guard.exe" $Version $Commit
     $Env:PATH = $OriginalPath
@@ -262,11 +396,12 @@ try {
         $Files[$Relative] = Get-Hash $File.FullName
     }
     $Info = [ordered]@{
-        product_version = $Version; git_commit = $Commit; git_dirty = $Dirty
+        product_version = $Version; git_commit = $Commit; git_dirty = $false
         built_at_utc = [DateTime]::UtcNow.ToString('o')
+        profile = 'dynamic-split'
         gui = @{ compiler = 'MSVC x64'; qt_version = $QtVersion; linkage = 'dynamic'; smoke_test = $GuiSmoke }
         engine = @{ version = $Version; language = 'C++20'; qt_version = $QtVersion; linkage = 'dynamic QtCore'; protocol_version = 1; path = 'engine/codex-proxy-guard.exe'; bridge_smoke_test = $BridgeSmoke }
-        qt_source = @{ url = $SourceUrl; sha256 = $SourceHash; archive = "sources/$SourceName" }
+        qt_source = @{ url = $SourceUrl; sha256 = $SourceHash; provided_by = "CodexProxyGuard-$Version-source-compliance.zip (not shipped inside the runtime ZIP)" }
         qt_sdk = @{ archive_url = $SdkManifest.archive_url; archive_sha256 = $SdkManifest.archive_sha256; manifest = 'licenses/Qt/sdk-6.8.3-msvc2022-x64.json'; deployed_files = $DeployedQt }
         files_sha256 = $Files
     }
@@ -274,21 +409,36 @@ try {
     $HashLines = @($Files.GetEnumerator() | ForEach-Object { "$($_.Value)  $($_.Key)" })
     $HashLines += "$(Get-Hash "$Output\build-info.json")  build-info.json"
     Write-Utf8 "$Output\SHA256SUMS.txt" ($HashLines -join "`n")
-    $Zip = Join-Path $Root "dist\CodexProxyGuard-$Version-windows-x86_64.zip"
-    Compress-Archive -Path "$Output\*" -DestinationPath $Zip -CompressionLevel Optimal -Force
-    Write-Utf8 "$Zip.sha256" "$(Get-Hash $Zip)  $([IO.Path]::GetFileName($Zip))"
-    # Final independent gate: re-open the ZIP and re-verify CRC, sidecar,
-    # every manifest member, deployed Qt hashes and provenance from scratch.
-    # Dirty trees are legitimate development iterations; the strict verifier
-    # requires a clean commit, so it runs exactly when release evidence would.
-    if ($Dirty) {
-        Write-Warning 'Dirty working tree: development ZIP only. The clean-commit package verifier was skipped; this artifact is not release evidence.'
-    } else {
-        Invoke-Checked $Python.Source @((Join-Path $PSScriptRoot 'verify-package.py'), $Zip, '--expected-commit', $Commit)
-    }
-    Write-Host "GUI bundle: $Output"
-    Write-Host "GUI ZIP: $Zip"
-    Write-Host "Source commit: $Commit (dirty: $Dirty)"
+    Compress-Directory $Output $RuntimeZip
+    Write-Utf8 "$RuntimeZip.sha256" "$(Get-Hash $RuntimeZip)  $([IO.Path]::GetFileName($RuntimeZip))"
+
+    $Compliance = New-SourceCompliance $Commit
+    Write-Utf8 "$ComplianceZip.sha256" "$($Compliance.sha256)  $([IO.Path]::GetFileName($ComplianceZip))"
+
+    Write-Utf8 $ReleaseManifest (@{
+            schema_version = 2; profile = 'dynamic-split'; product_version = $Version
+            source_commit = $Commit; source_dirty = $false
+            built_at_utc = [DateTime]::UtcNow.ToString('o')
+            runtime_archive = @{ name = [IO.Path]::GetFileName($RuntimeZip); sha256 = (Get-Hash $RuntimeZip); bytes = (Get-Item -LiteralPath $RuntimeZip).Length; layout = 'dist/gui directory' }
+            source_compliance_archive = @{ name = [IO.Path]::GetFileName($ComplianceZip); sha256 = $Compliance.sha256; bytes = $Compliance.bytes; members = $Compliance.members }
+            qt_source = @{ name = $SourceName; url = $SourceUrl; sha256 = $SourceHash }
+            qt_sdk = @{ archive_url = $SdkManifest.archive_url; archive_sha256 = $SdkManifest.archive_sha256; manifest = 'licenses/Qt/sdk-6.8.3-msvc2022-x64.json' }
+            toolchain = (Get-ToolchainRecord)
+        } | ConvertTo-Json -Depth 5)
+    Write-Utf8 (Join-Path $Root 'dist\SHA256SUMS.txt') (@(
+            "$(Get-Hash $RuntimeZip)  $([IO.Path]::GetFileName($RuntimeZip))"
+            "$($Compliance.sha256)  $([IO.Path]::GetFileName($ComplianceZip))"
+            "$(Get-Hash $ReleaseManifest)  release-manifest.json"
+        ) -join "`n")
+    # Final independent gate: re-open both archives and re-verify CRC, sidecars,
+    # every manifest member, deployed Qt hashes, provenance and the split
+    # runtime/source relationship from scratch.
+    Invoke-Checked $Python.Source @((Join-Path $PSScriptRoot 'verify-package.py'), $RuntimeZip, '--expected-commit', $Commit)
+    Write-Host "Runtime bundle: $Output"
+    Write-Host "Runtime ZIP: $RuntimeZip"
+    Write-Host "Source compliance ZIP: $ComplianceZip"
+    Write-Host "Release manifest: $ReleaseManifest"
+    Write-Host "Source commit: $Commit (clean)"
 } finally {
     $Env:PATH = $OriginalPath
     if ($null -ne $OriginalQtPluginPath) { $Env:QT_PLUGIN_PATH = $OriginalQtPluginPath } else { Remove-Item Env:QT_PLUGIN_PATH -ErrorAction SilentlyContinue }
