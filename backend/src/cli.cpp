@@ -1,5 +1,5 @@
+#include "cli.h"
 #include "bridge.h"
-#include <QCoreApplication>
 #include <QCommandLineParser>
 #include <QFile>
 #include <QJsonDocument>
@@ -64,10 +64,38 @@ int console(const QString &path) {
         } catch (const cpg::Error &e) { print(e.code + ": " + e.message); }
     }
 }
+// Stream one embedded license resource to stdout. License text can exceed the
+// bridge frame budget, so it never goes through the NDJSON protocol writer.
+bool writeResource(const QString &resourcePath) {
+    QFile file(resourcePath);
+    if (!file.open(QIODevice::ReadOnly)) return false;
+    char buffer[16384];
+    const HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
+    while (const qint64 read = file.read(buffer, sizeof(buffer))) {
+        if (read < 0) return false;
+        DWORD written = 0;
+        if (!WriteFile(output, buffer, static_cast<DWORD>(read), &written, nullptr)
+            || written != static_cast<DWORD>(read))
+            return false;
+    }
+    return true;
 }
-int main(int argc, char **argv) {
-    Q_INIT_RESOURCE(discovery);
-    QCoreApplication app(argc, argv);
+int licenses() {
+    const char separator[] = "\n-----\n\n";
+    const HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
+    for (const QString &name : {QStringLiteral("LICENSE"), QStringLiteral("THIRD_PARTY_NOTICES.md")}) {
+        const QString header = "===== " + name + " =====\n";
+        DWORD written = 0;
+        const auto headerBytes = header.toUtf8();
+        if (!WriteFile(output, headerBytes.constData(), static_cast<DWORD>(headerBytes.size()), &written, nullptr)) return 1;
+        if (!writeResource(QStringLiteral(":/licenses/") + name)) return 1;
+        if (!WriteFile(output, separator, static_cast<DWORD>(sizeof(separator) - 1), &written, nullptr)) return 1;
+    }
+    return 0;
+}
+}
+
+int cpg::runCli(QCoreApplication &app) {
     SetConsoleCtrlHandler(interruptConsole, TRUE);
     QCoreApplication::setApplicationName("codex-proxy-guard");
     QCoreApplication::setApplicationVersion(CPG_PRODUCT_VERSION);
@@ -75,13 +103,14 @@ int main(int argc, char **argv) {
     parser.setApplicationDescription("Launch Desktop through a loopback HTTP/Mixed proxy.");
     parser.addHelpOption(); parser.addVersionOption();
     parser.addOption({"config", "Guard configuration file.", "path"});
+    parser.addOption({"build-info", "Print embedded build provenance and exit."});
     parser.addOption({"json", "Print launch receipt as JSON."});
     parser.addOption({"refresh-codex-daemon", "Single-use authorization to stop the shared daemon before launch; may interrupt other clients."});
     parser.addOption({"activation-only", "Registered activation diagnostic without proxy arguments or Home file writes."});
     parser.addOption({"force", "Replace the Guard configuration."});
     parser.addOption({"proxy-host", "Loopback proxy host.", "host"});
     parser.addOption({"proxy-port", "Proxy port.", "port"});
-    parser.addPositionalArgument("command", "launch, init-config, config-path, build-info; omitted: interactive console.", "[command]");
+    parser.addPositionalArgument("command", "launch, init-config, config-path, build-info, console, licenses, bridge; omitted: interactive console.", "[command]");
     parser.process(app);
     try {
         const auto args = parser.positionalArguments();
@@ -98,9 +127,13 @@ int main(int argc, char **argv) {
             if (parser.isSet("config")) throw cpg::Error("CLI_INVALID", "The activation worker does not accept configuration.");
             return cpg::activationWorker();
         }
-        if (command == "build-info") {
-            print(QJsonObject{{"version", CPG_PRODUCT_VERSION}, {"commit", CPG_BUILD_COMMIT}, {"dirty", QString(CPG_BUILD_DIRTY) == "true"}, {"language", "C++20"}, {"qt_version", QT_VERSION_STR}, {"protocol_version", 1}}); return 0;
+        if (command == "build-info" || parser.isSet("build-info")) {
+            print(QJsonObject{{"version", CPG_PRODUCT_VERSION}, {"commit", CPG_BUILD_COMMIT}, {"dirty", QString(CPG_BUILD_DIRTY) == "true"}, {"language", "C++20"}, {"qt_version", QT_VERSION_STR}, {"protocol_version", 1},
+                // Compatibility spellings for the former GUI --build-info output.
+                {"product_version", CPG_PRODUCT_VERSION}, {"git_commit", CPG_BUILD_COMMIT}, {"git_dirty", QString(CPG_BUILD_DIRTY) == "true"}});
+            return 0;
         }
+        if (command == "licenses") return licenses();
         const auto path = parser.isSet("config") ? parser.value("config") : cpg::Config::defaultPath();
         if (command == "bridge") return cpg::runBridge(path);
         if (command == "config-path") { print(path); return 0; }
@@ -119,7 +152,7 @@ int main(int argc, char **argv) {
             const ConsoleOperation operation;
             print(cpg::launchPipeline(config, path, {parser.isSet("refresh-codex-daemon"), parser.isSet("activation-only")}, consoleCancellation)); return 0;
         }
-        if (command.isEmpty()) return console(path);
+        if (command.isEmpty() || command == "console") return console(path);
         throw cpg::Error("CLI_INVALID", "Unknown command.");
     } catch (const cpg::Error &e) {
         std::cerr << e.code.toUtf8().constData() << ": " << e.message.toUtf8().constData() << std::endl; return 1;

@@ -124,7 +124,7 @@ private slots:
         // Portable package without the engine binary: start fails and the
         // engine reaches its terminal stopped state long before the user
         // closes the window. The close must still complete exactly once.
-        EngineBridge engine(enginePath(QStringLiteral("missing/fake-engine-absent.exe")), nullptr);
+        EngineBridge engine(enginePath(QStringLiteral("missing/fake-engine-absent.exe")), {}, nullptr, true);
         LauncherController c(&engine);
         QSignalSpy failed(&engine, &IEngineClient::failed);
         QSignalSpy stopped(&engine, &IEngineClient::stopped);
@@ -138,7 +138,7 @@ private slots:
         QTRY_COMPARE(closed.count(), 1);
     }
     void realEngineCrashThenCloseCompletes() {
-        EngineBridge engine(enginePath(QStringLiteral("fake_engine.exe")), nullptr);
+        EngineBridge engine(enginePath(QStringLiteral("fake_engine.exe")), {}, nullptr, true);
         LauncherController c(&engine);
         QSignalSpy stopped(&engine, &IEngineClient::stopped);
         QSignalSpy closed(&c, &LauncherController::closed);
@@ -153,7 +153,7 @@ private slots:
         QCOMPARE(closed.count(), 1);
     }
     void realEngineRestartAfterCrashThenCloseWaitsForNewStop() {
-        EngineBridge engine(enginePath(QStringLiteral("fake_engine.exe")), nullptr);
+        EngineBridge engine(enginePath(QStringLiteral("fake_engine.exe")), {}, nullptr, true);
         LauncherController c(&engine);
         QSignalSpy ready(&engine, &IEngineClient::ready);
         QSignalSpy stopped(&engine, &IEngineClient::stopped);

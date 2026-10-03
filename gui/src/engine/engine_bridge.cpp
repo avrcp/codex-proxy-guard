@@ -15,14 +15,22 @@ constexpr qsizetype ReadChunkBytes = 16 * 1024;
 }
 
 EngineBridge::EngineBridge(QObject *parent)
-    : EngineBridge(QDir(QCoreApplication::applicationDirPath())
-                       .absoluteFilePath(QStringLiteral("engine/codex-proxy-guard.exe")), parent)
+    : EngineBridge(QCoreApplication::applicationFilePath(), {}, parent, false)
 {
 }
 
-EngineBridge::EngineBridge(const QString &absoluteTestEnginePath, QObject *parent)
-    : IEngineClient(parent), enginePath_(absoluteTestEnginePath)
+EngineBridge::EngineBridge(const QString &configPath, QObject *parent)
+    : EngineBridge(QCoreApplication::applicationFilePath(), configPath, parent, false)
 {
+}
+
+EngineBridge::EngineBridge(const QString &absoluteTestEnginePath, const QString &configPath,
+                           QObject *parent, bool testEngineOverride)
+    : IEngineClient(parent), enginePath_(absoluteTestEnginePath), configPath_(configPath)
+{
+    // The test seam is only honoured through this dedicated constructor so a
+    // stray argument can never redirect production process spawning.
+    Q_UNUSED(testEngineOverride);
     process_.setProcessChannelMode(QProcess::SeparateChannels);
 #ifdef Q_OS_WIN
     process_.setCreateProcessArgumentsModifier([](QProcess::CreateProcessArguments *args) {
@@ -108,7 +116,9 @@ void EngineBridge::start()
         return;
     }
     process_.setProgram(enginePath_);
-    process_.setArguments({QStringLiteral("bridge")});
+    QStringList bridgeArguments{QStringLiteral("bridge")};
+    if (!configPath_.isEmpty()) bridgeArguments << QStringLiteral("--config") << configPath_;
+    process_.setArguments(bridgeArguments);
     process_.setWorkingDirectory(QFileInfo(enginePath_).absolutePath());
     startDeadline_ = elapsed_.elapsed() + 10000;
     timer_.start();

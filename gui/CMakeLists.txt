@@ -15,6 +15,7 @@ add_library(guard_gui STATIC
     src/engine/protocol.cpp src/engine/protocol.h
     src/engine/snapshot.cpp src/engine/snapshot.h
     src/controller/launcher_controller.cpp src/controller/launcher_controller.h
+    src/gui_entry.cpp src/gui_entry.h
     src/ui/main_window.cpp src/ui/main_window.h
     src/ui/proxy_settings_dialog.cpp src/ui/proxy_settings_dialog.h
     src/ui/theme.cpp src/ui/theme.h
@@ -28,11 +29,6 @@ target_compile_definitions(guard_gui PUBLIC
     CPG_BUILD_DIRTY="${CPG_BUILD_DIRTY}")
 if(MSVC)
     target_compile_options(guard_gui PRIVATE /W4 /WX /utf-8 /permissive-)
-endif()
-qt_add_executable(CodexProxyGuard WIN32 src/main.cpp)
-target_link_libraries(CodexProxyGuard PRIVATE guard_gui)
-if(MSVC)
-    target_link_options(CodexProxyGuard PRIVATE "/MANIFESTUAC:level='asInvoker' uiAccess='false'")
 endif()
 
 include(CTest)

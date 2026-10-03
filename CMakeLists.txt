@@ -21,3 +21,9 @@ if(BUILD_TESTING)
 endif()
 add_subdirectory(backend)
 add_subdirectory(gui)
+add_subdirectory(app)
+# Backend integration tests spawn the unified production executable, so they
+# are registered only after the app target exists (no CMake cycles).
+if(BUILD_TESTING)
+    add_subdirectory(backend/tests)
+endif()

@@ -20,8 +20,11 @@ import zipfile
 QT_SOURCE_SHA256 = '56001b905601bb9023d399f3ba780d7fa940f3e4861e496a7c490331f49e0b80'
 QT_SOURCE_NAME = 'qtbase-everywhere-src-6.8.3.tar.xz'
 QT_SOURCE_URL = 'https://download.qt.io/archive/qt/6.8/6.8.3/submodules/' + QT_SOURCE_NAME
-REQUIRED_RUNTIME = ('engine/Qt6Core.dll', 'engine/msvcp140.dll', 'engine/vcruntime140.dll',
-                    'platforms/qwindows.dll', 'licenses/tomlplusplus/LICENSE')
+REQUIRED_RUNTIME_LEGACY = ('engine/Qt6Core.dll', 'engine/msvcp140.dll',
+                            'engine/vcruntime140.dll', 'platforms/qwindows.dll',
+                            'licenses/tomlplusplus/LICENSE')
+REQUIRED_RUNTIME_UNIFIED = ('CodexProxyGuard.exe', 'platforms/qwindows.dll',
+                            'licenses/tomlplusplus/LICENSE')
 
 
 def digest(data: bytes) -> str:
@@ -85,9 +88,13 @@ def verify_qt_deployment(actual: dict, info: dict) -> None:
 
 def verify_split(runtime_zip: pathlib.Path, bundle: zipfile.ZipFile, files: dict,
                  info: dict, expected_commit: str, qt_source_sha: str) -> None:
-    for name in REQUIRED_RUNTIME:
+    for name in REQUIRED_RUNTIME_UNIFIED:
         if name not in files:
             raise SystemExit(f'Missing runtime/license file: {name}')
+    production = [name for name in files if name.endswith('.exe')
+                  and name != 'vc_redist.x64.exe']
+    if production != ['CodexProxyGuard.exe']:
+        raise SystemExit(f'Unified runtime must contain exactly one production executable: {production}')
     for name in files:
         if name.startswith('sources/'):
             raise SystemExit(f'Source archive must not ship inside the runtime ZIP: {name}')
@@ -159,7 +166,7 @@ def verify_split(runtime_zip: pathlib.Path, bundle: zipfile.ZipFile, files: dict
 
 
 def verify_legacy(bundle: zipfile.ZipFile, files: dict, info: dict, expected_commit: str) -> None:
-    for name in REQUIRED_RUNTIME:
+    for name in REQUIRED_RUNTIME_LEGACY:
         if name not in files:
             raise SystemExit(f'Missing runtime/license file: {name}')
     actual = verify_member_hashes(bundle, files, info)

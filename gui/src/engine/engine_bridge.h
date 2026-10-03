@@ -31,9 +31,13 @@ signals:
 class EngineBridge final : public IEngineClient {
     Q_OBJECT
 public:
+    // Production roles: relaunch this exact executable file in the bridge
+    // role, optionally forwarding one Guard configuration path.
     explicit EngineBridge(QObject *parent = nullptr);
-    // Test seam only: production always uses the fixed, adjacent bundled engine.
-    EngineBridge(const QString &absoluteTestEnginePath, QObject *parent);
+    explicit EngineBridge(const QString &configPath, QObject *parent = nullptr);
+    // Test seam only: production never overrides the relaunch target.
+    EngineBridge(const QString &absoluteTestEnginePath, const QString &configPath,
+                 QObject *parent, bool testEngineOverride);
     ~EngineBridge() override;
     void start() override;
     quint64 request(const QString &method, const QJsonObject &params = {}) override;
@@ -51,6 +55,7 @@ private:
     void notifyStopped();
 
     const QString enginePath_;
+    const QString configPath_;
     QProcess process_;
     ProtocolDecoder decoder_;
     QByteArray diagnosticRing_;

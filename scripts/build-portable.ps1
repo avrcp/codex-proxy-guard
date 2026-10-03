@@ -332,22 +332,19 @@ try {
     $ExpectedOutput = [IO.Path]::GetFullPath((Join-Path $Root 'dist\gui'))
     if ($Output -ne $ExpectedOutput -or -not $Output.StartsWith($Root + '\', [StringComparison]::OrdinalIgnoreCase)) { throw 'Unsafe package directory.' }
     if (Test-Path -LiteralPath $Output) { Remove-Item -LiteralPath $Output -Recurse -Force }
-    New-Item -ItemType Directory -Path "$Output\engine" -Force | Out-Null
-    Copy-Item -LiteralPath "$Build\gui\CodexProxyGuard.exe" -Destination $Output
-    Copy-Item -LiteralPath "$Build\backend\codex-proxy-guard.exe" -Destination "$Output\engine\codex-proxy-guard.exe"
-    $EngineHash = Get-Hash "$Output\engine\codex-proxy-guard.exe"
+    New-Item -ItemType Directory -Path $Output -Force | Out-Null
+    Copy-Item -LiteralPath "$Build\app\CodexProxyGuard.exe" -Destination $Output
+    $EngineHash = Get-Hash "$Output\CodexProxyGuard.exe"
     Invoke-Checked "$QtRoot\bin\windeployqt.exe" @('--release', '--compiler-runtime', '--no-patchqt', '--qtpaths', "$QtRoot\bin\qtpaths.exe", '--skip-plugin-types', 'generic,networkinformation,tls', '--no-translations', '--no-opengl-sw', '--no-system-d3d-compiler', '--no-system-dxc-compiler', '--dir', $Output, "$Output\CodexProxyGuard.exe")
     # Keep every Qt DLL byte-identical to the verified SDK. qt.conf supplies
     # relative deployment paths instead of windeployqt patching Qt6Core.dll.
     Write-Utf8 "$Output\qt.conf" "[Paths]`nPrefix=.`nPlugins=."
     # The worker lives beside the engine, so it needs its own Qt Core runtime.
-    Copy-Item -LiteralPath "$QtRoot\bin\Qt6Core.dll" -Destination "$Output\engine"
-    Write-Utf8 "$Output\engine\qt.conf" "[Paths]`nPrefix=.`nPlugins=."
     Assert-OfficialQtSdk
     $DeployedQt = [ordered]@{}
     foreach ($Dll in (Get-ChildItem -LiteralPath $Output -Recurse -File -Filter '*.dll')) {
         $Relative = $Dll.FullName.Substring($Output.Length + 1).Replace('\', '/')
-        $SourceRelative = if ($Relative -eq 'engine/Qt6Core.dll') { 'bin/Qt6Core.dll' } elseif ($Relative -notmatch '/') { "bin/$Relative" } else { "plugins/$Relative" }
+        $SourceRelative = if ($Relative -notmatch '/') { "bin/$Relative" } else { "plugins/$Relative" }
         $Entry = $SdkManifest.files_sha256.PSObject.Properties[$SourceRelative]
         if ($null -eq $Entry) {
             # Compiler runtime is checked/copied separately below. Any Qt DLL
@@ -364,27 +361,41 @@ try {
     $CrtDirs = @(Get-ChildItem -LiteralPath "$Vs\VC\Redist\MSVC\$RedistVersion\x64" -Directory | Where-Object Name -match '^Microsoft\.VC\d+\.CRT$')
     if ($CrtDirs.Count -ne 1) { throw 'Cannot unambiguously locate the app-local x64 VC runtime.' }
     Get-ChildItem -LiteralPath $CrtDirs[0].FullName -Filter '*.dll' | Copy-Item -Destination $Output
-    # The C++ engine/activation worker starts from engine/, so the parent's
-    # application-local runtime is not on its DLL search path on a clean PC.
-    Get-ChildItem -LiteralPath $CrtDirs[0].FullName -Filter '*.dll' | Copy-Item -Destination "$Output\engine"
+
     Copy-Item -LiteralPath 'LICENSE', 'THIRD_PARTY_NOTICES.md' -Destination $Output
     Copy-Item -LiteralPath 'licenses' -Destination $Output -Recurse
     New-Item -ItemType Directory -Path "$Output\licenses\tomlplusplus" -Force | Out-Null
     Copy-Item -LiteralPath 'backend\third_party\toml++\LICENSE' -Destination "$Output\licenses\tomlplusplus"
 
-    foreach ($Required in @('Qt6Core.dll', 'Qt6Gui.dll', 'Qt6Widgets.dll', 'platforms\qwindows.dll', 'msvcp140.dll', 'vcruntime140.dll', 'vcruntime140_1.dll', 'engine\Qt6Core.dll', 'engine\msvcp140.dll', 'engine\vcruntime140.dll')) {
+    foreach ($Required in @('CodexProxyGuard.exe', 'Qt6Core.dll', 'Qt6Gui.dll', 'Qt6Widgets.dll', 'platforms\qwindows.dll', 'msvcp140.dll', 'vcruntime140.dll', 'vcruntime140_1.dll')) {
         if (-not (Test-Path -LiteralPath "$Output\$Required" -PathType Leaf)) { throw "Incomplete deployment: $Required" }
     }
+    $ProductionExes = @(Get-ChildItem -LiteralPath $Output -Recurse -File -Filter '*.exe' | Where-Object Name -eq 'CodexProxyGuard.exe')
+    foreach ($Extra in @(Get-ChildItem -LiteralPath $Output -Recurse -File -Filter '*.exe' | Where-Object Name -notin @('CodexProxyGuard.exe', 'vc_redist.x64.exe'))) {
+        throw "Unexpected executable in runtime: $($Extra.Name)"
+    }
+    if ($ProductionExes.Count -ne 1) { throw 'The runtime must contain exactly one production executable.' }
     # Verify DLL loading without SDK paths or plugin overrides.
     $Env:PATH = "$Env:SystemRoot\System32;$Env:SystemRoot"
     Remove-Item Env:QT_PLUGIN_PATH -ErrorAction SilentlyContinue
     $GuiSmoke = Invoke-Smoke "$Output\CodexProxyGuard.exe" '--smoke-test'
-    $GuiEmbedded = (Invoke-Smoke "$Output\CodexProxyGuard.exe" '--build-info') | ConvertFrom-Json
-    if ($GuiEmbedded.git_commit -ne $Commit -or [bool]$GuiEmbedded.git_dirty -ne $false -or $GuiEmbedded.product_version -ne $Version -or $GuiEmbedded.qt_version -ne $QtVersion -or $GuiEmbedded.protocol_version -ne 1) { throw 'GUI embedded provenance mismatch.' }
-    $EngineEmbedded = (Invoke-Smoke "$Output\engine\codex-proxy-guard.exe" 'build-info') | ConvertFrom-Json
-    if ($EngineEmbedded.commit -ne $Commit -or [bool]$EngineEmbedded.dirty -ne $false -or $EngineEmbedded.version -ne $Version -or $EngineEmbedded.language -ne 'C++20' -or $EngineEmbedded.qt_version -ne $QtVersion -or $EngineEmbedded.protocol_version -ne 1) { throw 'Packaged engine provenance mismatch.' }
-    if ((Get-Hash "$Output\engine\codex-proxy-guard.exe") -ne $EngineHash) { throw 'Packaged engine hash changed during deployment.' }
-    $BridgeSmoke = Invoke-BridgeSmoke "$Output\engine\codex-proxy-guard.exe" $Version $Commit
+    foreach ($Spelling in @('--build-info', 'build-info')) {
+        $Embedded = (Invoke-Smoke "$Output\CodexProxyGuard.exe" $Spelling) | ConvertFrom-Json
+        if ($Embedded.git_commit -ne $Commit -or [bool]$Embedded.git_dirty -ne $false -or $Embedded.product_version -ne $Version -or $Embedded.commit -ne $Commit -or [bool]$Embedded.dirty -ne $false -or $Embedded.version -ne $Version -or $Embedded.language -ne 'C++20' -or $Embedded.qt_version -ne $QtVersion -or $Embedded.protocol_version -ne 1) { throw "Embedded provenance mismatch ($Spelling)." }
+    }
+    # Headless roles must not create a GUI platform: a broken QPA name may not
+    # affect build-info or the rejected activation worker input.
+    $Env:QT_QPA_PLATFORM = 'guarded-nonexistent-qpa'
+    $null = Invoke-Smoke "$Output\CodexProxyGuard.exe" 'build-info'
+    $WorkerRejected = $false
+    try { $null = Invoke-Smoke "$Output\CodexProxyGuard.exe" 'internal-activate-package' '{"truncated"' }
+    catch { $WorkerRejected = $true }
+    if (-not $WorkerRejected) { throw 'The activation worker unexpectedly accepted malformed input.' }
+    Remove-Item Env:QT_QPA_PLATFORM -ErrorAction SilentlyContinue
+    if ((Get-Hash "$Output\CodexProxyGuard.exe") -ne $EngineHash) { throw 'Packaged executable hash changed during deployment.' }
+    $BridgeSmoke = Invoke-BridgeSmoke "$Output\CodexProxyGuard.exe" $Version $Commit
+    $Licenses = Invoke-Smoke "$Output\CodexProxyGuard.exe" 'licenses'
+    if ($Licenses -notmatch 'MIT License' -or $Licenses -notmatch 'THIRD_PARTY_NOTICES') { throw 'Embedded licenses output is incomplete.' }
     $Env:PATH = $OriginalPath
     $StatusAfter = (@(& git status --porcelain=v1 --untracked-files=all) -join "`n")
     $CommitAfter = (& git rev-parse HEAD | Out-String).Trim()
@@ -400,7 +411,8 @@ try {
         built_at_utc = [DateTime]::UtcNow.ToString('o')
         profile = 'dynamic-split'
         gui = @{ compiler = 'MSVC x64'; qt_version = $QtVersion; linkage = 'dynamic'; smoke_test = $GuiSmoke }
-        engine = @{ version = $Version; language = 'C++20'; qt_version = $QtVersion; linkage = 'dynamic QtCore'; protocol_version = 1; path = 'engine/codex-proxy-guard.exe'; bridge_smoke_test = $BridgeSmoke }
+        engine = @{ version = $Version; language = 'C++20'; qt_version = $QtVersion; linkage = 'dynamic QtCore (bridge role of the single executable)'; protocol_version = 1; path = 'CodexProxyGuard.exe (bridge role)'; bridge_smoke_test = $BridgeSmoke }
+        roles = 'single executable: gui / bridge / activation worker / cli'
         qt_source = @{ url = $SourceUrl; sha256 = $SourceHash; provided_by = "CodexProxyGuard-$Version-source-compliance.zip (not shipped inside the runtime ZIP)" }
         qt_sdk = @{ archive_url = $SdkManifest.archive_url; archive_sha256 = $SdkManifest.archive_sha256; manifest = 'licenses/Qt/sdk-6.8.3-msvc2022-x64.json'; deployed_files = $DeployedQt }
         files_sha256 = $Files

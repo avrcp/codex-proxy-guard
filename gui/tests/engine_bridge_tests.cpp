@@ -30,7 +30,7 @@ static QString helperPath()
 
 void EngineBridgeTests::handshakeAndRequest()
 {
-    EngineBridge bridge(helperPath(), nullptr);
+    EngineBridge bridge(helperPath(), {}, nullptr, true);
     QSignalSpy ready(&bridge, &IEngineClient::ready);
     QSignalSpy responses(&bridge, &IEngineClient::response);
     QSignalSpy failures(&bridge, &IEngineClient::failed);
@@ -50,7 +50,7 @@ void EngineBridgeTests::handshakeAndRequest()
 
 void EngineBridgeTests::requestErrorKeepsEngine()
 {
-    EngineBridge bridge(helperPath(), nullptr);
+    EngineBridge bridge(helperPath(), {}, nullptr, true);
     QSignalSpy ready(&bridge, &IEngineClient::ready);
     QSignalSpy errors(&bridge, &IEngineClient::requestFailed);
     QSignalSpy failures(&bridge, &IEngineClient::failed);
@@ -71,7 +71,7 @@ void EngineBridgeTests::requestErrorKeepsEngine()
 
 void EngineBridgeTests::crashAndExplicitRestart()
 {
-    EngineBridge bridge(helperPath(), nullptr);
+    EngineBridge bridge(helperPath(), {}, nullptr, true);
     QSignalSpy ready(&bridge, &IEngineClient::ready);
     QSignalSpy failures(&bridge, &IEngineClient::failed);
     QSignalSpy stopped(&bridge, &IEngineClient::stopped);
@@ -98,7 +98,7 @@ void EngineBridgeTests::invalidTransport_data()
 void EngineBridgeTests::invalidTransport()
 {
     QFETCH(QString, scenario);
-    EngineBridge bridge(helperPath(), nullptr);
+    EngineBridge bridge(helperPath(), {}, nullptr, true);
     QSignalSpy ready(&bridge, &IEngineClient::ready);
     QSignalSpy failures(&bridge, &IEngineClient::failed);
     QSignalSpy responses(&bridge, &IEngineClient::response);
@@ -114,7 +114,7 @@ void EngineBridgeTests::invalidTransport()
 
 void EngineBridgeTests::diagnosticsStayOffProtocol()
 {
-    EngineBridge bridge(helperPath(), nullptr);
+    EngineBridge bridge(helperPath(), {}, nullptr, true);
     QSignalSpy ready(&bridge, &IEngineClient::ready);
     QSignalSpy failures(&bridge, &IEngineClient::failed);
     QSignalSpy responses(&bridge, &IEngineClient::response);
@@ -131,7 +131,7 @@ void EngineBridgeTests::diagnosticsStayOffProtocol()
 
 void EngineBridgeTests::cancelOperation()
 {
-    EngineBridge bridge(helperPath(), nullptr);
+    EngineBridge bridge(helperPath(), {}, nullptr, true);
     QSignalSpy ready(&bridge, &IEngineClient::ready);
     QSignalSpy events(&bridge, &IEngineClient::event);
     QSignalSpy responses(&bridge, &IEngineClient::response);
@@ -159,7 +159,7 @@ void EngineBridgeTests::cancelOperation()
 
 void EngineBridgeTests::shutdownActiveOperation()
 {
-    EngineBridge bridge(helperPath(), nullptr);
+    EngineBridge bridge(helperPath(), {}, nullptr, true);
     QSignalSpy ready(&bridge, &IEngineClient::ready);
     QSignalSpy events(&bridge, &IEngineClient::event);
     QSignalSpy failures(&bridge, &IEngineClient::failed);
@@ -176,7 +176,7 @@ void EngineBridgeTests::shutdownActiveOperation()
 
 void EngineBridgeTests::shutdownBeforeStart()
 {
-    EngineBridge bridge(helperPath(), nullptr);
+    EngineBridge bridge(helperPath(), {}, nullptr, true);
     QSignalSpy stopped(&bridge, &IEngineClient::stopped);
     bridge.shutdown();
     bridge.shutdown();
@@ -185,7 +185,7 @@ void EngineBridgeTests::shutdownBeforeStart()
 
 void EngineBridgeTests::unresponsiveChildIsReapedWithUnknownOutcome()
 {
-    EngineBridge bridge(helperPath(), nullptr);
+    EngineBridge bridge(helperPath(), {}, nullptr, true);
     QSignalSpy ready(&bridge, &IEngineClient::ready);
     QSignalSpy responses(&bridge, &IEngineClient::response);
     QSignalSpy failures(&bridge, &IEngineClient::failed);
@@ -202,7 +202,7 @@ void EngineBridgeTests::unresponsiveChildIsReapedWithUnknownOutcome()
 
 void EngineBridgeTests::protocolFailureThenHungCleanupStillReportsUnknownOutcome()
 {
-    EngineBridge bridge(helperPath(), nullptr);
+    EngineBridge bridge(helperPath(), {}, nullptr, true);
     QSignalSpy ready(&bridge, &IEngineClient::ready);
     QSignalSpy failures(&bridge, &IEngineClient::failed);
     QSignalSpy stopped(&bridge, &IEngineClient::stopped);

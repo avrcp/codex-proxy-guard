@@ -36,8 +36,8 @@ def write_zip(path: pathlib.Path, members: dict) -> None:
 def runtime_members(fake_qt_sha: str) -> dict:
     """Return (members, build-info dict) for a consistent runtime ZIP."""
     payload = {name: f'fixture {name}'.encode() for name in
-               ('engine/Qt6Core.dll', 'engine/msvcp140.dll', 'engine/vcruntime140.dll',
-                'platforms/qwindows.dll', 'licenses/tomlplusplus/LICENSE')}
+               ('CodexProxyGuard.exe', 'engine/Qt6Core.dll', 'platforms/qwindows.dll',
+                'licenses/tomlplusplus/LICENSE')}
     files_sha = {name: sha256_bytes(data) for name, data in payload.items()}
     info = {
         'product_version': VERSION, 'git_commit': COMMIT, 'git_dirty': False,
