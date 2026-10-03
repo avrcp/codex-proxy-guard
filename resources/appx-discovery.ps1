@@ -1,6 +1,6 @@
 # Bounded, read-only APPX discovery for Codex Proxy Guard.
 #
-# Output contract (consumed verbatim by crates/proxy-guard-windows/src/appx.rs):
+# Output contract (consumed verbatim by backend/src/platform.cpp):
 #   * a single fixed-schema envelope: {"schema_version":1,"records":[...]};
 #   * the envelope is emitted even when no supported package is installed
 #     (records = []), so "no package" is always distinguishable from a failed

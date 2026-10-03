@@ -1,5 +1,27 @@
 # Security Model
 
+## GUI process boundary
+
+The Qt GUI uses the bundled C++ engine through a strict, bounded stdio protocol;
+it cannot issue arbitrary commands. It never edits TOML or `.env` itself. Backend
+consent and repair each require an explicit Cancel-default dialog and a single-use
+C++ confirmation token bound to the displayed scope and current configuration.
+These supplement the console/CLI authorization paths described below.
+
+The GUI runs asInvoker. C++ remains the final authority on elevation, loopback
+proxy validation, package identity and repair gates. A malformed/mismatched engine
+response disables actions; no submitted operation is auto-retried. Raw stderr is
+not displayed. Shutdown cancels cooperatively before any last-resort termination
+of the GUI-owned bridge child; it never kills Desktop or the shared daemon.
+
+Concurrent frontends cannot replace the authorized Home while a revoke transaction
+is running: Windows configuration handles deny concurrent writes/deletion and
+compare the expected state before any Home change. Launch holds a read-only lease
+until cleanup, so stale launches cannot recreate blocks after consent is revoked.
+Invalid-config repair refuses to overwrite a newly valid configuration. A storage
+failure during Guard config commit attempts rollback and remains an explicit
+error; no crash-atomicity promise is made for the Guard configuration file.
+
 ## 强制边界
 
 - 代理 scheme 必须为 `http`；
@@ -11,7 +33,7 @@
 - 不发现、启动、终止或配置 v2rayN；
 - 不强制终止 Desktop；
 - 不把环境变量注入宣称为全流量代理或强制网络策略；
-- 所有外部错误在 TUI/CLI 展示前脱敏；
+- 所有外部错误在 console/CLI 展示前脱敏；
 - Guard 退出只取消自身工作，不终止外部进程。
 
 ## 程序包身份边界
@@ -44,9 +66,9 @@ codex app-server daemon stop
 
 并且仅限：
 
-- 该次调用已获得用户明确授权（CLI `--refresh-codex-daemon` 或 TUI `D`+`Y`），授权不
+- 该次调用已获得用户明确授权（CLI `--refresh-codex-daemon` 或 console `R` + `YES`），授权不
   持久化到配置；
-- 通过可信来源解析出的官方 Codex CLI 执行：显式 override（现存绝对路径 native `.exe`，
+- 通过受约束的路径解析 Codex CLI 执行（不声称验证发行签名）：显式 override（现存绝对路径 native `.exe`，
   失效即错不换源）、显式 `CODEX_HOME`（必须存在，不回退默认目录、不跨 Home 扫描）、
   已知包布局、PATH 中的绝对目录（跳过当前目录与相对项，不使用 `where.exe`）；
 - stdin 为 null、两条管道各 64 KiB 硬上限（超限先于解析失败）、严格 UTF-8、恰好一个
@@ -61,17 +83,18 @@ codex app-server daemon stop
 
 ## Codex Home `.env` 授权代理块
 
-默认关闭。仅当用户在 TUI `B` 确认页对显示的确切 Home 按下 `Y` 后，Guard 才会在该
+默认关闭。仅当用户确认 GUI 对话框，或在控制台 `B` 对显示的确切 Home 输入 `YES` 后，Guard 才会在该
 Home 的 `.env` 中维护一个 BEGIN/END 标记的 `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` 块。
 该块影响之后从同一 Home 启动的所有 Codex 客户端，不只本次 Desktop；确认文案必须说明
 这一作用域。块的编辑规则：
 
 - 只操作精确匹配的当前版本标记块；重复块、缺损块、未知版本、非 UTF-8、超过 1 MiB
   的文件拒绝自动编辑；
-- 块外字节逐字保留（含 CRLF），文件从不被整体重写，文件内容从不回显；
+- 块外字节逐字保留（含 CRLF）；通过隔离文件事务提交内容，文件内容从不回显；
 - 块外已有代理键（含大小写变体、`export KEY=...` dotenv 写法与 `ALL_PROXY`）按名报告
   冲突（`BACKEND_PROXY_CONFIG_CONFLICT`），绝不抢占或追加覆盖；
-- 写入经同目录临时文件原子替换，替换前复核原内容未变；
+- 写入在本地 NTFS 文件事务中重验原内容并原子提交，隔离外部写入及 rename-save；
+  不支持事务的文件系统或运行时失败关闭，不回退非事务覆盖；
 - 撤销只删除 Guard 自己未被外部修改的块；仅当文件除该块外无实质内容时才删除文件。
   撤销顺序是先安全移除块、成功后才落盘关闭授权——revoke 失败时授权、绑定 Home 与
   文件原样保留（可重试），绝不会留下 Guard 无法再定位的孤儿块；若块已移除而配置
@@ -79,8 +102,8 @@ Home 的 `.env` 中维护一个 BEGIN/END 标记的 `HTTP_PROXY`/`HTTPS_PROXY`/`
 - 未授权（包括仅展示、取消、刷新配置）时绝不创建、修改或删除 `.env`；
 - Guard 绝不从自己的 `CODEX_HOME` 推断 Desktop 的 Home；自定义 Home 未确认时返回
   `BACKEND_PROXY_SCOPE_UNCONFIRMED`，不写任何文件；
-- 准备成功只是文件事实（`backend_proxy_config_prepared`），不是网络验证；实际内置
-  后端不读取该文件时记录 `BACKEND_PROXY_DELIVERY_UNSUPPORTED`，不扩大手段。
+- 准备成功只是文件事实（回执 `backend_proxy_config=prepared`），不是网络验证；
+  Guard 不检查后端是否读取该文件，也不扩大代理交付手段。
 
 禁止：
 
@@ -96,10 +119,9 @@ Home 的 `.env` 中维护一个 BEGIN/END 标记的 `HTTP_PROXY`/`HTTPS_PROXY`/`
 
 ## 权限边界
 
-Guard 不以管理员身份启动 Desktop：Codex 0.157+ 的共享后台服务要求非提升进程。Guard 用
-与 Codex 官方一致的 `TokenElevation` 查询（RAII handle、失败即时捕获 last_os_error）；
-发现自身提升运行时直接阻止 Launch（`ELEVATED_LAUNCH_UNSUPPORTED`），查询本身失败也
-阻止（`ELEVATION_QUERY_FAILED`），绝不把查询失败解释成非提升，也不自动 UAC、不创建
+Guard 不以管理员身份启动 Desktop。Guard 用 `TokenElevation` 查询及 RAII handle；
+发现自身提升运行时直接阻止 Launch（`GUARD_ELEVATED`），查询本身失败也
+阻止（`GUARD_ELEVATION_QUERY_FAILED`），绝不把查询失败解释成非提升，也不自动 UAC、不创建
 低权限 token、不做降权伪装。
 
 ## 信任边界
@@ -111,8 +133,9 @@ canonicalize 后不得逃逸至安装目录外；清单缺失或多入口歧义�
 后备程序。
 `cli_executable_override` 只在指向现存绝对路径 `.exe` 时生效，失效报错而不换源；CLI 与
 Desktop 的身份比较采用一致的 Windows 路径规范化（普通与 extended-length 写法等价），
-名称相似但路径不可读的候选报告 Unknown 而不是“未运行”。Desktop “已运行”只由与已发现
-可执行文件路径相同、具有有效启动时间且不是 Chromium `--type=` 子进程的根进程证明。
+名称相似但路径不可读的候选报告 Unknown 而不是“未运行”。Desktop 进程使用精确映像路径
+及父子关系识别；同路径父进程存在时排除其 helper，孤立同路径进程保守视为 running。
+不读取其他进程的 PEB 或命令行内存。
 
 ## 不做网络判断
 
@@ -122,4 +145,3 @@ Guard 不访问配置的代理端口，也不访问 OpenAI 域名。代理失效
 `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` 仅传递给新启动的进程树。它们不构成 VPN、
 透明代理或防泄漏控制：Guard 不接管 DNS、UDP、系统服务或应用后续以其他路径建立的连接。
 尤其不应把 ChatGPT Voice 等可能使用 UDP 的流量视为已经被 HTTP 代理覆盖。
-
