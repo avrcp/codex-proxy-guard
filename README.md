@@ -8,11 +8,13 @@ Guard 将代理参数交给新启动的 ChatGPT Desktop / Codex Desktop，并可
 
 解压 `CodexProxyGuard-0.6.0-rc.1-windows-x86_64.zip`，运行 `CodexProxyGuard.exe`。保留整个目录；无需安装 Qt 或开发工具。注册应用通过 Windows 原生应用模型激活，普通独立 EXE 使用进程环境。
 
-GUI 可修改 loopback 地址与端口、刷新本地状态、授权或撤销后台代理块，以及启动 Desktop。代理必须为本机 HTTP/Mixed 端口；不支持 SOCKS-only、远程代理或带凭据的 URL。
+GUI 可修改 loopback 地址与端口、刷新本地状态、授权或撤销后台代理块，以及启动 Desktop。代理必须为本机 HTTP/Mixed 端口；不支持 SOCKS-only、远程代理或带凭据的 URL。代理编辑窗口在保存被引擎确认前保持打开：校验、锁定或写入失败时输入原样保留，可原位修正后重试；保存过程中引擎中断则如实报告结果未确认，不会自动重发。
 
 授权对话框显示确切 Home，默认取消。后台代理块影响后来使用这个 Home 的 Codex 进程；“已准备”仅表示文件状态，不能证明网络已通过代理。普通启动绝不解析 Codex CLI，也不调用 daemon 命令。
 
-修复启动每次单独确认，可执行一次公开的 `codex app-server daemon stop`，可能中断其他客户端共享任务。注册应用必须先授权并成功准备代理块。关闭 Guard 不会终止 Desktop；提交激活后取消可能只能报告结果未知，不能自动重试。
+启动成功后 GUI 会区分实例观测：`created` 表示观察到新进程；`reused` 表示复用了已运行的 Desktop 实例——本次启动的代理设置是否重新生效未确认，请完全退出 Desktop 后再从 Guard 启动；`unknown` 表示无法确认实例是否新建。这些是引擎观测分类，不是网络验证。
+
+修复启动每次单独确认，可执行一次公开的 `codex app-server daemon stop`，可能中断其他客户端共享任务。注册应用必须先授权并成功准备代理块。关闭 Guard 不会终止 Desktop；提交激活后取消可能只能报告结果未知，不能自动重试。即使引擎已离线或已崩溃，关闭窗口仍会正常完成，无需任务管理器。
 
 ## CLI 与控制台
 
@@ -49,6 +51,8 @@ alternate_screen = "auto"
 `executable_override` 和 `cli_executable_override` 是可选的绝对 EXE 路径；注册包的 EXE 覆盖仍须经应用模型激活。`proxy_env_home` 只与明确授权的后台代理块配对。保留 `tui.alternate_screen` 供读取既有配置，它不再控制控制台布局。不要手工设置授权字段代替确认流程。
 
 Guard 的块由 `# BEGIN CODEX PROXY GUARD: proxy-v1` 和对应 END 标记界定。块外原字节保留；现有代理变量（含 `export` 拼写）、异常标记或被修改的块会阻止写入。撤销先安全移除块，再保存关闭授权；失败保持授权和绑定 Home。`init-config --force` 不能覆盖尚未撤销的授权。
+
+自动编辑有受限的语法边界：`.env` 中的单行赋值、单行单/双引号值（含转义）、注释、空行和 `export` 拼写可被识别；跨物理行的引号值、续行或未闭合引号会被整体拒绝（`BACKEND_PROXY_ENV_SYNTAX_UNSUPPORTED`），不修改任何字节，授权保持可重试。“不支持自动编辑”不等于该文件无效——请手工修整后重试。此限制防止把引号字符串内的标记误认成 Guard 的托管块。
 
 ## 开发与打包
 

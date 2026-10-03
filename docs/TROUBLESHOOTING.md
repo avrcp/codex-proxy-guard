@@ -22,6 +22,21 @@ retry. Do not reset the config to hide a failed revoke. `init-config --force`
 rejects resetting active consent. A physical disk failure may also prevent a
 configuration write and rollback; inspect the Guard config before continuing.
 
+`BACKEND_PROXY_ENV_SYNTAX_UNSUPPORTED` (shown as "Cannot auto-edit · fix .env
+manually") means the `.env` contains multi-line quoted values, a continuation,
+or an unterminated quote. Guard refuses to edit such files at all — no byte is
+changed, the error names the line, and consent stays bound so you can retry
+after fixing the file. This is a lexical safety refusal, not a network claim
+and not a statement that the file is invalid for every reader. Quote a
+multi-line value on one physical line, or move Guard's managed block into a
+plainly formatted section, then refresh.
+
+If a launch reported a `reused` or `unknown` instance classification, the
+activation call completed but an existing Desktop instance may have handled it.
+This launch's proxy settings may not have been re-applied. Exit Desktop fully
+and launch again from Guard; do not treat the warning as a network failure or
+let any tool auto-retry the activation.
+
 ## Desktop discovery and activation
 
 Guard must run as a normal, non-elevated user. Elevation-query failure also blocks
@@ -56,7 +71,10 @@ version/commit/dirty provenance. Shutdown must complete with stdin still open.
 Bridge failures disable actions and require explicit recovery. stdout is strictly
 bounded NDJSON; stderr is not shown verbatim. The GUI cancels and waits for its own
 engine only; quitting Guard never terminates Desktop. A submitted activation can
-remain unknown even if the helper/bridge has exited.
+remain unknown even if the helper/bridge has exited. A window whose engine already
+failed or crashed still closes normally — no task-manager action is needed. The
+proxy editor keeps your input on any save failure; if the engine failed mid-save,
+verify the stored settings after reconnecting instead of resubmitting blindly.
 
 Backend proxy block writes require working local NTFS transactions. Microsoft
 recommends alternatives to TxF for new applications; this narrow adapter retains

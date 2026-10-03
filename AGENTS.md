@@ -37,7 +37,11 @@ The single `~/.codex/.env` exception: Guard may manage exactly one
 BEGIN/END-marked `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` block inside one
 explicitly authorized Codex Home (`codex.manage_codex_proxy_env` bound to an
 absolute `codex.proxy_env_home`; default off; consent granted or revoked only
-through an explicit single-use prompt). Outside that block nothing is written:
+through an explicit single-use prompt). The file is only auto-edited when every
+physical line is an independent single-line dotenv construct: multi-line quoted
+values, continuations and unterminated quotes are refused whole-file with
+`BACKEND_PROXY_ENV_SYNTAX_UNSUPPORTED` — a marker inside a quoted value is value
+content, never a managed block. Outside that block nothing is written:
 existing keys (including `export KEY=...` dotenv spellings) are reported as
 conflicts, other bytes are preserved verbatim, edits are atomic with content
 re-verification, and the scope is never inferred from Guard's own

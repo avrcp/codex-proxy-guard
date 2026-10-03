@@ -71,3 +71,51 @@ Not exercised: live Desktop activation, live shared-daemon interruption, a clean
 Windows VM, Windows 10, UNC storage, high-DPI/screen-reader acceptance or Authenticode
 signing. Read-only discovery, fixtures and portable smoke do not establish network
 connectivity or prove the backend consumed the proxy block.
+
+## Remediation round — 2026-10-03 review
+
+Baseline `c2102d1`; four fixes landed on top (`6013a0f`…`95ce6c0`), each with
+regression tests added first. The full suite was rerun after every stage.
+
+- R1 `fix(gui): close cleanly after engine has already stopped`. The controller
+  previously waited only for a future `stopped` notification, so after a start
+  failure or post-crash cleanup the window could never close. It now records the
+  terminal stop fact (cleared before each `start()`), and `closed` completes from
+  that fact exactly once per close. Reproduced on the pre-fix controller: the
+  real-bridge start-failure, crash, and window-close cases failed before the fix.
+  `EngineBridge::notifyStopped()` one-shot semantics are unchanged
+  (`shutdownBeforeStart` still passes).
+- R2 `fix(core): reject unsafe dotenv lexical boundaries`. `readEnv()` scanned
+  physical lines without quote context, so a marker block inside a multi-line
+  quoted value was accepted as a real block — inspection reported `current` and
+  revoke would have removed the user's string bytes (reproduced on the pre-gate
+  core: the quoted-template fixture reported `current`). A bounded read-only
+  lexical gate now refuses multi-line quoted values, continuations and
+  unterminated quotes with `BACKEND_PROXY_ENV_SYNTAX_UNSUPPORTED` before marker
+  recognition: no byte changes, inspection reports the new `unsupported` state
+  ("Cannot auto-edit · fix .env manually", never a network claim), and a failed
+  revoke keeps consent with the specific cause. TxF transaction, concurrency and
+  rollback fixtures are unchanged and still pass.
+- R3 `fix(gui): surface reused and unknown activation instances`. The receipt's
+  `instance` classification now drives distinct success messages (reused warns
+  that this launch's proxy settings may not have been re-applied) and a Details
+  row; the automatic post-completion snapshot refresh no longer swallows the
+  warning. Backend receipts still classify created/reused/unknown with a single
+  activation per launch and no retry.
+- R4 `fix(gui): retain proxy edits until save is confirmed`. The proxy editor
+  is now a `ProxySettingsDialog` shown with `open()`; Save submits and waits for
+  the engine-bound `set_proxy` result (`proxySaveSucceeded` / `proxySaveFailed`
+  / `proxySaveOutcomeUnknown`). Validation, lock, write and changed-config
+  failures keep the draft in place for in-place correction; Cancel/Esc/X are
+  blocked only while a save is pending; engine failure mid-save reports an
+  unconfirmed result without resubmitting. A discovery error in the refreshed
+  snapshot after a confirmed save is reported separately from the save result.
+
+Verification this round: `scripts/test-cpp.ps1 -QtRoot C:\Qt\6.8.3\msvc2022_64`
+passed all seven suites (backend core, platform, launch, bridge, GUI protocol,
+controller, engine bridge) with zero failures after each remediation stage;
+`git diff --check` clean. Pre-fix behavior was demonstrated for R1 and R2 by
+re-running the new tests against the unfixed sources. Still not exercised,
+unchanged from above: live Desktop activation, live shared-daemon interruption,
+clean Windows VM, Windows 10, UNC, high-DPI/screen-reader and signing acceptance
+(V1 manual matrix remains pending operator authorization).
