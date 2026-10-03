@@ -241,6 +241,15 @@ private slots:
         QVERIFY(!f.calls.contains("stop"));
         QCOMPARE(failure([&] { f.run({false, true}); }), "ACTIVATION_ONLY_UNSUPPORTED");
     }
+    void instanceObservationPassesThroughWithoutRetry() {
+        for (const QString &instance : {QString("created"), QString("reused"), QString("unknown")}) {
+            Fixture f;
+            f.worker.insert("instance", instance);
+            const auto receipt = f.run();
+            QCOMPARE(receipt.value("instance").toString(), instance);
+            QCOMPARE(f.calls.count("activate"), 1); // Reuse never triggers a second activation.
+        }
+    }
     void activationFailuresNeverRetry() {
         for (const QString &field : {QString("package_identity"), QString("aumid")}) {
             Fixture f;

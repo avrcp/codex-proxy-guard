@@ -231,15 +231,24 @@ void MainWindow::repairDialog() {
     const auto token = controller_->snapshot().value("confirmations").toObject().value("repair").toObject().value("token").toString();
     if (confirm(this, "Repair and launch", "This stops the shared Codex background server. Other CLI, IDE or remote tasks using the same Home may be interrupted.\n\nGuard prepares the authorized backend proxy configuration first. This confirmation applies to one launch only.", "Repair & Launch")) controller_->launch(true, token);
 }
+QString MainWindow::receiptSummary(const QJsonObject &receipt) {
+    const bool activation = receipt.value("launch_method").toString() == "appmodel_activation";
+    const QString instance = receipt.value("instance").toString();
+    const QString instanceText = !activation ? QString("Not applicable")
+        : instance == "reused" ? "Reused an existing instance; this launch's proxy settings may not have been re-applied"
+        : instance == "unknown" ? "Unknown; whether a new instance was created is unconfirmed"
+        : "Created (new instance observed)";
+    return QString("Launch: %1\nInstance: %2\nProxy delivery (how configuration was submitted): %3\nBackend configuration: %4\nDaemon: %5\nPID: %6\n\nThese are engine observations, not network verification.")
+        .arg(receipt.value("launch_method").toString(), instanceText, receipt.value("proxy_delivery").toString(),
+             receipt.value("backend_proxy_config").toString(), receipt.value("daemon_preparation").toString(),
+             QString::number(receipt.value("pid").toInt()));
+}
 void MainWindow::errorDialog() {
     QDialog dialog(this); dialog.setWindowTitle("Action details"); dialog.setMinimumWidth(430);
     auto *layout = new QVBoxLayout(&dialog); layout->setSpacing(16);
     const auto receipt = controller_->receipt();
     const auto detailText = controller_->errorCode().isEmpty()
-        ? QString("Launch: %1\nProxy delivery: %2\nBackend configuration: %3\nDaemon: %4\nPID: %5\n\nThese are engine observations, not network verification.")
-            .arg(receipt.value("launch_method").toString(), receipt.value("proxy_delivery").toString(),
-                 receipt.value("backend_proxy_config").toString(), receipt.value("daemon_preparation").toString(),
-                 QString::number(receipt.value("pid").toInt()))
+        ? receiptSummary(receipt)
         : controller_->errorCode() + "\n\n" + controller_->errorMessage();
     auto *detail = textLabel(detailText, &dialog);
     detail->setTextInteractionFlags(Qt::TextSelectableByMouse | Qt::TextSelectableByKeyboard);

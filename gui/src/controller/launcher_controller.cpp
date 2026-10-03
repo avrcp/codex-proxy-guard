@@ -50,9 +50,19 @@ LauncherController::LauncherController(IEngineClient *engine, QObject *parent)
                 report(error.value("code").toString(), error.value("message").toString());
             } else {
                 receipt_ = event.value("result").toObject();
-                message_ = receipt_.value("launch_method") == "appmodel_activation"
-                    ? "Application activated. Network coverage is not verified."
-                    : "Process created. Network coverage is not verified.";
+                // The activation contract returns the instance that handled it,
+                // not a guarantee of a new process. An existing instance may not
+                // re-apply this launch's proxy settings; surface that fact.
+                const bool activation = receipt_.value("launch_method") == "appmodel_activation";
+                const QString instance = receipt_.value("instance").toString();
+                if (activation && instance == "reused")
+                    message_ = "Activated into an existing Desktop instance; whether this launch's proxy settings were re-applied is unconfirmed. Exit Desktop fully, then launch from Guard again. Network coverage is not verified.";
+                else if (activation && instance == "unknown")
+                    message_ = "Application activated, but whether a new instance was created could not be confirmed. Network coverage is not verified.";
+                else if (activation)
+                    message_ = "Application activated. Network coverage is not verified.";
+                else
+                    message_ = "Process created. Network coverage is not verified.";
             }
             // Keep operation errors visible through the automatic refresh.
             send("snapshot");

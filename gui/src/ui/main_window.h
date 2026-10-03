@@ -10,6 +10,9 @@ class MainWindow final : public QMainWindow {
     Q_OBJECT
 public:
     explicit MainWindow(LauncherController *controller, QWidget *parent = nullptr);
+    // Human-readable receipt observations; distinguishes activation success
+    // from instance reuse and never claims network verification.
+    static QString receiptSummary(const QJsonObject &receipt);
 protected:
     void closeEvent(QCloseEvent *event) override;
 private:

@@ -203,6 +203,37 @@ private slots:
         window.close(); // The window X must actually close even though no stop notification will follow.
         QTRY_VERIFY(!window.isVisible());
     }
+    void instanceObservationSurfacesWarnings() {
+        FakeEngineClient engine; LauncherController c(&engine); c.start(); engine.reply("snapshot", readySnapshot());
+        const auto finish = [&engine](int id, const QString &instance) {
+            emit engine.event({{"event", "operation_finished"}, {"operation_id", id}, {"ok", true},
+                {"result", QJsonObject{{"launch_method", "appmodel_activation"}, {"pid", 123}, {"instance", instance},
+                    {"proxy_delivery", "activation_arguments_and_home_config"}, {"backend_proxy_config", "prepared"},
+                    {"daemon_preparation", "skipped"}}}});
+        };
+        c.launch(); engine.reply("start_launch", {{"operation_id", 3}});
+        finish(3, "reused");
+        QVERIFY(c.errorCode().isEmpty()); // Observation warning, not a fabricated failure.
+        QVERIFY(c.message().contains("existing Desktop instance"));
+        QVERIFY(c.message().contains("not verified"));
+        QCOMPARE(c.receipt().value("instance").toString(), "reused");
+        engine.reply("snapshot", readySnapshot()); // The automatic post-completion refresh must not swallow it.
+        QVERIFY(c.message().contains("existing Desktop instance"));
+        QVERIFY(MainWindow::receiptSummary(c.receipt()).contains("Reused an existing instance"));
+        QVERIFY(MainWindow::receiptSummary(c.receipt()).contains("how configuration was submitted"));
+
+        c.launch(); engine.reply("start_launch", {{"operation_id", 4}});
+        finish(4, "unknown");
+        QVERIFY(c.errorCode().isEmpty());
+        QVERIFY(c.message().contains("could not be confirmed"));
+        QVERIFY(MainWindow::receiptSummary(c.receipt()).contains("Unknown; whether a new instance"));
+
+        c.launch(); engine.reply("start_launch", {{"operation_id", 5}});
+        finish(5, "created");
+        QVERIFY(c.message().contains("Application activated"));
+        QVERIFY(!c.message().contains("existing Desktop instance"));
+        QVERIFY(MainWindow::receiptSummary(c.receipt()).contains("Created (new instance observed)"));
+    }
     void invalidConfigurationCanBeEdited() {
         FakeEngineClient engine; LauncherController c(&engine); c.start();
         auto s = readySnapshot(); s.insert("config_readiness", "repair_required");
