@@ -1,5 +1,6 @@
 #include "tui_app.h"
 #include "cpg/build_info.h"
+#include "clipboard.h"
 #include "cli_console.h"
 #include "input.h"
 #include "screen.h"
@@ -20,6 +21,7 @@
 #include <cstdio>
 #include <cwchar>
 #include <exception>
+#include <iostream>
 #include <string>
 
 namespace cpg::tui {
@@ -76,24 +78,6 @@ std::wstring diagnosticText(const TuiState &state)
         && snapshot.at("coverage").at("state").is_string())
         text += "coverage: " + snapshot.at("coverage").at("state").get<std::string>() + "\n";
     return utf8ToWide(text);
-}
-
-bool copyDiagnostic(const std::wstring &text)
-{
-    if (!OpenClipboard(nullptr)) return false;
-    struct CloseScope { ~CloseScope() { CloseClipboard(); } } closer;
-    EmptyClipboard();
-    const HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, (text.size() + 1) * sizeof(wchar_t));
-    if (!memory) return false;
-    auto *bytes = static_cast<wchar_t *>(GlobalLock(memory));
-    if (!bytes) {
-        GlobalFree(memory);
-        return false;
-    }
-    std::memcpy(bytes, text.c_str(), (text.size() + 1) * sizeof(wchar_t));
-    GlobalUnlock(memory);
-    SetClipboardData(CF_UNICODETEXT, memory); // clipboard owns the handle on success
-    return true;
 }
 
 // Same missing-key contract as tui_state's at(): an empty object, never null
@@ -202,7 +186,13 @@ int runInteractive(const std::filesystem::path &configPath)
                         session.cancel();
                         break;
                     case TuiState::Action::Kind::CopyDiagnostic:
-                        (void)copyDiagnostic(diagnosticText(state));
+                        if (copyDiagnosticToClipboard(diagnosticText(state))) {
+                            state.setNotice("Diagnostic copied");
+                        } else {
+                            const Error failure("CLIPBOARD_FAILED",
+                                                "Cannot copy the diagnostic to the clipboard.");
+                            state.setOperationOutcome(&failure);
+                        }
                         break;
                     case TuiState::Action::Kind::None:
                         break;
@@ -249,16 +239,13 @@ int runTui(const std::filesystem::path &configPath, bool plainOverride)
     try {
         return runInteractive(configPath);
     } catch (const std::exception &error) {
-        // Diagnostic hook for the interactive-acceptance probe; the plain
-        // fallback cannot render an exception that escaped the render loop.
-        if (wchar_t *temp = _wgetenv(L"TEMP")) {
-            FILE *log = _wfsopen((std::wstring(temp) + L"\\cpg_tui_crash.txt").c_str(),
-                                 L"w", _SH_DENYNO);
-            if (log) {
-                std::fwprintf(log, L"%hs\n", error.what());
-                fclose(log);
-            }
-        }
+        // TerminalSession's RAII teardown already restored the console; one
+        // redacted public line on stderr is the whole diagnostic story. No
+        // persistent crash log is written.
+        std::cerr << "TUI_FAILED: " << publicText(error.what(), 200) << std::endl;
+        return 1;
+    } catch (...) {
+        std::cerr << "TUI_FAILED: unknown error" << std::endl;
         return 1;
     }
 }

@@ -8,6 +8,7 @@
 #endif
 
 #include "cli_console.h"
+#include "clipboard.h"
 #include "display_width.h"
 #include "input.h"
 #include "screen.h"
@@ -510,6 +511,94 @@ TEST_CASE("timed-out operations stay busy until their future is reaped")
     // After the reap the gate is open again for a new operation.
     session.requestRefresh();
     CHECK(session.busy());
+}
+
+namespace {
+
+struct RecordingClipboardApi : public ClipboardApi {
+    bool failOpen = false, failEmpty = false, failLock = false, failUnlock = false,
+         failSet = false;
+    bool opened = false, emptied = false, closed = false, setTextCalled = false;
+    int allocations = 0, frees = 0;
+    void *lastFreed = nullptr;
+    wchar_t buffer[512] = {};
+
+    bool open(void *) override { opened = true; return !failOpen; }
+    bool empty() override { emptied = true; return !failEmpty; }
+    void *allocate(std::size_t) override
+    {
+        ++allocations;
+        return reinterpret_cast<void *>(0x1234);
+    }
+    void *lock(void *) override
+    {
+        if (failLock) return nullptr;
+        return buffer;
+    }
+    bool unlock(void *) override { return !failUnlock; }
+    bool setText(void *) override
+    {
+        setTextCalled = true;
+        return !failSet;
+    }
+    void freeMemory(void *memory) override { ++frees; lastFreed = memory; }
+    void close() override { closed = true; }
+};
+
+} // namespace
+
+TEST_CASE("clipboard copy obeys Win32 handle ownership rules")
+{
+    RecordingClipboardApi api;
+    // Success: the accepted HGLOBAL is never freed; the text arrived intact.
+    CHECK(copyDiagnosticText(L"diagnostic 中文", api, reinterpret_cast<void *>(7)));
+    CHECK(api.opened);
+    CHECK(api.emptied);
+    CHECK(api.setTextCalled);
+    CHECK(api.closed);
+    CHECK(api.allocations == 1);
+    CHECK(api.frees == 0);
+    CHECK(api.buffer == std::wstring(L"diagnostic 中文"));
+    // SetClipboardData refused: ownership never transferred, so it is freed.
+    RecordingClipboardApi refused;
+    refused.failSet = true;
+    CHECK_FALSE(copyDiagnosticText(L"x", refused, nullptr));
+    CHECK(refused.frees == 1);
+    CHECK(refused.lastFreed == reinterpret_cast<void *>(0x1234));
+    // Earlier failures never leak an allocation either.
+    RecordingClipboardApi emptyFailed;
+    emptyFailed.failEmpty = true;
+    CHECK_FALSE(copyDiagnosticText(L"x", emptyFailed, nullptr));
+    CHECK(emptyFailed.allocations == 0);
+    RecordingClipboardApi lockFailed;
+    lockFailed.failLock = true;
+    CHECK_FALSE(copyDiagnosticText(L"x", lockFailed, nullptr));
+    CHECK(lockFailed.frees == 1);
+    RecordingClipboardApi unlockFailed;
+    unlockFailed.failUnlock = true;
+    CHECK_FALSE(copyDiagnosticText(L"x", unlockFailed, nullptr));
+    CHECK(unlockFailed.frees == 1);
+    RecordingClipboardApi openFailed;
+    openFailed.failOpen = true;
+    CHECK_FALSE(copyDiagnosticText(L"x", openFailed, nullptr));
+    CHECK(openFailed.allocations == 0);
+}
+
+TEST_CASE("the copy notice is transient feedback on the status line")
+{
+    TuiState state;
+    state.setSnapshot(snapshotFixture());
+    state.setNotice("Diagnostic copied");
+    Screen screen;
+    screen.resize(80, 24);
+    state.draw(screen);
+    std::wstring frame = renderFrame(screen);
+    CHECK(frame.find(L"Diagnostic copied") != std::wstring::npos);
+    // The next snapshot replaces it with the usual status line.
+    state.setSnapshot(snapshotFixture());
+    state.draw(screen);
+    frame = renderFrame(screen);
+    CHECK(frame.find(L"Diagnostic copied") == std::wstring::npos);
 }
 
 CPG_TEST_MAIN

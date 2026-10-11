@@ -86,12 +86,14 @@ Box drawBox(Screen &screen, const std::wstring &title, int width, int height)
 void TuiState::setBusy(bool busy, const std::string &label)
 {
     if (busy && !busy_) modal_ = Modal::None; // entering busy closes modals
+    if (busy) notice_.clear();
     busy_ = busy;
     busyLabel_ = label;
 }
 
 void TuiState::setOperationOutcome(const Error *error)
 {
+    notice_.clear();
     hasOutcome_ = true;
     outcomeOk_ = error == nullptr;
     outcomeCode_.clear();
@@ -367,6 +369,10 @@ void TuiState::drawMain(Screen &screen) const
     screen.rule(screen.height() - 3, StyleDim);
     if (busy_) {
         screen.text(1, screen.height() - 2, L"[ Ctrl+C ] Cancel " + widen(busyLabel_), StyleYellow);
+    } else if (!notice_.empty()) {
+        std::wstring notice;
+        appendTruncated(notice, widen(notice_), screen.width() - 2);
+        screen.text(1, screen.height() - 2, notice, StyleGreen);
     } else if (canLaunch) {
         screen.text(1, screen.height() - 2,
                     L"[ Enter ] Launch " + widen(desktop.value("display_name", "Desktop")), StyleBold);

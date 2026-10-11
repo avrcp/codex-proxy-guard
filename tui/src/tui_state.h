@@ -28,13 +28,16 @@ public:
         std::string token;              // ConfirmConsent / ConfirmRepair
     };
 
-    void setSnapshot(Json value) { snapshot_ = std::move(value); }
+    void setSnapshot(Json value) { snapshot_ = std::move(value); notice_.clear(); }
     void setBusy(bool busy, const std::string &label);
     void setOperationOutcome(const Error *error); // null = success receipt
     void setSpinnerPhase(int phase) { spinnerPhase_ = phase; }
     void setEditorSeed(const std::wstring &host, const std::wstring &port);
     void setConfirmHome(const std::wstring &home) { confirmHome_ = home; }
     void setDiagnostic(const std::string &text) { diagnostic_ = text; }
+    // Transient one-shot feedback (e.g. "Diagnostic copied"); cleared by the
+    // next snapshot, operation outcome or busy phase.
+    void setNotice(const std::string &text) { notice_ = text; }
 
     Modal modal() const { return modal_; }
     void clearModal() { modal_ = Modal::None; }
@@ -74,6 +77,7 @@ private:
     bool hasOutcome_ = false;
     bool outcomeOk_ = false;
     std::string outcomeCode_, outcomeMessage_;
+    std::string notice_;
     std::string diagnostic_;
 };
 

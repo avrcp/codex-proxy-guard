@@ -1,6 +1,7 @@
 # Win32 VT TUI plus the plain-console fallback over the shared engine session.
 add_library(guard_tui STATIC
     src/cli_console.cpp
+    src/clipboard.cpp
     src/display_width.cpp
     src/input.cpp
     src/screen.cpp
