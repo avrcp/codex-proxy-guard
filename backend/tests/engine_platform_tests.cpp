@@ -8,12 +8,14 @@
 #endif
 
 #include "platform.h"
+#include "package_discovery.h"
 #include "platform_protocol_p.h"
 #include "../../tests/support/test_support.h"
 
 #include <windows.h>
 #include <shellapi.h>
 
+#include <cctype>
 #include <string>
 #include <thread>
 
@@ -21,6 +23,13 @@ using namespace cpg;
 using namespace cpgtest;
 
 namespace {
+
+std::string asciiLower(std::string value)
+{
+    for (char &character : value)
+        character = static_cast<char>(std::tolower(static_cast<unsigned char>(character)));
+    return value;
+}
 
 Json application(const std::string &id = "App", const std::string &executable = "app\\ChatGPT.exe")
 {
@@ -254,6 +263,71 @@ TEST_CASE("owned helper output limit and submission")
                         std::chrono::milliseconds(100), 1024,
                         UnicodeEnvironment::current(), true);
     }) == "APPX_ACTIVATION_OUTCOME_UNKNOWN");
+}
+
+TEST_CASE("native discovery matches the PowerShell baseline fixture")
+{
+    std::ifstream stream(utf8ToWide(CPG_DISCOVERY_FIXTURE).c_str(), std::ios::binary);
+    REQUIRE(stream.good());
+    std::ostringstream buffer;
+    buffer << stream.rdbuf();
+    const Json baseline = parseStrictJsonObject(buffer.str(), 64 * 1024, "FIXTURE_INVALID");
+    const Json native = discoverPackagesNative(Cancellation{});
+    const Json &baselineRecords = baseline.at("records");
+    const Json &nativeRecords = native.at("records");
+    for (const auto &expected : baselineRecords) {
+        bool found = false;
+        for (const auto &record : nativeRecords) {
+            if (record.at("package_name") != expected.at("package_name")) continue;
+            found = true;
+            CHECK(record.at("package_family_name") == expected.at("package_family_name"));
+            CHECK(record.at("architecture") == expected.at("architecture"));
+            CHECK(record.at("applications") == expected.at("applications"));
+            const std::string fullName = record.value("package_full_name", "");
+            const std::string family = record.value("package_family_name", "");
+            const std::string architecture = record.value("architecture", "");
+            const std::string prefix = record.value("package_name", "") + "_";
+            CHECK(fullName.rfind(prefix, 0) == 0);
+            // Full names embed the lowercase architecture segment.
+            std::string lowered = fullName;
+            for (char &character : lowered)
+                character = static_cast<char>(std::tolower(static_cast<unsigned char>(character)));
+            const std::string loweredArchitecture = asciiLower(architecture);
+            CHECK(lowered.find('_' + loweredArchitecture + '_') != std::string::npos);
+            // The publisher id closes both the full name and the family name.
+            const std::string publisherId = family.substr(family.rfind('_') + 1);
+            CHECK(fullName.size() > publisherId.size());
+            CHECK(fullName.compare(fullName.size() - publisherId.size(),
+                                   publisherId.size(), publisherId) == 0);
+            const std::string install = record.value("install_location", "");
+            CHECK(std::filesystem::is_directory(std::filesystem::path(utf8ToWide(install))));
+            CHECK(install.find("WindowsApps") != std::string::npos);
+            const std::string version = record.value("package_version", "");
+            int dots = 0;
+            bool digits = !version.empty();
+            for (const char character : version)
+                if (character == '.') ++dots;
+                else if (character < '0' || character > '9') digits = false;
+            CHECK(dots == 3);
+            CHECK(digits);
+        }
+        CHECK(found);
+    }
+    // End to end: the production discovery path resolves the registered
+    // Desktop on this machine (or fails closed as not installed).
+    Config config;
+    bool notInstalled = false;
+    Desktop desktop;
+    try { desktop = discoverDesktop(config, Cancellation{}); }
+    catch (const Error &error) { notInstalled = error.code == "CODEX_NOT_INSTALLED"; }
+    if (!notInstalled) {
+        CHECK(desktop.registered);
+        CHECK(desktop.runtimeKind == "full_trust_desktop");
+        CHECK(desktop.aumid.rfind("OpenAI.", 0) == 0);
+        CHECK(desktop.aumid.find('!') != std::string::npos);
+        CHECK(std::filesystem::is_regular_file(desktop.executable));
+        CHECK(pathWithin(desktop.installLocation, desktop.executable));
+    }
 }
 
 TEST_CASE("normalized paths and current process")

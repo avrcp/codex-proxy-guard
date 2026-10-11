@@ -2,6 +2,7 @@
 #include "cpg/build_info.h"
 #include "cpg/path.h"
 #include "cpg/win_handle.h"
+#include "package_discovery.h"
 #include "platform_protocol_p.h"
 
 #include <algorithm>
@@ -20,10 +21,6 @@
 #include <appmodel.h>
 #include <shobjidl.h>
 #include <tlhelp32.h>
-
-// Generated at configure time from resources/appx-discovery.ps1 so the engine
-// needs no Qt resource system.
-#include "discovery_script.h"
 
 namespace cpg {
 namespace {
@@ -454,20 +451,10 @@ Desktop parseDiscovery(const std::string &json, const std::filesystem::path &ove
 Desktop discoverDesktop(const Config &config, const Cancellation &cancel)
 {
     cancel.check();
-    const std::size_t scriptSize = std::strlen(discoveryScript);
-    if (scriptSize > 64 * 1024 || !strictUtf8(std::string_view(discoveryScript, scriptSize)))
-        fail("APPX_DISCOVERY_FAILED", "Invalid discovery resource");
-    std::array<wchar_t, MAX_PATH + 1> buffer{};
-    const UINT size = GetSystemDirectoryW(buffer.data(), static_cast<UINT>(buffer.size()));
-    if (!size || size >= buffer.size()) fail("APPX_DISCOVERY_FAILED", "Cannot resolve system PowerShell");
-    const std::filesystem::path powershell = std::filesystem::path(std::wstring(buffer.data(), size))
-        / L"WindowsPowerShell" / L"v1.0" / L"powershell.exe";
-    const HelperResult result = runHelper(powershell,
-        {L"-NoLogo", L"-NoProfile", L"-NonInteractive", L"-Command", utf8ToWide(std::string_view(discoveryScript, scriptSize))},
-        {}, cancel, std::chrono::milliseconds(15000), 128 * 1024);
-    if (result.out.size() > 64 * 1024) fail("APPX_DISCOVERY_OUTPUT_LIMIT", "Discovery output exceeded 64 KiB");
-    if (result.exitCode != 0) fail("APPX_DISCOVERY_FAILED", "System PowerShell discovery failed");
-    return parseDiscovery(result.out, config.executableOverride);
+    // Native AppModel discovery only: no PowerShell child, no fallback to it
+    // (failures surface as APPX_DISCOVERY_FAILED / CODEX_NOT_INSTALLED).
+    const Json envelope = discoverPackagesNative(cancel);
+    return parseDiscovery(jsonDump(envelope), config.executableOverride);
 }
 
 ProcessState desktopProcessState(const Desktop &desktop)

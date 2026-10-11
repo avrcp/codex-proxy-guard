@@ -9,6 +9,7 @@ foreach(name engine_core engine_platform engine_launch engine_bridge)
     target_compile_options(${name}_suite PRIVATE /W4 /WX /utf-8 /permissive-)
     target_compile_definitions(${name}_suite PRIVATE
         TARGET_ENGINE_PATH="$<TARGET_FILE:CodexProxyGuard>"
+        CPG_DISCOVERY_FIXTURE="${CMAKE_SOURCE_DIR}/backend/tests/fixtures/appx_discovery_baseline.json"
         NOMINMAX WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00
         _CRT_SECURE_NO_WARNINGS)
     add_test(NAME backend_${name} COMMAND ${name}_suite)

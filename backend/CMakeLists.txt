@@ -1,9 +1,7 @@
-# Qt-free engine: core, platform, launch, bridge (interim regression role)
-# and the CLI/console frontends over the foundation primitives.
+# Qt-free engine: core, platform (native AppModel discovery), launch,
+# bridge (interim regression role) and the CLI/console frontends over the
+# foundation primitives.
 file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated")
-file(READ "${CMAKE_SOURCE_DIR}/resources/appx-discovery.ps1" CPG_DISCOVERY_SCRIPT)
-file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/generated/discovery_script.h"
-"// Generated from resources/appx-discovery.ps1; do not edit.\nnamespace cpg { const char discoveryScript[] = R\"CPG(${CPG_DISCOVERY_SCRIPT})CPG\"; }\n")
 
 # The embedded notice set: project license, third-party notices and (until the
 # Qt assets are removed) the complete Qt license tree, sorted exactly like the
@@ -45,9 +43,9 @@ set(CPG_LICENSES_MANIFEST "${CPG_LICENSES_MANIFEST}    };\n    return entries;\n
 file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/generated/licenses_manifest.h" "${CPG_LICENSES_MANIFEST}")
 file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/generated/licenses.rc" "${CPG_LICENSES_RC}")
 
-add_library(guard_engine STATIC src/core.cpp src/platform.cpp src/launch.cpp src/bridge.cpp src/cli.cpp)
+add_library(guard_engine STATIC src/core.cpp src/platform.cpp src/package_discovery.cpp src/launch.cpp src/bridge.cpp src/cli.cpp)
 target_include_directories(guard_engine PUBLIC src "${CMAKE_CURRENT_BINARY_DIR}/generated")
-target_link_libraries(guard_engine PUBLIC guard_foundation PRIVATE ws2_32 ktmw32)
+target_link_libraries(guard_engine PUBLIC guard_foundation PRIVATE ws2_32 ktmw32 shlwapi)
 target_compile_definitions(guard_engine PUBLIC
     NOMINMAX WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00
     _CRT_SECURE_NO_WARNINGS)
