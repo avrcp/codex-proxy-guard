@@ -18,13 +18,19 @@ enum Style : std::uint8_t {
 };
 
 struct Cell {
-    wchar_t glyph = L' ';
+    // Full glyph of the leading cell (an ASCII char, one wide CJK char or a
+    // two-unit surrogate pair, optionally followed by combining marks); empty
+    // for the continuation cells of a wide glyph.
+    std::wstring glyph = L" ";
     std::uint8_t style = StyleDefault;
+    bool continuation = false;
 };
 
 // Off-screen frame buffer. All composition happens here; the renderer turns a
 // finished frame into one console write. Wide glyphs occupy their lead cell
-// only (the trailing cell keeps a space) so the buffer stays index-aligned.
+// and mark the following cell(s) as continuation: the renderer emits the wide
+// glyph once and skips continuation cells, so a row's display width always
+// equals Screen::width().
 class Screen {
 public:
     Screen() = default;

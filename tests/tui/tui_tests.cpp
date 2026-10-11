@@ -97,6 +97,143 @@ TEST_CASE("screen clips wide text and never writes out of bounds")
     CHECK(screen.height() == 2);
 }
 
+TEST_CASE("screen writes an emoji atomically at the right boundary")
+{
+    Screen screen;
+    screen.resize(2, 1);
+    const wchar_t emoji[] = L"\xd83d\xde42";
+    CHECK(screen.text(0, 0, emoji) == 2);
+    CHECK(screen.cell(0, 0).glyph == emoji);
+    CHECK(screen.cell(1, 0).continuation);
+    const std::wstring frame = renderFrame(screen);
+    CHECK(frame.find(emoji) != std::wstring::npos);
+    // The pair is emitted exactly once (no duplicated low half via the
+    // continuation cell).
+    const std::size_t pairPos = frame.find(emoji);
+    CHECK(frame.find(emoji, pairPos + 1) == std::wstring::npos);
+}
+
+TEST_CASE("emoji that cannot fit is not partially written")
+{
+    Screen screen;
+    screen.resize(1, 1);
+    const wchar_t emoji[] = L"\xd83d\xde42";
+    CHECK(screen.text(0, 0, emoji) == 0);
+    const std::wstring frame = renderFrame(screen);
+    CHECK(frame.find(emoji) == std::wstring::npos);
+    CHECK(frame.find(L"\xd83d", 3) == std::wstring::npos); // no stray high half
+    CHECK(screen.cell(0, 0).glyph == L" ");
+}
+
+TEST_CASE("combining mark attaches to the previous glyph")
+{
+    Screen screen;
+    screen.resize(4, 1);
+    CHECK(screen.text(0, 0, L"a\x0301") == 1);
+    CHECK(screen.cell(0, 0).glyph == L"a\x0301");
+    CHECK_FALSE(screen.cell(1, 0).continuation);
+    CHECK(renderFrame(screen).find(L"a\x0301") != std::wstring::npos);
+    // A mark after a wide glyph attaches to that glyph's leading cell.
+    CHECK(screen.text(1, 0, L"\x4e2d\x0301") == 2);
+    CHECK(screen.cell(1, 0).glyph == L"\x4e2d\x0301");
+    CHECK(screen.cell(2, 0).continuation);
+}
+
+TEST_CASE("zero-width cluster at the clipped boundary never writes out of bounds")
+{
+    Screen screen;
+    screen.resize(1, 1);
+    CHECK(screen.text(0, 0, L"a") == 1);
+    // The mark lands on the existing cell, not on cell(1, 0).
+    CHECK(screen.text(1, 0, L"\x0301") == 0);
+    CHECK(screen.cell(0, 0).glyph == L"a\x0301");
+    // A mark with no preceding cell in the row is dropped.
+    Screen fresh;
+    fresh.resize(4, 1);
+    CHECK(fresh.text(0, 0, L"\x0301" L"b") == 1);
+    CHECK(fresh.cell(0, 0).glyph == L"b");
+    // Out-of-frame writes never attach to anything.
+    CHECK(screen.text(100, 0, L"\x0301") == 0);
+}
+
+TEST_CASE("isolated surrogate becomes replacement character")
+{
+    const DisplayCluster high = nextDisplayCluster(L"\xd83d", 0);
+    CHECK(high.text == L"\xfffd");
+    CHECK(high.width == 1);
+    CHECK(high.consumed == 1);
+    const DisplayCluster low = nextDisplayCluster(L"a\xdc00", 1);
+    CHECK(low.text == L"\xfffd");
+    CHECK(low.width == 1);
+    Screen screen;
+    screen.resize(2, 1);
+    CHECK(screen.text(0, 0, L"\xd83d") == 1);
+    CHECK(screen.cell(0, 0).glyph == L"\xfffd");
+    const std::wstring frame = renderFrame(screen);
+    CHECK(frame.find(L"\xd83d") == std::wstring::npos);
+    CHECK(frame.find(L"\xfffd") != std::wstring::npos);
+}
+
+TEST_CASE("wide clusters clip exactly at the frame edge")
+{
+    Screen screen;
+    screen.resize(3, 1);
+    // Only the first CJK glyph fits; the second must not be partially written.
+    CHECK(screen.text(0, 0, L"\x4e2d\x6587") == 2);
+    CHECK(screen.cell(0, 0).glyph == L"\x4e2d");
+    CHECK(screen.cell(1, 0).continuation);
+    CHECK(screen.cell(2, 0).glyph == L" ");
+    Screen mixed;
+    mixed.resize(4, 1);
+    // Emoji (2) + ASCII (1) leaves 1: the trailing CJK glyph does not fit.
+    CHECK(mixed.text(0, 0, L"\xd83d\xde42" L"a\x4e2d") == 3);
+    CHECK(mixed.cell(3, 0).glyph == L" ");
+}
+
+TEST_CASE("cluster-aware truncation never splits a glyph")
+{
+    std::wstring out;
+    appendTruncated(out, L"\xd83d\xde42", 1);
+    CHECK(out.empty()); // a wide cluster cannot fit one cell, not even half of it
+    out.clear();
+    CHECK(appendTruncated(out, L"a\xd83d\xde42" L"bcd", 4) == 4);
+    CHECK(out == L"a...");
+    out.clear();
+    // Combining marks travel with their base, and an isolated surrogate is
+    // normalized instead of being copied through.
+    appendTruncated(out, L"a\x0301\xd83d" L"b", 20);
+    CHECK(out == L"a\x0301\xfffd" L"b");
+    out.clear();
+    // "C:/☺🙂/.ćodex" into 5 cells: the emoji cannot be half-kept, so the
+    // ellipsis rolls back past ☺ and only "C:..." fits.
+    const std::wstring emojiHome = L"C:/\x263a\xd83d\xde42/.c\x0301odex";
+    CHECK(appendTruncated(out, emojiHome, 5) == 5);
+    CHECK(out == L"C:...");
+}
+
+TEST_CASE("the main view renders unicode homes without escaping the frame")
+{
+    TuiState state;
+    Json snapshot = snapshotFixture(true, true);
+    snapshot["coverage"]["authorized_home"] = "C:/users/\xf0\x9f\x99\x82\xc3\xa1/.c\xc2\xa1odex";
+    state.setSnapshot(snapshot);
+    for (const int width : {72, 40, 30}) {
+        Screen screen;
+        screen.resize(width, 22);
+        REQUIRE_NOTHROW(state.draw(screen));
+        const std::wstring frame = renderFrame(screen);
+        // Every high surrogate in the frame is part of a complete pair —
+        // truncation of the home path never emits a dangling half.
+        std::size_t at = frame.find(L"\xd83d");
+        while (at != std::wstring::npos) {
+            CHECK(frame.find(L"\xd83d\xde42", at) == at);
+            at = frame.find(L"\xd83d", at + 2);
+        }
+        if (width >= 40) // the emoji still fits; a narrow frame cuts before it
+            CHECK(frame.find(L"\xd83d\xde42") != std::wstring::npos);
+    }
+}
+
 TEST_CASE("input normalization maps records to keys and resize")
 {
     INPUT_RECORD records[4]{};

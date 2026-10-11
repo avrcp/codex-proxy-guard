@@ -34,19 +34,35 @@ int Screen::text(int x, int y, std::wstring_view value, std::uint8_t style)
     if (y < 0 || y >= height_) return 0;
     int column = std::max(0, x);
     int used = 0;
-    bool previousHigh = false;
-    for (std::size_t index = 0; index < value.size(); ++index) {
-        const wchar_t unit = value[index];
-        const int unitWidth = codeUnitWidth(unit, previousHigh);
-        previousHigh = (unit >= 0xd800 && unit <= 0xdbff) && !previousHigh;
-        if (column + unitWidth > width_) break;
-        if (column >= 0) {
-            cell(column, y) = Cell{unit, style};
-            for (int fill = 1; fill < unitWidth; ++fill)
-                cell(column + fill, y) = Cell{L' ', style};
+    std::size_t offset = 0;
+    while (offset < value.size()) {
+        const DisplayCluster cluster = nextDisplayCluster(value, offset);
+        offset += cluster.consumed;
+        if (cluster.combiningOnly) {
+            // Zero-width marks attach to the leading cell that ends at the
+            // previous column; they never address cell(column, ...) — that is
+            // what made the old unit-based writer go out of bounds at the
+            // right edge.
+            if (column > 0 && column <= width_) {
+                int lead = column - 1;
+                while (lead > 0 && cell(lead, y).continuation) --lead;
+                if (!cell(lead, y).continuation) cell(lead, y).glyph.append(cluster.text);
+            }
+            continue;
         }
-        column += unitWidth;
-        used += unitWidth;
+        if (column + cluster.width > width_) break;
+        Cell &lead = cell(column, y);
+        lead.glyph = cluster.text;
+        lead.style = style;
+        lead.continuation = false;
+        for (int fill = 1; fill < cluster.width; ++fill) {
+            Cell &tail = cell(column + fill, y);
+            tail.glyph.clear();
+            tail.style = style;
+            tail.continuation = true;
+        }
+        column += cluster.width;
+        used += cluster.width;
     }
     return used;
 }
@@ -54,7 +70,7 @@ int Screen::text(int x, int y, std::wstring_view value, std::uint8_t style)
 void Screen::rule(int y, std::uint8_t style)
 {
     if (y < 0 || y >= height_) return;
-    for (int x = 0; x < width_; ++x) cell(x, y) = Cell{L'\x2500', style};
+    for (int x = 0; x < width_; ++x) cell(x, y) = Cell{std::wstring(1, L'\x2500'), style, false};
 }
 
 std::wstring renderFrame(const Screen &screen)
@@ -78,18 +94,12 @@ std::wstring renderFrame(const Screen &screen)
     };
     for (int y = 0; y < screen.height(); ++y) {
         if (y > 0) frame.push_back(L'\n');
-        int x = 0;
-        while (x < screen.width()) {
+        for (int x = 0; x < screen.width(); ++x) {
             const Cell &current = screen.cell(x, y);
+            if (current.continuation) continue; // the wide glyph already covers it
             applyStyle(current.style);
-            frame.push_back(current.glyph);
-            int run = 1;
-            while (x + run < screen.width()
-                   && screen.cell(x + run, y).style == current.style) {
-                frame.push_back(screen.cell(x + run, y).glyph);
-                ++run;
-            }
-            x += run;
+            if (current.glyph.empty()) frame.push_back(L' ');
+            else frame.append(current.glyph);
         }
         applyStyle(StyleDefault);
         frame.append(L"\x1b[K"); // clear to end of line
