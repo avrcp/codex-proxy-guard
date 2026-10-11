@@ -1,32 +1,15 @@
-#ifndef _CRT_RAND_S
-#define _CRT_RAND_S
-#endif
 #include "bridge.h"
 #include "cpg/build_info.h"
 #include "cpg/win_handle.h"
 
 #include <cmath>
 #include <cstdio>
-#include <cstdlib>
+#include <memory>
 #include <thread>
 #include <windows.h>
 
 namespace cpg {
 namespace {
-
-std::string randomToken()
-{
-    // 128 bits from the CSPRNG-backed rand_s, formatted as a UUID-shaped hex
-    // token. Single-use confirmation nonce; not a security boundary by itself.
-    unsigned int values[4] = {};
-    for (unsigned int &value : values) {
-        if (rand_s(&value) != 0) throw Error("BRIDGE_RANDOM_UNAVAILABLE", "Cannot generate a confirmation token.");
-    }
-    char buffer[33] = {};
-    std::snprintf(buffer, sizeof buffer, "%08x%08x%08x%08x",
-                  values[0], values[1], values[2], values[3]);
-    return buffer;
-}
 
 Json success(std::int64_t id, const Json &result)
 {
@@ -105,7 +88,8 @@ void writeFrame(const Json &value)
     struct WriteState { std::string bytes; bool ok = false; };
     const auto state = std::make_shared<WriteState>();
     state->bytes = jsonDump(value) + '\n';
-    if (state->bytes.size() > 128 * 1024) throw Error("BRIDGE_OUTPUT_INVALID", "Engine output exceeds its limit.");
+    if (state->bytes.size() > 128 * 1024)
+        throw Error("BRIDGE_OUTPUT_INVALID", "Engine output exceeds its limit.");
     std::thread writer([state] {
         DWORD written = 0;
         state->ok = WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), state->bytes.data(),
@@ -129,90 +113,13 @@ void writeFrame(const Json &value)
 BridgeSession::BridgeSession(std::filesystem::path path,
     std::function<Desktop(const Config &, const Cancellation &)> discovery,
     std::function<std::string()> queryElevation)
-    : path_(std::move(path)), discovery_(std::move(discovery)),
-      queryElevation_(std::move(queryElevation)) {}
-BridgeSession::~BridgeSession() { cancel(); if (task_.valid()) task_.wait(); }
-void BridgeSession::cancel() { cancellation_.cancel(); invalidate(); }
-void BridgeSession::invalidate() { consentToken_.clear(); repairToken_.clear(); confirmedHome_.clear(); }
+    : session_(std::make_unique<EngineSession>(std::move(path), std::move(discovery),
+                                                std::move(queryElevation))) {}
+BridgeSession::~BridgeSession() = default;
+void BridgeSession::cancel() { session_->cancel(); }
 
-BridgeSession::Result BridgeSession::refresh(const Cancellation &cancel) const {
-    Result result;
-    result.snapshot = true;
-    try { result.config = Config::loadOrCreate(path_); result.ready = true; }
-    catch (const Error &e) { result.error = e; }
-    cancel.check();
-    if (result.ready) {
-        try {
-            result.desktop = discovery_(result.config, cancel);
-            result.process = desktopProcessState(*result.desktop);
-            result.coverage = result.desktop->registered ? inspectProxyEnv(result.config) : "not_applicable";
-        } catch (const Error &e) { result.error = e; }
-    }
-    return result;
-}
-
-void BridgeSession::confirmations() {
-    invalidate();
-    if (!state_.ready || pending_) return;
-    confirmedConfig_ = state_.config;
-    try {
-        confirmedHome_ = consentHome(state_.config);
-        if (!confirmedHome_.empty()) consentToken_ = randomToken();
-    } catch (const Error &) { }
-    if (state_.desktop && state_.process.state == "stopped" && queryElevation_() == "not_elevated"
-        && (!state_.desktop->registered || state_.config.manageBackend))
-        repairToken_ = randomToken();
-}
-
-Json BridgeSession::snapshot() const {
-    const std::string level = queryElevation_();
-    const bool enabled = state_.config.manageBackend;
-    const bool canLaunch = state_.ready && !pending_ && state_.desktop.has_value()
-        && state_.process.state == "stopped" && level == "not_elevated";
-    Json desktop{{"state", "unknown"}};
-    if (state_.desktop) {
-        desktop = state_.desktop->publicJson();
-        desktop["state"] = "found";
-    } else if (state_.error) desktop["state"] = "not_found";
-    Json error = Json(nullptr);
-    if (!state_.ready) error = Error("CONFIG_INVALID", "Repair the proxy configuration before launch.").json();
-    else if (level != "not_elevated") error = Error("ELEVATION_NOT_ALLOWED", "Run Guard as a normal user; elevation must be verifiable.").json();
-    else if (state_.error) error = state_.error->json();
-    return Json{
-        {"config_readiness", state_.ready ? "ready" : "repair_required"},
-        {"proxy", Json{{"url", state_.config.proxyUrl()}, {"host", state_.config.host}, {"port", state_.config.port}}},
-        {"launch", Json{{"method", state_.desktop ? (state_.desktop->registered ? "appmodel_activation" : "native_process") : "unknown"}}},
-        {"desktop", desktop},
-        {"process", Json{{"state", state_.process.state}, {"pid", state_.process.pid ? Json(static_cast<std::int64_t>(state_.process.pid)) : Json(nullptr)}}},
-        {"coverage", Json{{"state", state_.coverage}, {"enabled", enabled},
-            {"authorized_home", enabled ? Json(wideToUtf8(state_.config.home.wstring())) : Json(nullptr)},
-            {"candidate_home", confirmedHome_.empty() ? Json(nullptr) : Json(wideToUtf8(confirmedHome_.wstring()))}}},
-        {"busy", pending_}, {"elevation", level}, {"error", error},
-        {"actions", Json{{"can_launch", canLaunch}, {"can_edit_proxy", !pending_},
-            {"can_authorize_backend_proxy", !pending_ && !enabled && !consentToken_.empty()},
-            {"can_revoke_backend_proxy", !pending_ && enabled && !consentToken_.empty()},
-            {"can_repair", canLaunch && !repairToken_.empty()}, {"can_refresh", !pending_},
-            {"can_cancel", pending_ && launching_}}},
-        {"confirmations", Json{
-            {"backend_proxy", consentToken_.empty() ? Json(nullptr)
-                : Json{{"token", consentToken_}, {"enabled", !enabled}, {"home", wideToUtf8(confirmedHome_.wstring())}}},
-            {"repair", repairToken_.empty() ? Json(nullptr) : Json{{"token", repairToken_}}}}}};
-}
-
-void BridgeSession::dispatch(std::int64_t id, bool launch, std::function<Result()> effect) {
-    // Candidate and authorization were checked before committing a foreground effect.
-    pendingId_ = id;
-    launching_ = launch;
-    pending_ = true;
-    timer_ = std::chrono::steady_clock::now();
-    task_ = std::async(std::launch::async, [effect = std::move(effect)] {
-        try { return effect(); }
-        catch (const Error &e) { Result result; result.error = e; return result; }
-        catch (...) { Result result; result.error = Error("ENGINE_TASK_FAILED", "The engine task failed; refresh before retrying."); return result; }
-    });
-}
-
-std::vector<Json> BridgeSession::request(const std::string &frame) {
+std::vector<Json> BridgeSession::request(const std::string &frame)
+{
     std::int64_t id = 0;
     try {
         const Json request = parseStrictJsonObject(frame, 32 * 1024, "BRIDGE_REQUEST_INVALID");
@@ -225,7 +132,12 @@ std::vector<Json> BridgeSession::request(const std::string &frame) {
         const Json &params = at(request, "params");
         if (id <= lastId_) throw Error("BRIDGE_ID_REUSED", "Request ids must strictly increase.");
         lastId_ = id;
-        if (method == "shutdown") { keys(params, {}, {}); cancel(); closed_ = true; return {success(id, Json{{"shutting_down", true}})}; }
+        if (method == "shutdown") {
+            keys(params, {}, {});
+            cancel();
+            closed_ = true;
+            return {success(id, Json{{"shutting_down", true}})};
+        }
         if (method == "hello") {
             keys(params, {}, {});
             hello_ = true;
@@ -236,121 +148,74 @@ std::vector<Json> BridgeSession::request(const std::string &frame) {
         if (!hello_) throw Error("BRIDGE_HELLO_REQUIRED", "Send hello before business requests.");
         if (method == "cancel_operation") {
             keys(params, {"operation_id"}, {"operation_id"});
-            if (!pending_ || !launching_ || integer(at(params, "operation_id")) != operation_)
+            if (!session_->busy() || !session_->launching()
+                || integer(at(params, "operation_id")) != session_->operationId())
                 throw Error("OPERATION_NOT_FOUND", "No matching launch is active.");
             cancel();
             return {success(id, Json{{"cancellation_requested", true}}),
-                    Json{{"schema", 1}, {"event", "operation_state"}, {"operation_id", operation_},
+                    Json{{"schema", 1}, {"event", "operation_state"}, {"operation_id", session_->operationId()},
                          {"state", "cancelling"},
                          {"message", "Cancellation requested; waiting for the engine outcome."}}};
         }
         if (method == "snapshot") {
             keys(params, {}, {});
-            if (pending_) return {success(id, snapshot())};
-            invalidate();
-            cancellation_ = Cancellation();
-            dispatch(id, false, [this, cancel = cancellation_] { return refresh(cancel); });
+            if (session_->busy()) return {success(id, session_->snapshot())};
+            session_->requestRefresh();
+            pendingId_ = id;
             return {};
         }
-        if (method != "set_proxy" && method != "set_backend_proxy_consent" && method != "start_launch")
-            throw Error("BRIDGE_METHOD_UNKNOWN", "Unknown bridge method.");
-        if (pending_) throw Error("BRIDGE_BUSY", "Another foreground operation is active.");
-        cancellation_ = Cancellation();
-        const auto expected = state_.config;
         if (method == "set_proxy") {
             keys(params, {"host", "port"}, {"host", "port"});
             if (!at(params, "host").is_string()) throw Error("BRIDGE_PARAMS_INVALID", "Expected a proxy host.");
-            const std::string host = at(params, "host").get<std::string>();
-            const auto port = integer(at(params, "port"));
-            if (port > 65535) throw Error("CONFIG_INVALID", "Proxy port must be between 1 and 65535.");
-            Config candidate = expected;
-            candidate.host = host;
-            candidate.port = static_cast<int>(port);
-            candidate.validate();
-            invalidate();
-            dispatch(id, false, [this, expected, invalid = !state_.ready, host, port, cancel = cancellation_] {
-                cancel.check();
-                updateProxy(path_, expected, invalid, host, static_cast<int>(port));
-                return refresh(cancel);
-            });
+            const std::int64_t portValue = integer(at(params, "port"));
+            if (portValue > 65535)
+                throw Error("CONFIG_INVALID", "Proxy port must be between 1 and 65535.");
+            session_->requestSetProxy(at(params, "host").get<std::string>(),
+                                      static_cast<int>(portValue));
+            pendingId_ = id;
             return {};
         }
-        if (!state_.ready) throw Error("CONFIG_INVALID", "Refresh and repair the configuration first.");
-        if (!(Config::load(path_) == expected)) { invalidate(); throw Error("CONFIG_CHANGED", "Configuration changed; refresh and confirm again."); }
         if (method == "set_backend_proxy_consent") {
             keys(params, {"enabled", "confirmation_token"}, {"enabled", "confirmation_token"});
-            const bool enabled = boolean(params, "enabled");
-            const std::string supplied = token(params);
-            const bool authorized = supplied == consentToken_ && !consentToken_.empty()
-                && expected == confirmedConfig_ && enabled != expected.manageBackend;
-            const auto home = confirmedHome_;
-            invalidate();
-            if (!authorized) throw Error("CONFIRMATION_REQUIRED", "Refresh and confirm this action again.");
-            dispatch(id, false, [this, expected, enabled, home, cancel = cancellation_] {
-                cancel.check();
-                updateConsent(path_, expected, enabled, home);
-                return refresh(cancel);
-            });
+            session_->requestSetBackendConsent(boolean(params, "enabled"), token(params));
+            pendingId_ = id;
             return {};
         }
-        keys(params, {"repair", "confirmation_token"}, {"repair"});
-        const bool repair = boolean(params, "repair");
-        if (repair) {
-            const bool authorized = token(params) == repairToken_ && !repairToken_.empty()
-                && expected == confirmedConfig_;
-            invalidate();
-            if (!authorized) throw Error("CONFIRMATION_REQUIRED", "Refresh and confirm this repair launch again.");
-        } else {
-            if (params.contains("confirmation_token"))
-                throw Error("BRIDGE_PARAMS_INVALID", "Normal launch does not accept a confirmation token.");
-            invalidate();
+        if (method == "start_launch") {
+            keys(params, {"repair", "confirmation_token"}, {"repair"});
+            session_->requestLaunch(boolean(params, "repair"), at(params, "confirmation_token").is_string()
+                ? token(params) : std::string());
+            pendingId_ = id;
+            return {success(id, Json{{"operation_id", session_->operationId()}}),
+                    Json{{"schema", 1}, {"event", "operation_state"}, {"operation_id", session_->operationId()},
+                         {"state", "running"},
+                         {"message", boolean(params, "repair")
+                             ? "Preparing the proxy configuration and repair launch." : "Launching Desktop."}}};
         }
-        requireNonElevated();
-        ++operation_;
-        dispatch(id, true, [this, expected, repair, cancel = cancellation_] {
-            Result result;
-            result.value = launchPipeline(expected, path_, {repair, false}, cancel);
-            return result;
-        });
-        return {success(id, Json{{"operation_id", operation_}}),
-                Json{{"schema", 1}, {"event", "operation_state"}, {"operation_id", operation_},
-                     {"state", "running"},
-                     {"message", repair ? "Preparing the proxy configuration and repair launch." : "Launching Desktop."}}};
+        throw Error("BRIDGE_METHOD_UNKNOWN", "Unknown bridge method.");
     } catch (const Error &e) { return {failure(id, e)}; }
     catch (...) { return {failure(id, Error("ENGINE_TASK_FAILED", "The engine request failed."))}; }
 }
 
-std::vector<Json> BridgeSession::poll() {
-    if (!pending_) return {};
-    if (task_.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) {
-        const auto elapsed = std::chrono::steady_clock::now() - timer_;
-        if (elapsed > (launching_ ? std::chrono::seconds(840) : std::chrono::seconds(60))) {
-            cancel();
-            closed_ = true;
-        }
-        return {};
+std::vector<Json> BridgeSession::poll()
+{
+    const auto event = session_->poll();
+    switch (event) {
+    case EngineSession::Event::SnapshotArrived:
+        return {success(pendingId_, session_->snapshot())};
+    case EngineSession::Event::OperationFinished: {
+        const auto error = session_->operationError();
+        Json message{{"schema", 1}, {"event", "operation_finished"},
+                     {"operation_id", session_->operationId()}, {"ok", !error.has_value()}};
+        message[error ? "error" : "result"] = error ? error->json() : session_->operationResult();
+        return {message};
     }
-    auto result = task_.get();
-    pending_ = false;
-    if (launching_) {
-        invalidate();
-        // Previous process observations are stale after any submitted launch.
-        state_.process = {};
-        state_.error = result.error;
-        Json event{{"schema", 1}, {"event", "operation_finished"}, {"operation_id", operation_},
-                   {"ok", !result.error.has_value()}};
-        event[result.error ? "error" : "result"] = result.error ? result.error->json() : result.value;
-        return {event};
+    case EngineSession::Event::MutationFailed:
+        return {failure(pendingId_, session_->mutationError().value_or(Error("ENGINE_TASK_FAILED", "The engine request failed.")))};
+    case EngineSession::Event::None:
+        break;
     }
-    // Discovery failure is part of a usable snapshot; mutation exceptions have
-    // no ready configuration and are returned as errors without committing it.
-    if (!result.snapshot && result.error) {
-        invalidate();
-        return {failure(pendingId_, *result.error)};
-    }
-    state_ = std::move(result);
-    confirmations();
-    return {success(pendingId_, snapshot())};
+    return {};
 }
 
 int runBridge(const std::filesystem::path &configPath) {

@@ -12,9 +12,6 @@
 #endif
 #include <windows.h>
 
-#include <atomic>
-#include <cctype>
-#include <cstdio>
 #include <exception>
 #include <iostream>
 #include <map>
@@ -26,93 +23,14 @@
 
 namespace {
 
+int (*interactiveEntry)(const std::filesystem::path &, bool) = nullptr;
+
 using cpg::jsonDump;
 using cpg::productVersion;
 using cpg::wideToUtf8;
 
-std::atomic_bool consoleOperation{false};
-cpg::Cancellation consoleCancellation;
-BOOL WINAPI interruptConsole(DWORD signal) {
-    if ((signal == CTRL_C_EVENT || signal == CTRL_BREAK_EVENT) && consoleOperation.load()) {
-        consoleCancellation.cancel(); return TRUE;
-    }
-    return FALSE;
-}
-struct ConsoleOperation {
-    ConsoleOperation() { consoleCancellation = cpg::Cancellation{}; consoleOperation.store(true); }
-    ~ConsoleOperation() { consoleOperation.store(false); }
-};
-
 void print(const std::string &text) { std::cout << text << std::endl; }
 void printJson(const cpg::Json &object) { print(jsonDump(object)); }
-
-std::string asciiTrimmed(std::string_view value)
-{
-    std::size_t begin = 0, end = value.size();
-    while (begin < end && std::isspace(static_cast<unsigned char>(value[begin]))) ++begin;
-    while (end > begin && std::isspace(static_cast<unsigned char>(value[end - 1]))) --end;
-    return std::string(value.substr(begin, end - begin));
-}
-
-std::string toLower(std::string value)
-{
-    for (char &character : value)
-        character = static_cast<char>(std::tolower(static_cast<unsigned char>(character)));
-    return value;
-}
-
-std::string line(const std::string &prompt) {
-    print(prompt);
-    std::string value;
-    char character = 0;
-    while (std::cin.get(character) && character != '\n') {
-        if (value.size() >= 4096) throw cpg::Error("INPUT_INVALID", "Input exceeds its limit.");
-        value.push_back(character);
-    }
-    if (!std::cin && value.empty()) throw cpg::Error("CANCELLED", "Input closed.");
-    return asciiTrimmed(value);
-}
-
-int console(const std::filesystem::path &path) {
-    print(std::string("Codex Proxy Guard ") + productVersion() + " - local proxy launcher");
-    for (;;) {
-        cpg::Config config; bool ready = false;
-        try { config = cpg::Config::loadOrCreate(path); ready = true; }
-        catch (const cpg::Error &e) { print(e.code + ": " + e.message); }
-        print("Proxy: " + config.proxyUrl() + " | backend block: " + (config.manageBackend ? "authorized" : "off"));
-        const std::string action = toLower(line("[L] Launch  [E] Edit proxy  [B] Backend authorization  [R] Repair launch  [S] Refresh  [Q] Quit"));
-        if (action == "q") return 0;
-        try {
-            if (action == "s") {
-                if (!ready) continue;
-                const ConsoleOperation operation;
-                const auto desktop = cpg::discoverDesktop(config, consoleCancellation);
-                print(desktop.displayName + " | " + cpg::desktopProcessState(desktop).state + " | "
-                      + (desktop.registered ? cpg::inspectProxyEnv(config) : "process environment"));
-            } else if (action == "e") {
-                const std::string host = line("Loopback HTTP/Mixed host:");
-                const std::string portText = line("Port (1-65535):");
-                int port = 0;
-                try { port = std::stoi(portText); }
-                catch (const std::exception &) { throw cpg::Error("CONFIG_INVALID", "Invalid proxy port."); }
-                cpg::updateProxy(path, config, !ready, host, port);
-            } else if (action == "b" && ready) {
-                const std::filesystem::path home = cpg::consentHome(config);
-                print((config.manageBackend
-                           ? "Remove Guard's unchanged proxy block from: "
-                           : "Authorize HTTP_PROXY/HTTPS_PROXY/NO_PROXY block for later Codex processes in: ")
-                      + wideToUtf8(home.wstring()));
-                if (line("Type YES to confirm this single operation:") == "YES")
-                    cpg::updateConsent(path, config, !config.manageBackend, home);
-            } else if ((action == "l" || action == "r") && ready) {
-                const bool repair = action == "r";
-                if (repair && line("Repair stops the shared Codex daemon once and may interrupt other clients' tasks. Type YES to confirm:") != "YES") continue;
-                const ConsoleOperation operation;
-                printJson(cpg::launchPipeline(config, path, {repair, false}, consoleCancellation));
-            }
-        } catch (const cpg::Error &e) { print(e.code + ": " + e.message); }
-    }
-}
 
 // Stream one embedded license resource to stdout. License text can exceed the
 // bridge frame budget, so it never goes through the NDJSON protocol writer.
@@ -180,7 +98,7 @@ struct ParsedCli {
 };
 
 const wchar_t *wideValueOptions[] = {L"config", L"proxy-host", L"proxy-port"};
-const wchar_t *flagOptions[] = {L"build-info", L"json", L"refresh-codex-daemon", L"activation-only", L"force"};
+const wchar_t *flagOptions[] = {L"build-info", L"json", L"refresh-codex-daemon", L"activation-only", L"force", L"plain"};
 
 [[noreturn]] void cliFail(const std::string &message)
 {
@@ -189,8 +107,12 @@ const wchar_t *flagOptions[] = {L"build-info", L"json", L"refresh-codex-daemon",
 
 } // namespace
 
+void cpg::setInteractiveConsoleEntry(int (*entry)(const std::filesystem::path &, bool))
+{
+    interactiveEntry = entry;
+}
+
 int cpg::runCli(const std::vector<std::wstring> &arguments) {
-    SetConsoleCtrlHandler(interruptConsole, TRUE);
     ParsedCli parsed;
     std::optional<std::wstring> pending;
     bool afterSeparator = false;
@@ -303,13 +225,17 @@ int cpg::runCli(const std::vector<std::wstring> &arguments) {
             if (flagSet(L"refresh-codex-daemon") && flagSet(L"activation-only"))
                 cliFail("Repair and activation-only cannot be combined.");
             const auto config = Config::loadOrCreate(configPath);
-            const ConsoleOperation operation;
             printJson(launchPipeline(config, configPath,
-                                 {flagSet(L"refresh-codex-daemon"), flagSet(L"activation-only")},
-                                 consoleCancellation));
+                                     {flagSet(L"refresh-codex-daemon"), flagSet(L"activation-only")},
+                                     Cancellation{}));
             return 0;
         }
-        if (command.empty() || command == L"console") return console(configPath);
+        if (command.empty() || command == L"console") {
+            if (!interactiveEntry)
+                throw Error("CLI_INVALID", "The interactive console is unavailable in this build.");
+            const bool plain = parsed.flags.count(L"plain") > 0;
+            return interactiveEntry(configPath, plain);
+        }
         cliFail("Unknown command.");
     } catch (const Error &e) {
         std::cerr << e.code << ": " << e.message << std::endl;

@@ -45,11 +45,13 @@ endif()
 include(CTest)
 add_subdirectory(foundation)
 add_subdirectory(backend)
+add_subdirectory(tui)
 add_subdirectory(app)
 if(BUILD_TESTING)
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
     add_subdirectory(tests/foundation)
     add_subdirectory(tests/app)
+    add_subdirectory(tests/tui)
     # Engine integration tests spawn the unified production executable, so they
     # are registered only after the app target exists (no CMake cycles).
     add_subdirectory(backend/tests)

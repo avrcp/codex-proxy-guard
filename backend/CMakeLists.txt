@@ -43,7 +43,7 @@ set(CPG_LICENSES_MANIFEST "${CPG_LICENSES_MANIFEST}    };\n    return entries;\n
 file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/generated/licenses_manifest.h" "${CPG_LICENSES_MANIFEST}")
 file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/generated/licenses.rc" "${CPG_LICENSES_RC}")
 
-add_library(guard_engine STATIC src/core.cpp src/platform.cpp src/package_discovery.cpp src/launch.cpp src/bridge.cpp src/cli.cpp)
+add_library(guard_engine STATIC src/core.cpp src/platform.cpp src/package_discovery.cpp src/launch.cpp src/session.cpp src/bridge.cpp src/cli.cpp)
 target_include_directories(guard_engine PUBLIC src "${CMAKE_CURRENT_BINARY_DIR}/generated")
 target_link_libraries(guard_engine PUBLIC guard_foundation PRIVATE ws2_32 ktmw32 shlwapi)
 target_compile_definitions(guard_engine PUBLIC

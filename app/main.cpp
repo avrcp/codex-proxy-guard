@@ -2,6 +2,7 @@
 
 #include "cli.h"
 #include "cpg/text.h"
+#include "tui_app.h"
 
 #ifdef CPG_ENABLE_QT_GUI
 #include "gui_entry.h"
@@ -23,6 +24,16 @@ void writeStdError(const std::wstring &message)
     if (error == INVALID_HANDLE_VALUE || error == nullptr) return;
     DWORD written = 0;
     WriteFile(error, bytes.data(), static_cast<DWORD>(bytes.size()), &written, nullptr);
+}
+
+std::filesystem::path configPathFrom(const cpg::StartupMode &mode)
+{
+    // Relative --config values resolve against the current directory before
+    // the interactive frontend opens, mirroring the previous GUI behavior.
+    if (mode.configPath.empty()) return {};
+    std::error_code error;
+    const std::filesystem::path absolute = std::filesystem::absolute(mode.configPath, error);
+    return error ? std::filesystem::path(mode.configPath) : absolute;
 }
 
 std::vector<std::wstring> wideArguments()
@@ -53,13 +64,14 @@ int main(int argc, char *argv[])
         writeStdError(mode.errorMessage);
         return mode.exitCode;
     }
+    cpg::setInteractiveConsoleEntry(&cpg::tui::runTui);
     if (mode.role == cpg::StartupRole::Gui) {
 #ifdef CPG_ENABLE_QT_GUI
         return guard::runGui(mode.configPath, mode.smokeTest);
 #else
-        // No-Qt interim build: the interactive frontend is the console until
-        // the TUI lands; headless roles parse the same arguments.
-        return cpg::runCli(arguments);
+        // No-Qt build: no-arg starts the interactive TUI (plain fallback
+        // through runTui when VT output is unavailable).
+        return cpg::tui::runTui(configPathFrom(mode), false);
 #endif
     }
     return cpg::runCli(arguments);
