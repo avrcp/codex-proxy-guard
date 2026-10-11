@@ -206,9 +206,6 @@ $Manifest = [ordered]@{
 Write-Utf8 (Join-Path $Staging 'release-manifest.json') ($Manifest | ConvertTo-Json -Depth 5)
 
 # --- 14. Independent re-verification ------------------------------------------
-$StagingRelease = Join-Path $Staging 'release'
-New-Item -ItemType Directory -Path $StagingRelease -Force | Out-Null
-# verify-package expects the release directory itself
 Invoke-Checked (Get-Command python).Source @((Join-Path $Root 'scripts\verify-package.py'),
     '--release', $Staging, '--schema', 'static-single')
 
