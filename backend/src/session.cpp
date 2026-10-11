@@ -36,9 +36,9 @@ const Json &at(const Json &object, const char *key)
 
 EngineSession::EngineSession(std::filesystem::path path,
     std::function<Desktop(const Config &, const Cancellation &)> discovery,
-    std::function<std::string()> queryElevation)
+    std::function<std::string()> queryElevation, SessionBudgets budgets)
     : path_(std::move(path)), discovery_(std::move(discovery)),
-      queryElevation_(std::move(queryElevation)) {}
+      queryElevation_(std::move(queryElevation)), budgets_(budgets) {}
 
 EngineSession::~EngineSession()
 {
@@ -133,6 +133,8 @@ void EngineSession::dispatch(bool launch, std::function<Result()> effect)
     // Candidate and authorization were checked before committing a foreground effect.
     launching_ = launch;
     pending_ = true;
+    foreground_ = ForegroundState::Running;
+    timeoutError_.reset();
     dispatchedAt_ = std::chrono::steady_clock::now();
     task_ = std::async(std::launch::async, [effect = std::move(effect)] {
         try { return effect(); }
@@ -232,17 +234,42 @@ EngineSession::Event EngineSession::poll()
     if (!pending_) return Event::None;
     if (task_.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) {
         const auto elapsed = std::chrono::steady_clock::now() - dispatchedAt_;
-        if (elapsed > (launching_ ? std::chrono::seconds(840) : std::chrono::seconds(60))) {
-            cancel();
-            mutationError_ = Error("SESSION_TIMEOUT", "The foreground operation exceeded its budget and was cancelled; refresh.");
-            mutationFailure_ = true;
-            pending_ = false;
-            return Event::MutationFailed;
+        const auto budget = launching_ ? budgets_.launch : budgets_.mutation;
+        if (elapsed > budget && foreground_ == ForegroundState::Running) {
+            // The budget is exhausted: cancel and invalidate, but keep the
+            // session busy — the effect's future is still running and the
+            // single-foreground-operation invariant must hold until it is
+            // reaped. Nothing is detached and no future is ever dropped.
+            cancellation_.cancel();
+            invalidate();
+            foreground_ = ForegroundState::CancellingAfterTimeout;
+            timeoutError_ = Error("SESSION_TIMEOUT",
+                "The operation exceeded its session budget; cancellation completed, "
+                "and the resulting state must be refreshed.");
         }
         return Event::None;
     }
     auto result = task_.get();
     pending_ = false;
+    if (foreground_ == ForegroundState::CancellingAfterTimeout) {
+        // A reaped timed-out task never reports success: its receipt cannot
+        // be trusted and its snapshot is not applied. Precise outcome codes
+        // from the effect itself are preserved over the generic timeout.
+        foreground_ = ForegroundState::Idle;
+        timeoutError_.reset();
+        invalidate();
+        state_.process = {}; // observations are stale after the unbounded run
+        mutationError_ = Error("SESSION_TIMEOUT",
+            "The operation exceeded its session budget; cancellation completed, "
+            "and the resulting state must be refreshed.");
+        if (result.error && (result.error->code == "APPX_ACTIVATION_OUTCOME_UNKNOWN"
+            || result.error->code == "CODEX_DAEMON_STOP_TIMEOUT"
+            || result.error->code == "CODEX_DAEMON_STOP_FAILED"))
+            mutationError_ = *result.error;
+        mutationFailure_ = true;
+        return Event::MutationFailed;
+    }
+    foreground_ = ForegroundState::Idle;
     if (launching_) {
         invalidate();
         // Previous process observations are stale after any submitted launch.

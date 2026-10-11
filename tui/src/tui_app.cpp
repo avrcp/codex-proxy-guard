@@ -231,7 +231,8 @@ int runInteractive(const std::filesystem::path &configPath)
         case EngineSession::Event::None:
             break;
         }
-        state.setBusy(session.busy(), session.launching() ? "Launching Desktop" : "Updating");
+        state.setBusy(session.busy(), session.cancellingAfterTimeout()
+            ? "Cancelling timed-out operation" : session.launching() ? "Launching Desktop" : "Updating");
         state.setSpinnerPhase(spinner++);
     }
     SetConsoleCtrlHandler(interruptHandler, FALSE);

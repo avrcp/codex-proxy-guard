@@ -10,6 +10,15 @@
 
 namespace cpg {
 
+// Session time budgets. When a foreground operation exceeds its budget the
+// session cancels it but stays busy until the effect's future has been
+// reaped; only then does it report the failure and accept new requests.
+// Tests inject short budgets instead of sleeping real minutes.
+struct SessionBudgets {
+    std::chrono::milliseconds mutation{60000};
+    std::chrono::milliseconds launch{840000};
+};
+
 // Transport-free engine session: the single authoritative state machine for
 // every interactive frontend (TUI, plain console and — until it is removed —
 // the bridge protocol adapter). It owns candidate validation, single-use
@@ -30,10 +39,15 @@ public:
         std::optional<Error> error;
     };
     enum class Event { None, SnapshotArrived, OperationFinished, MutationFailed };
+    // Idle: no future outstanding. Running: an effect owns the foreground.
+    // CancellingAfterTimeout: the budget was exceeded, the cancellation was
+    // requested and the session stays busy until the future is reaped.
+    enum class ForegroundState { Idle, Running, CancellingAfterTimeout };
 
     explicit EngineSession(std::filesystem::path path,
         std::function<Desktop(const Config &, const Cancellation &)> discovery = discoverDesktop,
-        std::function<std::string()> queryElevation = elevation);
+        std::function<std::string()> queryElevation = elevation,
+        SessionBudgets budgets = {});
     ~EngineSession();
     EngineSession(const EngineSession &) = delete;
     EngineSession &operator=(const EngineSession &) = delete;
@@ -51,6 +65,11 @@ public:
     Event poll();
     bool busy() const { return pending_; }
     bool launching() const { return launching_; }
+    ForegroundState foregroundState() const { return foreground_; }
+    bool cancellingAfterTimeout() const
+    {
+        return foreground_ == ForegroundState::CancellingAfterTimeout;
+    }
     // The view model (same shape the bridge protocol emitted).
     Json snapshot() const;
     // The error of a finished foreground operation, when poll() reported
@@ -72,8 +91,10 @@ private:
     std::filesystem::path path_;
     std::function<Desktop(const Config &, const Cancellation &)> discovery_;
     std::function<std::string()> queryElevation_;
+    SessionBudgets budgets_;
     Result state_;
     bool pending_ = false, launching_ = false;
+    ForegroundState foreground_ = ForegroundState::Idle;
     std::int64_t operation_ = 0;
     std::string consentToken_, repairToken_;
     std::filesystem::path confirmedHome_;
@@ -83,6 +104,7 @@ private:
     std::chrono::steady_clock::time_point dispatchedAt_;
     bool mutationFailure_ = false;
     std::optional<Error> mutationError_;
+    std::optional<Error> timeoutError_;
 };
 
 } // namespace cpg

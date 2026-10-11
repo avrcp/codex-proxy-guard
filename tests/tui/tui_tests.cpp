@@ -14,6 +14,7 @@
 #include "session.h"
 #include "tui_state.h"
 
+#include <atomic>
 #include <cwctype>
 
 #include "../../tests/support/test_support.h"
@@ -456,6 +457,59 @@ TEST_CASE("the shared session keeps the single-foreground-operation gate")
     // worker from the running executable, so a session test would perform a
     // real application-model activation. Launch semantics stay covered by the
     // engine fixture suites.
+}
+
+TEST_CASE("timed-out operations stay busy until their future is reaped")
+{
+    cpgtest::TemporaryDirectory root;
+    const std::filesystem::path path = root.file(L"guard.toml");
+    Config config;
+    config.home = root.path;
+    initializeConfig(path, config, false);
+
+    std::atomic<int> active{0};
+    std::atomic<int> maxActive{0};
+    const auto slowDiscovery = [&](const Config &, const Cancellation &cancel) -> Desktop {
+        int now = active.fetch_add(1) + 1;
+        int seen = maxActive.load();
+        while (now > seen && !maxActive.compare_exchange_weak(seen, now)) {}
+        for (int elapsed = 0; elapsed < 500 && !cancel.cancelled(); ++elapsed) Sleep(1);
+        Sleep(30); // bounded cleanup that continues after cancellation
+        active.fetch_sub(1);
+        throw Error("APPX_NOT_FOUND", "No Desktop fixture.");
+    };
+    SessionBudgets budgets;
+    budgets.mutation = std::chrono::milliseconds(20);
+    // Destruction of a session with a live timed-out effect cancels it and
+    // reaps the future before returning (covered by this scope).
+    EngineSession session(path, slowDiscovery, [] { return std::string("not_elevated"); },
+                          budgets);
+    session.requestRefresh();
+    bool cancelling = false;
+    for (int elapsed = 0; elapsed < 2000 && !cancelling; ++elapsed) {
+        session.poll();
+        cancelling = session.cancellingAfterTimeout();
+        if (!cancelling) Sleep(1);
+    }
+    REQUIRE(cancelling);
+    // The old future is still running: the session must stay busy and refuse
+    // a second foreground operation instead of overlapping it.
+    CHECK(session.busy());
+    CHECK_THROWS_AS(session.requestSetProxy("127.0.0.1", 7890), Error);
+    EngineSession::Event event = EngineSession::Event::None;
+    for (int elapsed = 0; elapsed < 5000; ++elapsed) {
+        event = session.poll();
+        if (!session.busy()) break;
+        Sleep(1);
+    }
+    CHECK(event == EngineSession::Event::MutationFailed);
+    CHECK_FALSE(session.busy());
+    CHECK(session.mutationError().has_value());
+    CHECK(session.mutationError()->code == "SESSION_TIMEOUT");
+    CHECK(maxActive.load() == 1); // the refused request never started
+    // After the reap the gate is open again for a new operation.
+    session.requestRefresh();
+    CHECK(session.busy());
 }
 
 CPG_TEST_MAIN
