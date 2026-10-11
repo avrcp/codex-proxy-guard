@@ -166,9 +166,11 @@ Write-Utf8 (Join-Path $Staging 'SHA256SUMS.txt') (@(
     "$SourceHash $SourceZipName"
 ) -join "`n")
 
-$SizeReport = Join-Path $Staging 'size-report.json'
+$SizeReportPath = Join-Path $Root 'dist\size-report.json'
 Invoke-Checked (Get-Command python).Source @((Join-Path $Root 'scripts\report-package-size.py'),
-    '--root', $Staging, '--archive', $TransportZip, '--output', $SizeReport)
+    '--root', $Staging, '--archive', $TransportZip, '--output', $SizeReportPath)
+$SizeReport = Join-Path $Staging 'size-report.json'
+Copy-Item $SizeReportPath $SizeReport
 
 $BuildDate = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
 $Manifest = [ordered]@{
