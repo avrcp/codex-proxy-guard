@@ -23,6 +23,7 @@
 #include <filesystem>
 #include <string>
 #include <thread>
+#include <vector>
 
 using namespace cpg;
 
@@ -283,12 +284,97 @@ TEST_CASE("stdin request bytes and environment reach the child")
     request.environment = UnicodeEnvironment::current();
     request.environment.set(L"CPG_FOUNDATION_MARKER", L"passed through \u4e2d");
     request.timeout = std::chrono::milliseconds(5000);
-    request.stdinBytes = "request payload 中文";
+    request.stdinBytes = "request payload \u4e2d\u6587";
     const ProcessResult result = runOwnedProcess(request, {});
     CHECK(result.exitCode == 0);
     CHECK(result.out.find("request payload \u4e2d\u6587") != std::string::npos);
     CHECK(result.out.find("marker=passed through \u4e2d") != std::string::npos);
     CHECK(result.err.empty());
+}
+
+TEST_CASE("the owned child inherits only its standard handles")
+{
+    ProcessRequest request;
+    request.program = currentExecutablePath();
+    request.environment = UnicodeEnvironment::current();
+    request.timeout = std::chrono::milliseconds(5000);
+
+    // Control: a non-inheritable handle never crosses, on any system.
+    SECURITY_ATTRIBUTES private_{sizeof(SECURITY_ATTRIBUTES), nullptr, FALSE};
+    HANDLE control = CreateEventW(&private_, TRUE, FALSE, nullptr);
+    REQUIRE(control != nullptr);
+    UniqueHandle controlGuard(control);
+    request.arguments = {L"--foundation-probe-handle",
+                         std::to_wstring(reinterpret_cast<std::uintptr_t>(control))};
+    ProcessResult result = runOwnedProcess(request, {});
+    CHECK(result.normalExit);
+    CHECK(result.exitCode == 0);
+    CHECK(WaitForSingleObject(control, 0) == WAIT_TIMEOUT);
+
+    // Strict: an inheritable handle outside the runner's explicit std-handle
+    // list must not cross. Hosts whose CreateProcess hook strips
+    // PROC_THREAD_ATTRIBUTE_HANDLE_LIST leak every inheritable handle no
+    // matter what the caller does; there the effective barrier is that the
+    // runner duplicates the three std pipe ends as the only inheritable
+    // handles Guard ever holds. Detect that environment instead of failing.
+    SECURITY_ATTRIBUTES inheritable{sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE};
+    HANDLE event = CreateEventW(&inheritable, TRUE, FALSE, nullptr);
+    REQUIRE(event != nullptr);
+    UniqueHandle probe(event);
+    request.arguments = {L"--foundation-probe-handle",
+                         std::to_wstring(reinterpret_cast<std::uintptr_t>(event))};
+    result = runOwnedProcess(request, {});
+    CHECK(result.normalExit);
+    if (WaitForSingleObject(event, 0) == WAIT_OBJECT_0) {
+        MESSAGE("host CreateProcess ignores the handle-inheritance list; "
+                "no-other-inheritable-handles is the active barrier here");
+        return;
+    }
+    CHECK(result.exitCode == 0);
+}
+
+TEST_CASE("a child that never reads stdin still honors the budget")
+{
+    ProcessRequest request = selfRequest({L"--foundation-never-read-stdin"});
+    request.timeout = std::chrono::milliseconds(150);
+    request.stdinBytes.assign(helperRequestLimit, 'x'); // beyond the pipe buffer
+    CHECK(errorCode([&] { (void)runOwnedProcess(request, {}); }) == "HELPER_TIMEOUT");
+}
+
+TEST_CASE("a fast-exiting flood is always caught by the output limit")
+{
+    for (int iteration = 0; iteration < 50; ++iteration) {
+        ProcessRequest request = selfRequest({L"--foundation-output-exit-fast"});
+        request.timeout = std::chrono::milliseconds(10000);
+        request.stdoutLimit = 1024;
+        INFO("iteration " << iteration);
+        CHECK(errorCode([&] { (void)runOwnedProcess(request, {}); }) == "HELPER_OUTPUT_LIMIT");
+    }
+}
+
+TEST_CASE("environment blocks are ordered for CreateProcess")
+{
+    UnicodeEnvironment environment;
+    environment.set(L"z_var", L"1");
+    environment.set(L"A_VAR", L"2");
+    environment.set(L"m_var", L"3");
+    environment.set(L"HTTP_PROXY", L"a");
+    environment.set(L"http_proxy", L"b"); // case variant collapses into one entry
+    const std::vector<wchar_t> &block = environment.block();
+    std::vector<std::wstring> names;
+    for (std::size_t index = 0; index + 1 < block.size() && block[index] != L'\0';) {
+        const std::wstring entry(&block[index]);
+        const std::size_t equal = entry.find(L'=');
+        REQUIRE(equal != std::wstring::npos);
+        names.push_back(entry.substr(0, equal));
+        index += entry.size() + 1;
+    }
+    // Case-insensitive ordinal order, exactly as CreateProcessW requires,
+    // with no duplicate names left behind.
+    REQUIRE(names.size() == 4);
+    CHECK(names == std::vector<std::wstring>({L"A_VAR", L"HTTP_PROXY", L"m_var", L"z_var"}));
+    CHECK(block[block.size() - 2] == L'\0');
+    CHECK(block.back() == L'\0');
 }
 
 int main(int argc, char **argv)
@@ -316,6 +402,25 @@ int main(int argc, char **argv)
             printf("input=%s\nmarker=%s\n", input.c_str(), marker.c_str());
             fflush(stdout);
             return 0;
+        }
+        if (argument == "--foundation-never-read-stdin") { Sleep(10000); return 0; }
+        if (argument == "--foundation-output-exit-fast") {
+            // Flood past any realistic stdout limit and exit immediately: the
+            // parent must still catch the overflow after reaping the readers.
+            std::string flood(128 * 1024, 'x');
+            fwrite(flood.data(), 1, flood.size(), stdout);
+            fflush(stdout);
+            return 0;
+        }
+        if (argument == "--foundation-probe-handle" && index + 1 < argc) {
+            // Exit codes: 0 = the probed handle value is not valid here (not
+            // inherited), 2 = valid but not a signalable event, 7 = fully
+            // usable event (an inheritance leak, which must never happen).
+            const long long value = _atoi64(argv[index + 1]);
+            const HANDLE probed = reinterpret_cast<HANDLE>(static_cast<LONG_PTR>(value));
+            DWORD flags = 0;
+            if (!GetHandleInformation(probed, &flags)) return 0;
+            return SetEvent(probed) ? 7 : 2;
         }
     }
     return doctest::Context(argc, argv).run();

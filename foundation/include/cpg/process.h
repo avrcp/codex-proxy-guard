@@ -24,9 +24,10 @@ namespace cpg {
 // 16 KiB bounded request budget shared by the activation worker protocol.
 inline constexpr std::size_t helperRequestLimit = 16 * 1024;
 
-// Case-insensitive Windows environment block builder. Entries keep the
-// position of their first occurrence; `block()` returns the sorted-by-insert
-// double-NUL-terminated UTF-16 block for CreateProcessW
+// Case-insensitive Windows environment block builder. Names fold to their
+// first spelling; `block()` returns the double-NUL-terminated UTF-16 block
+// sorted by name (CompareStringOrdinal, case-insensitive) exactly as
+// CreateProcessW requires for custom environment blocks
 // (CREATE_UNICODE_ENVIRONMENT).
 class UnicodeEnvironment {
 public:
