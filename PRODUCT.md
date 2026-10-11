@@ -4,11 +4,12 @@
 
 ## Platform
 
-Windows native desktop (Qt Widgets).
+Windows console application (Win32 VT TUI with a plain-console fallback).
 
 ## Stack
 
-C++20, Qt 6.8+ Core/Gui/Widgets, MSVC x64, CMake; C++ engine over stdio.
+C++20, STL, Windows SDK, MSVC x64, CMake; single executable, in-process
+engine session, static CRT.
 
 ## Users and purpose
 
@@ -24,12 +25,14 @@ An observed activation or prepared configuration is never a network success clai
 
 ## Brand commitments
 
-The supplied brief pins a compact, quiet, Telegram-inspired native launcher:
-single window, native title bar, standard accessible controls, system light/dark.
-No Telegram code, branding, icons or palette resources. Product copy follows the
-existing English UI. This record derives from the explicit implementation brief.
+A compact, quiet console launcher: one screen that answers which proxy, which
+application, whether it is running and what proxy configuration is prepared.
+Launch is the only primary action; destructive confirmations require typing YES.
+Product copy stays in English; status is always stated in text in addition to
+color.
 
 ## Accessibility
 
-Keyboard access and visible buttons for every task; labeled controls; text in
-addition to status colors; DPI-aware layouts and readable long-path dialogs.
+Keyboard access for every task (Enter/E/B/D/R/?, Ctrl+C cancel, Tab field
+switching); text in addition to status colors; the plain line console is a
+full fallback when VT output is unavailable.

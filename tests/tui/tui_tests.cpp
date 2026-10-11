@@ -235,6 +235,21 @@ TEST_CASE("the error modal offers its suggested follow-up action")
     CHECK(state.key(key(L'b')).kind == TuiState::Action::Kind::OpenConsent);
 }
 
+TEST_CASE("the TUI renders before the first session snapshot arrives")
+{
+    // Regression: the initial empty snapshot must render (missing keys never
+    // reach a null receiver, which would throw json type_error.306).
+    TuiState state;
+    Screen screen;
+    screen.resize(80, 24);
+    REQUIRE_NOTHROW(state.draw(screen));
+    const std::wstring frame = renderFrame(screen);
+    CHECK(frame.find(L"CODEX PROXY GUARD") != std::wstring::npos);
+    CHECK_FALSE(TuiState::blockedReason(Json::object()).empty());
+    // Keys still work in the pre-snapshot state.
+    CHECK(state.key(key(L'e')).kind == TuiState::Action::Kind::OpenEditor);
+}
+
 TEST_CASE("drawing a frame keeps every glyph inside the buffer")
 {
     TuiState state;

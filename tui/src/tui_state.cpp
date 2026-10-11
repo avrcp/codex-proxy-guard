@@ -17,11 +17,14 @@
 namespace cpg::tui {
 namespace {
 
+// Missing keys resolve to a shared empty OBJECT (not null): nlohmann's
+// value() throws on a null receiver, and the TUI must render before the
+// first session snapshot arrives.
 const Json &at(const Json &object, const char *key)
 {
-    static const Json nullValue = Json();
+    static const Json empty = Json::object();
     const auto entry = object.find(key);
-    return entry == object.end() ? nullValue : *entry;
+    return entry == object.end() ? empty : *entry;
 }
 
 std::wstring widen(const std::string &utf8)

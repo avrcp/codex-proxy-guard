@@ -1,14 +1,17 @@
-"""Failure-fixture tests for scripts/verify-package.py.
+"""Failure-fixture tests for scripts/verify-package.py (static-single schema).
 
-Builds small synthetic split releases (runtime ZIP + source-compliance ZIP +
-release-manifest.json) and asserts that the verifier accepts a fully
-consistent release and rejects every tampered variant with a nonzero exit.
-The pinned Qt source digest is overridden so fixtures stay kilobytes small;
-production invocations keep the official default.
+Builds small synthetic single-EXE releases (release-manifest.json +
+SHA256SUMS.txt + transport ZIP + source ZIP + EXE stub) and asserts that the
+verifier accepts a fully consistent release and rejects every tampered
+variant with a nonzero exit. The fixture EXE is a stub payload: the
+production execution gate (running build-info/licenses on the packaged EXE)
+is exercised by the canonical build script; these fixtures pass
+--skip-execution and instead verify every structural and digest gate.
 """
 import hashlib
 import json
 import pathlib
+import struct
 import subprocess
 import sys
 import tempfile
@@ -19,201 +22,173 @@ REPOSITORY = pathlib.Path(__file__).resolve().parents[2]
 VERIFIER = REPOSITORY / 'scripts' / 'verify-package.py'
 COMMIT = '0123456789abcdef0123456789abcdef01234567'
 VERSION = '9.9.9-test'
-QT_URL = 'https://download.qt.io/archive/qt/6.8/6.8.3/submodules/qtbase-everywhere-src-6.8.3.tar.xz'
-QT_NAME = 'qtbase-everywhere-src-6.8.3.tar.xz'
 
 
 def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def write_zip(path: pathlib.Path, members: dict) -> None:
-    with zipfile.ZipFile(path, 'w', zipfile.ZIP_DEFLATED) as bundle:
-        for name, data in members.items():
-            bundle.writestr(name, data)
+def file_sha256(path: pathlib.Path) -> str:
+    return sha256_bytes(path.read_bytes())
 
 
-def runtime_members(fake_qt_sha: str) -> dict:
-    """Return (members, build-info dict) for a consistent runtime ZIP."""
-    payload = {name: f'fixture {name}'.encode() for name in
-               ('CodexProxyGuard.exe', 'engine/Qt6Core.dll', 'platforms/qwindows.dll',
-                'licenses/tomlplusplus/LICENSE')}
-    files_sha = {name: sha256_bytes(data) for name, data in payload.items()}
-    info = {
-        'product_version': VERSION, 'git_commit': COMMIT, 'git_dirty': False,
-        'profile': 'dynamic-split',
-        'engine': {'version': VERSION, 'language': 'C++20', 'protocol_version': 1,
-                   'path': 'engine/codex-proxy-guard.exe'},
-        'qt_source': {'url': QT_URL, 'sha256': fake_qt_sha,
-                      'provided_by': 'CodexProxyGuard-9.9.9-test-source-compliance.zip'},
-        'qt_sdk': {'deployed_files': {
-            'engine/Qt6Core.dll': {'sdk_path': 'bin/Qt6Core.dll', 'sdk_sha256': files_sha['engine/Qt6Core.dll'],
-                                   'deployed_sha256': files_sha['engine/Qt6Core.dll']},
-            'platforms/qwindows.dll': {'sdk_path': 'plugins/platforms/qwindows.dll',
-                                       'sdk_sha256': files_sha['platforms/qwindows.dll'],
-                                       'deployed_sha256': files_sha['platforms/qwindows.dll']}}},
-        'files_sha256': files_sha,
-    }
-    info_bytes = json.dumps(info).encode()
-    sums = '\n'.join(f'{value}  {key}' for key, value in
-                     {**files_sha, 'build-info.json': sha256_bytes(info_bytes)}.items()).encode()
-    members = dict(payload)
-    members['build-info.json'] = info_bytes
-    members['SHA256SUMS.txt'] = sums
-    return members, info
+def minimal_console_pe() -> bytes:
+    """A tiny but structurally valid PE32+ console image importing
+    KERNEL32.DLL — enough for the verifier's own PE parser."""
+    headers = bytearray(0x200)
+    struct.pack_into('<H', headers, 0, 0x5A4D)              # MZ
+    struct.pack_into('<I', headers, 0x3c, 0x40)             # e_lfanew
+    offset = 0x40
+    headers[offset:offset + 4] = b'PE' + bytes(2)
+    offset += 4
+    struct.pack_into('<HHIIIHH', headers, offset,
+                     0x8664, 1, 0, 0, 0, 240, 0x22)        # COFF header
+    offset += 20
+    optional = offset
+    struct.pack_into('<H', headers, optional, 0x20b)       # PE32+ magic
+    struct.pack_into('<H', headers, optional + 68, 3)      # CUI subsystem
+    struct.pack_into('<I', headers, optional + 108, 16)    # data directory count
+    struct.pack_into('<I', headers, optional + 120, 0x1000)  # import directory RVA
+    offset += 240
+    section = offset
+    headers[section:section + 8] = b'.idata' + bytes(2)
+    struct.pack_into('<I', headers, section + 8, 0x200)    # virtual size
+    struct.pack_into('<I', headers, section + 12, 0x1000)  # virtual address
+    struct.pack_into('<I', headers, section + 16, 0x200)   # raw size
+    struct.pack_into('<I', headers, section + 20, 0x200)   # raw pointer
+    idata = bytearray(0x200)
+    struct.pack_into('<I', idata, 12, 0x1100)              # import name RVA
+    idata[0x100:0x100 + 13] = b'KERNEL32.DLL' + bytes(1)
+    return bytes(headers) + bytes(idata)
 
 
-def compliance_members(fake_qt: bytes) -> dict:
-    return {
-        'app/CMakeLists.txt': b'# fixture application source\n',
-        f'upstream/{QT_NAME}': fake_qt,
-        'manifest.json': b'placeholder-replaced-by-caller',
-        'REBUILD.md': b'fixture rebuild instructions\n',
-        'SOURCE_REVISION.txt': f'application source commit: {COMMIT}\n'.encode(),
-        'SOURCE_ACCESS.txt': b'fixture source access statement\n',
-        'patches/README.txt': b'no patches\n',
-        'recipes/toolchain.json': b'{"msvc": "fixture"}',
-        'recipes/packaging.json': b'{"entry_point": "scripts/build-portable.ps1"}',
-        'licenses/THIRD_PARTY_NOTICES.md': b'fixture notices\n',
-        'licenses/Qt/sdk-6.8.3-msvc2022-x64.json': b'{"schema_version": 1}',
-        'licenses/tomlplusplus/LICENSE': b'fixture toml++ license\n',
-    }
+class VerifierTests(unittest.TestCase):
 
-
-class ReleaseFixture:
-    def __init__(self, root: pathlib.Path):
-        self.root = root
-        self.release_dir = root / 'dist'
-        self.release_dir.mkdir(parents=True)
-        self.fake_qt = b'fixture qt source archive bytes'
-        self.fake_qt_sha = sha256_bytes(self.fake_qt)
-        self.runtime_zip = self.release_dir / 'CodexProxyGuard-9.9.9-test-windows-x86_64-dynamic.zip'
-        self.compliance_zip = self.release_dir / 'CodexProxyGuard-9.9.9-test-source-compliance.zip'
-        self.manifest_path = self.release_dir / 'release-manifest.json'
-        self.rebuild()
-
-    def rebuild(self, *, runtime_override=None, compliance_override=None,
-                manifest_override=None, dirty=False) -> None:
-        members, info = runtime_members(self.fake_qt_sha)
-        if dirty:
-            info['git_dirty'] = 'false'  # string, not boolean
-            members['build-info.json'] = json.dumps(info).encode()
-        if runtime_override:
-            members.update(runtime_override)
-        write_zip(self.runtime_zip, members)
-        self.runtime_sha = sha256_bytes(self.runtime_zip.read_bytes())
-        (self.release_dir / (self.runtime_zip.name + '.sha256')).write_text(
-            f'{self.runtime_sha}  {self.runtime_zip.name}\n')
-
-        compliance = compliance_members(self.fake_qt)
-        if compliance_override:
-            compliance.update(compliance_override)
-        compliance.pop('manifest.json')
-        listed = {name: sha256_bytes(data) for name, data in compliance.items()}
-        compliance['manifest.json'] = json.dumps({
-            'schema_version': 1, 'product_version': VERSION, 'source_commit': COMMIT,
-            'qt_source': {'name': QT_NAME, 'sha256': self.fake_qt_sha, 'url': QT_URL},
-            'files_sha256': listed}).encode()
-        write_zip(self.compliance_zip, compliance)
-        self.compliance_sha = sha256_bytes(self.compliance_zip.read_bytes())
-        (self.release_dir / (self.compliance_zip.name + '.sha256')).write_text(
-            f'{self.compliance_sha}  {self.compliance_zip.name}\n')
-
-        manifest = {
-            'schema_version': 2, 'profile': 'dynamic-split', 'product_version': VERSION,
-            'source_commit': COMMIT, 'source_dirty': False,
-            'runtime_archive': {'name': self.runtime_zip.name, 'sha256': self.runtime_sha},
-            'source_compliance_archive': {'name': self.compliance_zip.name, 'sha256': self.compliance_sha},
-            'qt_source': {'name': QT_NAME, 'url': QT_URL, 'sha256': self.fake_qt_sha},
-        }
-        if manifest_override:
-            manifest.update(manifest_override)
-        self.manifest_path.write_text(json.dumps(manifest))
-
-    def run(self, *extra):
-        return subprocess.run(
-            [sys.executable, str(VERIFIER), str(self.runtime_zip),
-             '--expected-commit', COMMIT, '--qt-source-sha256', self.fake_qt_sha, *extra],
-            capture_output=True, text=True)
-
-
-class VerifyPackageTests(unittest.TestCase):
     def setUp(self):
-        self._tmp = tempfile.TemporaryDirectory()
-        self.fixture = ReleaseFixture(pathlib.Path(self._tmp.name))
+        self._temporary = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self._temporary.name)
+        self.release = self.root / f'{VERSION}-{COMMIT[:8]}'
+        self.release.mkdir()
+        self.exe = self.release / 'CodexProxyGuard.exe'
+        self.exe.write_bytes(minimal_console_pe())
+        self.transport = self.release / f'CodexProxyGuard-{VERSION}-windows-x86_64.zip'
+        self.source = self.release / f'CodexProxyGuard-{VERSION}-source.zip'
+        self.write_transport()
+        self.write_source()
+        self.manifest = {
+            'schema': 'static-single', 'schema_version': 1,
+            'version': VERSION, 'commit': COMMIT, 'dirty': False,
+            'created_utc': '2026-10-11T00:00:00Z',
+            'qt': False, 'powershell_appx_discovery': False,
+            'subsystem': 'console', 'crt': 'static',
+            'unsigned_dev': True,
+            'executable': {'path': 'CodexProxyGuard.exe',
+                           'sha256': file_sha256(self.exe),
+                           'size': self.exe.stat().st_size,
+                           'signed': False, 'qt': False},
+            'transport_zip': {'path': self.transport.name,
+                              'sha256': file_sha256(self.transport)},
+            'artifacts': ['CodexProxyGuard.exe', self.transport.name,
+                          self.source.name, 'release-manifest.json',
+                          'SHA256SUMS.txt'],
+        }
+        self.write_manifest()
+        self.write_sums()
 
     def tearDown(self):
-        self._tmp.cleanup()
+        self._temporary.cleanup()
 
-    def test_consistent_split_release_passes(self):
-        result = self.fixture.run()
-        self.assertEqual(result.returncode, 0, result.stderr)
-        report = json.loads(result.stdout)
-        self.assertEqual(report['profile'], 'dynamic-split')
-        self.assertTrue(report['split_linkage'] == 'verified')
+    def write_transport(self, extra_member=None):
+        with zipfile.ZipFile(self.transport, 'w') as bundle:
+            bundle.writestr('CodexProxyGuard.exe', self.exe.read_bytes())
+            if extra_member:
+                bundle.writestr(extra_member, 'forbidden')
+        self.transport.with_name(self.transport.name + '.sha256').write_text(
+            f'{file_sha256(self.transport)} {self.transport.name}\n', encoding='utf-8')
 
-    def test_wrong_commit_rejected(self):
-        result = self.fixture.run('--expected-commit', 'fedcba9876543210' + '0' * 24)
-        self.assertNotEqual(result.returncode, 0)
+    def write_source(self):
+        with zipfile.ZipFile(self.source, 'w') as bundle:
+            bundle.writestr('source/main.cpp', 'int main() {}\n')
+        self.source.with_name(self.source.name + '.sha256').write_text(
+            f'{file_sha256(self.source)} {self.source.name}\n', encoding='utf-8')
 
-    def test_dirty_string_rejected(self):
-        self.fixture.rebuild(dirty=True)
-        result = self.fixture.run()
-        self.assertNotEqual(result.returncode, 0)
+    def write_manifest(self, **overrides):
+        manifest = dict(self.manifest)
+        manifest.update(overrides)
+        (self.release / 'release-manifest.json').write_text(
+            json.dumps(manifest, indent=2), encoding='utf-8')
 
-    def test_extra_dll_rejected(self):
-        self.fixture.rebuild(runtime_override={'engine/Qt6Gui.dll': b'smuggled'})
-        result = self.fixture.run()
-        self.assertNotEqual(result.returncode, 0)
+    def write_sums(self):
+        lines = [f'{file_sha256(self.exe)} CodexProxyGuard.exe',
+                 f'{file_sha256(self.transport)} {self.transport.name}',
+                 f'{file_sha256(self.source)} {self.source.name}']
+        (self.release / 'SHA256SUMS.txt').write_text('\n'.join(lines) + '\n', encoding='utf-8')
 
-    def test_missing_compliance_archive_rejected(self):
-        self.fixture.compliance_zip.unlink()
-        result = self.fixture.run()
-        self.assertNotEqual(result.returncode, 0)
+    def verify(self) -> subprocess.CompletedProcess:
+        return subprocess.run([sys.executable, str(VERIFIER),
+                               '--release', str(self.release),
+                               '--schema', 'static-single', '--skip-execution'],
+                              capture_output=True, text=True, timeout=120)
 
-    def test_manifest_runtime_hash_mismatch_rejected(self):
-        self.fixture.rebuild(manifest_override={
-            'runtime_archive': {'name': self.fixture.runtime_zip.name,
-                                'sha256': '0' * 64}})
-        result = self.fixture.run()
-        self.assertNotEqual(result.returncode, 0)
+    def test_accepts_consistent_release(self):
+        completed = self.verify()
+        self.assertEqual(completed.returncode, 0, completed.stderr)
 
-    def test_qt_source_hash_mismatch_rejected(self):
-        self.fixture.rebuild(compliance_override={f'upstream/{QT_NAME}': b'tampered qt'})
-        result = self.fixture.run()
-        self.assertNotEqual(result.returncode, 0)
+    def test_rejects_manifest_digest_mismatch(self):
+        self.write_manifest(executable=dict(self.manifest['executable'], sha256='0' * 64))
+        self.assertNotEqual(self.verify().returncode, 0)
 
-    def test_corrupt_zip_crc_rejected(self):
-        raw = bytearray(self.fixture.runtime_zip.read_bytes())
-        raw[len(raw) // 2] ^= 0xFF
-        self.fixture.runtime_zip.write_bytes(raw)
-        result = self.fixture.run()
-        self.assertNotEqual(result.returncode, 0)
+    def test_rejects_size_mismatch(self):
+        self.write_manifest(executable=dict(self.manifest['executable'], size=1))
+        self.assertNotEqual(self.verify().returncode, 0)
 
-    def test_manifest_commit_mismatch_rejected(self):
-        self.fixture.rebuild(manifest_override={'source_commit': 'f' * 40})
-        result = self.fixture.run()
-        self.assertNotEqual(result.returncode, 0)
+    def test_rejects_qt_claim(self):
+        self.write_manifest(qt=True)
+        self.assertNotEqual(self.verify().returncode, 0)
 
-    def test_dirty_manifest_string_rejected(self):
-        self.fixture.rebuild(manifest_override={'source_dirty': 'false'})
-        result = self.fixture.run()
-        self.assertNotEqual(result.returncode, 0)
+    def test_rejects_powershell_discovery_claim(self):
+        self.write_manifest(powershell_appx_discovery=True)
+        self.assertNotEqual(self.verify().returncode, 0)
 
-    def test_schema_pin_rejects_other_layout(self):
-        # A legacy-shaped bundle (source embedded) must fail a dynamic-split pin.
-        members, info = runtime_members(self.fixture.fake_qt_sha)
-        members[f'sources/{QT_NAME}'] = self.fixture.fake_qt
-        legacy = self.fixture.release_dir / 'legacy-shaped.zip'
-        write_zip(legacy, members)
-        sidecar = self.fixture.release_dir / (legacy.name + '.sha256')
-        sidecar.write_text(f'{sha256_bytes(legacy.read_bytes())}  {legacy.name}\n')
-        result = subprocess.run(
-            [sys.executable, str(VERIFIER), str(legacy), '--expected-commit', COMMIT,
-             '--qt-source-sha256', self.fixture.fake_qt_sha, '--schema', 'dynamic-split'],
-            capture_output=True, text=True)
-        self.assertNotEqual(result.returncode, 0)
+    def test_rejects_wrong_subsystem_claim(self):
+        self.write_manifest(subsystem='windows')
+        self.assertNotEqual(self.verify().returncode, 0)
+
+    def test_rejects_unsigned_without_dev_marker(self):
+        manifest = dict(self.manifest)
+        manifest.pop('unsigned_dev')
+        (self.release / 'release-manifest.json').write_text(
+            json.dumps(manifest), encoding='utf-8')
+        self.assertNotEqual(self.verify().returncode, 0)
+
+    def test_rejects_signed_claim_without_valid_authenticode(self):
+        self.write_manifest(authenticode_status='Unavailable',
+                            executable=dict(self.manifest['executable'], signed=True))
+        self.assertNotEqual(self.verify().returncode, 0)
+
+    def test_rejects_transport_with_extra_member(self):
+        self.write_transport(extra_member='extra.txt')
+        self.write_manifest(transport_zip={'path': self.transport.name,
+                                           'sha256': file_sha256(self.transport)})
+        self.write_sums()
+        self.assertNotEqual(self.verify().returncode, 0)
+
+    def test_rejects_transport_sidecar_mismatch(self):
+        self.transport.with_name(self.transport.name + '.sha256').write_text(
+            f'{"0" * 64} {self.transport.name}\n', encoding='utf-8')
+        self.assertNotEqual(self.verify().returncode, 0)
+
+    def test_rejects_tampered_sums(self):
+        (self.release / 'SHA256SUMS.txt').write_text(
+            f'{"0" * 64} CodexProxyGuard.exe\n', encoding='utf-8')
+        self.assertNotEqual(self.verify().returncode, 0)
+
+    def test_rejects_missing_source_zip(self):
+        self.write_sums()
+        self.source.with_name(self.source.name + '.sha256').unlink()
+        self.source.unlink()
+        self.assertNotEqual(self.verify().returncode, 0)
 
 
 if __name__ == '__main__':
-    unittest.main(verbosity=2)
+    unittest.main()

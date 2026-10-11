@@ -1,30 +1,43 @@
-"""Verify portable release provenance, CRC and all SHA-256 manifests.
+"""Verify the no-Qt single-EXE portable release (schema: static-single).
 
-Two package schemas are recognized:
+Expected package layout under dist/releases/<version>-<commit>/:
 
-- legacy (the 0.6.0-rc.1 full bundle): a single ZIP that embedded both the
-  runtime and the corresponding Qt source archive under sources/.
-- dynamic-split (current): a runtime ZIP without any source archive, plus a
-  sibling source-compliance ZIP and release-manifest.json that bind both
-  archives to the same clean commit, Qt source hash and SDK provenance.
+- CodexProxyGuard.exe        the single console-subsystem executable
+- release-manifest.json      binds version/commit/artifacts together
+- SHA256SUMS.txt             digests of every file in the release directory
+- CodexProxyGuard-<version>-windows-x86_64.zip   transport ZIP with only the EXE
+- CodexProxyGuard-<version>-windows-x86_64.zip.sha256
+- CodexProxyGuard-<version>-source.zip            source snapshot
+- size-report.json           size evidence
 
-Pass --schema to pin the expectation. The verifier re-reads every artifact
-from disk; nothing the build scripts wrote is trusted on faith.
+The verifier re-reads every artifact from disk; nothing the build script
+wrote is trusted on faith. It executes the packaged EXE to read its embedded
+build-info, checks the console subsystem byte, scans the import table for
+non-system DLLs, and refuses manifests that still claim Qt or PowerShell
+discovery.
 """
 import argparse
 import hashlib
 import json
 import pathlib
+import struct
+import subprocess
+import tempfile
 import zipfile
 
-QT_SOURCE_SHA256 = '56001b905601bb9023d399f3ba780d7fa940f3e4861e496a7c490331f49e0b80'
-QT_SOURCE_NAME = 'qtbase-everywhere-src-6.8.3.tar.xz'
-QT_SOURCE_URL = 'https://download.qt.io/archive/qt/6.8/6.8.3/submodules/' + QT_SOURCE_NAME
-REQUIRED_RUNTIME_LEGACY = ('engine/Qt6Core.dll', 'engine/msvcp140.dll',
-                            'engine/vcruntime140.dll', 'platforms/qwindows.dll',
-                            'licenses/tomlplusplus/LICENSE')
-REQUIRED_RUNTIME_UNIFIED = ('CodexProxyGuard.exe', 'platforms/qwindows.dll',
-                            'licenses/tomlplusplus/LICENSE')
+REQUIRED_MANIFEST_KEYS = (
+    'schema', 'schema_version', 'version', 'commit', 'dirty',
+    'created_utc', 'artifacts', 'executable',
+)
+ALLOWED_IMPORT_PREFIXES = (
+    'ADVAPI32.DLL', 'API-MS-WIN-', 'BCRYPT.DLL', 'CFG.DLL', 'CLR.DLL',
+    'COMBASE.DLL', 'COMCTL32.DLL', 'CRYPT32.DLL', 'DBGHELP.DLL',
+    'DNSAPI.DLL', 'DPAPI.DLL', 'EXT-MS-WIN-', 'GDI32.DLL', 'GDIPLUS.DLL',
+    'IMM32.DLL', 'KERNEL32.DLL', 'MSVCRT.DLL', 'NCRYPT.DLL', 'NTDLL.DLL',
+    'OLE32.DLL', 'OLEAUT32.DLL', 'POWRPROF.DLL', 'RPCRT4.DLL', 'SECUR32.DLL',
+    'SHELL32.DLL', 'SHLWAPI.DLL', 'SHCORE.DLL', 'USER32.DLL', 'USERENV.DLL',
+    'UCRTBASE.DLL', 'VERSION.DLL', 'WIN32U.DLL', 'WS2_32.DLL', 'WTSAPI32.DLL',
+)
 
 
 def digest(data: bytes) -> str:
@@ -47,269 +60,171 @@ def check_sidecar(archive: pathlib.Path) -> str:
     return actual
 
 
-def member_map(bundle: zipfile.ZipFile) -> dict:
-    if bundle.testzip() is not None:
-        raise SystemExit('ZIP CRC failed')
-    entries = [entry for entry in bundle.infolist() if not entry.is_dir()]
-    files = {entry.filename.replace('\\', '/'): entry for entry in entries}
-    if len(files) != len(entries):
-        raise SystemExit('Duplicate ZIP paths')
-    for name in files:
-        parts = pathlib.PurePosixPath(name).parts
-        if name.startswith('/') or '..' in parts or ':' in name or '\x00' in name:
-            raise SystemExit(f'Unsafe ZIP path: {name}')
-    return files
+def pe_header(data: bytes):
+    if data[:2] != b'MZ':
+        raise SystemExit('EXE has no MZ signature')
+    pe_offset = struct.unpack_from('<I', data, 0x3c)[0]
+    if data[pe_offset:pe_offset + 4] != b'PE\x00\x00':
+        raise SystemExit('EXE has no PE signature')
+    return pe_offset
 
 
-def verify_member_hashes(bundle: zipfile.ZipFile, files: dict, info: dict) -> dict:
-    expected = info['files_sha256']
-    if set(files) != set(expected) | {'build-info.json', 'SHA256SUMS.txt'}:
-        raise SystemExit('Unmanifested or missing package files')
-    actual = {name: digest(bundle.read(entry)) for name, entry in files.items()}
-    for name, checksum in expected.items():
-        if actual[name] != checksum:
-            raise SystemExit(f'Member digest mismatch: {name}')
-    sums = {}
-    for line in bundle.read(files['SHA256SUMS.txt']).decode('utf-8-sig').splitlines():
-        checksum, name = line.split('  ', 1)
-        if name in sums:
-            raise SystemExit('Duplicate checksum entry')
-        sums[name] = checksum
-    if sums != {name: value for name, value in actual.items() if name != 'SHA256SUMS.txt'}:
-        raise SystemExit('SHA256SUMS contents mismatch')
-    return actual
+def pe_subsystem(data: bytes) -> int:
+    pe_offset = pe_header(data)
+    optional_header = pe_offset + 24
+    magic = struct.unpack_from('<H', data, optional_header)[0]
+    if magic not in (0x10b, 0x20b):
+        raise SystemExit('Unknown PE optional header magic')
+    return struct.unpack_from('<H', data, optional_header + 68)[0]
 
 
-def verify_qt_deployment(actual: dict, info: dict) -> None:
-    for name, record in info['qt_sdk']['deployed_files'].items():
-        if actual[name] != record['sdk_sha256'] or actual[name] != record['deployed_sha256']:
-            raise SystemExit(f'Qt SDK digest mismatch: {name}')
+def pe_imports(data: bytes) -> list:
+    """Import scan of the first import directory (dumpbin-free)."""
+    pe_offset = pe_header(data)
+    optional_header = pe_offset + 24
+    magic = struct.unpack_from('<H', data, optional_header)[0]
+    section_table = optional_header + struct.unpack_from('<H', data, pe_offset + 20)[0]
+    number_sections = struct.unpack_from('<H', data, pe_offset + 6)[0]
+    data_directories = optional_header + (112 if magic == 0x20b else 96)
+    # The import table is the second data directory (index 1).
+    import_rva = struct.unpack_from('<I', data, data_directories + 8)[0]
+
+    def rva_to_offset(rva: int) -> int:
+        for index in range(number_sections):
+            entry = section_table + index * 40
+            virtual_size = struct.unpack_from('<I', data, entry + 8)[0]
+            virtual_address = struct.unpack_from('<I', data, entry + 12)[0]
+            raw_size = struct.unpack_from('<I', data, entry + 16)[0]
+            raw_pointer = struct.unpack_from('<I', data, entry + 20)[0]
+            if virtual_address <= rva < virtual_address + max(virtual_size, raw_size):
+                return raw_pointer + (rva - virtual_address)
+        raise SystemExit(f'Import RVA outside sections: {rva:#x}')
+
+    imports = []
+    descriptor = rva_to_offset(import_rva) if import_rva else 0
+    while descriptor and data[descriptor:descriptor + 20] != b'\x00' * 20:
+        name_rva = struct.unpack_from('<I', data, descriptor + 12)[0]
+        name_offset = rva_to_offset(name_rva)
+        end = data.index(b'\x00', name_offset)
+        imports.append(data[name_offset:end].decode('ascii', 'replace').upper())
+        descriptor += 20
+    return imports
 
 
-def verify_split(runtime_zip: pathlib.Path, bundle: zipfile.ZipFile, files: dict,
-                 info: dict, expected_commit: str, qt_source_sha: str) -> None:
-    for name in REQUIRED_RUNTIME_UNIFIED:
-        if name not in files:
-            raise SystemExit(f'Missing runtime/license file: {name}')
-    production = [name for name in files if name.endswith('.exe')
-                  and name != 'vc_redist.x64.exe']
-    if production != ['CodexProxyGuard.exe']:
-        raise SystemExit(f'Unified runtime must contain exactly one production executable: {production}')
-    for name in files:
-        if name.startswith('sources/'):
-            raise SystemExit(f'Source archive must not ship inside the runtime ZIP: {name}')
-    actual = verify_member_hashes(bundle, files, info)
-    verify_qt_deployment(actual, info)
-    qt_source = info['qt_source']
-    if qt_source['sha256'] != qt_source_sha or qt_source['url'] != QT_SOURCE_URL:
-        raise SystemExit('Runtime build-info Qt source provenance mismatch')
-
-    manifest_path = runtime_zip.parent / 'release-manifest.json'
-    if not manifest_path.is_file():
-        raise SystemExit('dynamic-split runtime requires release-manifest.json beside it')
-    manifest = json.loads(manifest_path.read_text(encoding='utf-8-sig'))
-    if (manifest.get('schema_version') != 2 or manifest.get('profile') != 'dynamic-split'
-            or isinstance(manifest.get('source_dirty'), str)):
-        raise SystemExit('Release manifest schema mismatch')
-    if manifest['source_commit'] != expected_commit or manifest['source_dirty'] is not False:
-        raise SystemExit('Release manifest does not match the expected clean commit')
-    runtime_record = manifest['runtime_archive']
-    if runtime_record['name'] != runtime_zip.name:
-        raise SystemExit('Release manifest runtime archive name mismatch')
-    if runtime_record['sha256'] != check_sidecar(runtime_zip):
-        raise SystemExit('Release manifest runtime archive digest mismatch')
-
-    compliance_zip = runtime_zip.parent / manifest['source_compliance_archive']['name']
-    if not compliance_zip.is_file():
-        raise SystemExit('Source compliance archive listed in the manifest is missing')
-    if file_digest(compliance_zip) != manifest['source_compliance_archive']['sha256']:
-        raise SystemExit('Source compliance archive digest mismatch')
-    compliance_sidecar = pathlib.Path(str(compliance_zip) + '.sha256').read_text(encoding='utf-8-sig').split()
-    if compliance_sidecar != [manifest['source_compliance_archive']['sha256'], compliance_zip.name]:
-        raise SystemExit('Source compliance sidecar digest mismatch')
-    if manifest['qt_source']['sha256'] != qt_source_sha:
-        raise SystemExit('Release manifest Qt source digest mismatch')
-
-    with zipfile.ZipFile(compliance_zip) as compliance:
-        compliance_files = member_map(compliance)
-        required = {'app/CMakeLists.txt', f'upstream/{QT_SOURCE_NAME}', 'manifest.json',
-                    'REBUILD.md', 'SOURCE_REVISION.txt', 'SOURCE_ACCESS.txt',
-                    'patches/README.txt', 'recipes/toolchain.json', 'recipes/packaging.json',
-                    'licenses/THIRD_PARTY_NOTICES.md', 'licenses/Qt/sdk-6.8.3-msvc2022-x64.json',
-                    'licenses/tomlplusplus/LICENSE'}
-        missing = required - set(compliance_files)
-        if missing:
-            raise SystemExit(f'Source compliance members missing: {sorted(missing)}')
-        if digest(compliance.read(f'upstream/{QT_SOURCE_NAME}')) != qt_source_sha:
-            raise SystemExit('Corresponding Qt source mismatch inside compliance archive')
-        revision = compliance.read('SOURCE_REVISION.txt').decode('utf-8-sig')
-        if expected_commit not in revision:
-            raise SystemExit('Source revision does not name the expected commit')
-        compliance_manifest = json.loads(compliance.read('manifest.json').decode('utf-8-sig'))
-        if compliance_manifest['source_commit'] != expected_commit:
-            raise SystemExit('Compliance manifest commit mismatch')
-        if compliance_manifest['qt_source']['sha256'] != qt_source_sha:
-            raise SystemExit('Compliance manifest Qt source digest mismatch')
-        listed = compliance_manifest['files_sha256']
-        if 'manifest.json' in listed:
-            raise SystemExit('Compliance manifest must not hash itself')
-        if set(listed) | {'manifest.json'} != set(compliance_files):
-            raise SystemExit('Unmanifested or missing compliance members')
-        for name, checksum in listed.items():
-            if digest(compliance.read(name)) != checksum:
-                raise SystemExit(f'Compliance member digest mismatch: {name}')
-        print(json.dumps({'version': info['product_version'], 'commit': expected_commit,
-                          'dirty': False, 'profile': 'dynamic-split',
-                          'runtime_members': len(info['files_sha256']),
-                          'compliance_members': len(compliance_files),
-                          'zip_crc': 'passed', 'split_linkage': 'verified'}, indent=2))
-
-
-def verify_static_single(runtime_zip: pathlib.Path, bundle: zipfile.ZipFile, files: dict,
-                         info: dict, expected_commit: str, qt_source_sha: str) -> None:
-    import os
-    import subprocess
-    import tempfile
-    # The static-single runtime archive carries exactly one member: the EXE.
-    if set(files) != {'CodexProxyGuard.exe'}:
-        raise SystemExit(f'static-single runtime must contain only CodexProxyGuard.exe: {sorted(files)}')
-    manifest_path = runtime_zip.parent / 'release-manifest.json'
-    if not manifest_path.is_file():
-        raise SystemExit('static-single runtime requires release-manifest.json beside it')
-    manifest = json.loads(manifest_path.read_text(encoding='utf-8-sig'))
-    if (manifest.get('schema_version') != 2 or manifest.get('profile') != 'static-single'
-            or isinstance(manifest.get('source_dirty'), str)):
-        raise SystemExit('Release manifest schema mismatch')
-    if manifest['source_commit'] != expected_commit or manifest['source_dirty'] is not False:
-        raise SystemExit('Release manifest does not match the expected clean commit')
-    runtime_record = manifest['runtime_archive']
-    if runtime_record['name'] != runtime_zip.name:
-        raise SystemExit('Release manifest runtime archive name mismatch')
-    if runtime_record['sha256'] != check_sidecar(runtime_zip):
-        raise SystemExit('Release manifest runtime archive digest mismatch')
-    executable = manifest.get('executable', {})
-    if (executable.get('qt_linkage') != 'static' or executable.get('crt_linkage') != 'static'
-            or not manifest.get('qt_static', {}).get('recipe_key')):
-        raise SystemExit('Static provenance incomplete: qt/crt linkage or recipe key missing')
-    if manifest['qt_source']['sha256'] != qt_source_sha:
-        raise SystemExit('Release manifest Qt source digest mismatch')
-
-    exe_bytes = bundle.read(files['CodexProxyGuard.exe'])
-    if digest(exe_bytes) != executable['sha256']:
-        raise SystemExit('Executable digest mismatch against release manifest')
-    if exe_bytes[:2] != b'MZ':
-        raise SystemExit('Executable member is not a PE image')
-
-    # Build information comes from executing the actual packaged executable
-    # with a scratch-only PATH, never from trusting the packaging script JSON.
-    with tempfile.TemporaryDirectory(prefix='cpg-verify-') as scratch:
-        extracted = pathlib.Path(scratch) / 'CodexProxyGuard.exe'
-        extracted.write_bytes(exe_bytes)
-        environment = dict(os.environ)
-        environment['PATH'] = scratch
-        environment.pop('QT_QPA_PLATFORM', None)
-        environment.pop('QT_PLUGIN_PATH', None)
-        completed = subprocess.run([str(extracted), 'build-info'], capture_output=True,
-                                   text=True, timeout=60, env=environment)
-        if completed.returncode != 0:
-            raise SystemExit(f'build-info execution failed: {completed.stderr.strip()}')
-        embedded = json.loads(completed.stdout)
-        if (embedded.get('git_commit') != expected_commit or embedded.get('commit') != expected_commit
-                or embedded.get('version') != manifest['product_version']
-                or embedded.get('product_version') != manifest['product_version']
-                or embedded.get('git_dirty') is not False or embedded.get('dirty') is not False
-                or embedded.get('language') != 'C++20' or embedded.get('protocol_version') != 1):
-            raise SystemExit('Embedded build-info disagrees with the release manifest')
-
-    compliance_zip = runtime_zip.parent / manifest['source_compliance_archive']['name']
-    if not compliance_zip.is_file():
-        raise SystemExit('Source compliance archive listed in the manifest is missing')
-    if file_digest(compliance_zip) != manifest['source_compliance_archive']['sha256']:
-        raise SystemExit('Source compliance archive digest mismatch')
-    with zipfile.ZipFile(compliance_zip) as compliance:
-        compliance_files = member_map(compliance)
-        if 'recipes/qt-static-recipe.json' not in compliance_files:
-            raise SystemExit('Static source compliance package lacks the Qt static recipe')
-        recipe = json.loads(compliance.read('recipes/qt-static-recipe.json').decode('utf-8-sig'))
-        if recipe.get('recipe_key') != manifest['qt_static']['recipe_key']:
-            raise SystemExit('Compliance recipe key disagrees with the release manifest')
-        if recipe.get('qt_source_sha256') != qt_source_sha:
-            raise SystemExit('Compliance recipe Qt source digest mismatch')
-        if digest(compliance.read(f'upstream/{QT_SOURCE_NAME}')) != qt_source_sha:
-            raise SystemExit('Corresponding Qt source mismatch inside compliance archive')
-        revision = compliance.read('SOURCE_REVISION.txt').decode('utf-8-sig')
-        if expected_commit not in revision:
-            raise SystemExit('Source revision does not name the expected commit')
-        compliance_manifest = json.loads(compliance.read('manifest.json').decode('utf-8-sig'))
-        listed = compliance_manifest['files_sha256']
-        if 'manifest.json' in listed:
-            raise SystemExit('Compliance manifest must not hash itself')
-        if set(listed) | {'manifest.json'} != set(compliance_files):
-            raise SystemExit('Unmanifested or missing compliance members')
-        for name, checksum in listed.items():
-            if digest(compliance.read(name)) != checksum:
-                raise SystemExit(f'Compliance member digest mismatch: {name}')
-        print(json.dumps({'version': manifest['product_version'], 'commit': expected_commit,
-                          'dirty': False, 'profile': 'static-single',
-                          'executable_sha256': executable['sha256'],
-                          'qt_linkage': 'static', 'crt_linkage': 'static',
-                          'qt_recipe_key': manifest['qt_static']['recipe_key'],
-                          'runtime_members': 1,
-                          'compliance_members': len(compliance_files),
-                          'zip_crc': 'passed', 'embedded_build_info': 'executed'}, indent=2))
-
-
-def verify_legacy(bundle: zipfile.ZipFile, files: dict, info: dict, expected_commit: str) -> None:
-    for name in REQUIRED_RUNTIME_LEGACY:
-        if name not in files:
-            raise SystemExit(f'Missing runtime/license file: {name}')
-    actual = verify_member_hashes(bundle, files, info)
-    verify_qt_deployment(actual, info)
-    source = info['qt_source']
-    if actual[source['archive']] != source['sha256']:
-        raise SystemExit('Corresponding Qt source mismatch')
-    print(json.dumps({'version': info['product_version'], 'commit': expected_commit,
-                      'dirty': False, 'manifest_files': len(info['files_sha256']),
-                      'zip_crc': 'passed'}, indent=2))
+def run(args: pathlib.Path, *arguments: str) -> str:
+    completed = subprocess.run([str(args), *arguments], capture_output=True, text=True,
+                               timeout=120)
+    if completed.returncode != 0:
+        raise SystemExit(f'{args.name} {" ".join(arguments)} failed: {completed.stderr.strip()}')
+    return completed.stdout.strip()
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('archive', type=pathlib.Path)
-    parser.add_argument('--expected-commit', required=True)
-    parser.add_argument('--schema', choices=('auto', 'legacy', 'dynamic-split', 'static-single'),
-                        default='auto')
-    parser.add_argument('--qt-source-sha256', default=QT_SOURCE_SHA256,
-                        help='Expected Qt source archive digest (default: the pinned '
-                             'official 6.8.3 release); custom Qt rebuilds pass their own')
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--release', required=True, help='release directory to verify')
+    parser.add_argument('--schema', default='static-single',
+                        choices=['static-single'], help='expected package schema')
+    parser.add_argument('--skip-execution', action='store_true',
+                        help='test fixtures only: skip executing the packaged EXE')
     args = parser.parse_args()
-    check_sidecar(args.archive)
-    with zipfile.ZipFile(args.archive) as bundle:
-        files = member_map(bundle)
-        if set(files) == {'CodexProxyGuard.exe'}:
-            # EXE-only archive: no member manifest exists; the static-single
-            # schema is anchored by the external release manifest instead.
-            detected = 'static-single'
-            info = {}
-        else:
-            info = json.loads(bundle.read(files['build-info.json']).decode('utf-8-sig'))
-            if info.get('git_commit') != args.expected_commit or info.get('git_dirty') is not False:
-                raise SystemExit('Package is not the expected clean commit')
-            if info['engine']['language'] != 'C++20' or info['engine']['protocol_version'] != 1:
-                raise SystemExit('Unexpected engine provenance')
-            detected = 'legacy' if any(name.startswith('sources/') for name in files) \
-                else info.get('profile', 'legacy')
-        schema = detected if args.schema == 'auto' else args.schema
-        if schema != detected:
-            raise SystemExit(f'Package does not match the requested schema: {detected}')
-        if schema == 'legacy':
-            verify_legacy(bundle, files, info, args.expected_commit)
-        elif schema == 'static-single':
-            verify_static_single(args.archive, bundle, files, info,
-                                 args.expected_commit, args.qt_source_sha256)
-        else:
-            verify_split(args.archive, bundle, files, info, args.expected_commit,
-                         args.qt_source_sha256)
+    release = pathlib.Path(args.release)
+    if not release.is_dir():
+        raise SystemExit(f'Release directory missing: {release}')
+
+    manifest = json.loads((release / 'release-manifest.json').read_text(encoding='utf-8-sig'))
+    for key in REQUIRED_MANIFEST_KEYS:
+        if key not in manifest:
+            raise SystemExit(f'release-manifest.json missing key: {key}')
+    if manifest.get('schema') != 'static-single' or manifest.get('schema_version') != 1:
+        raise SystemExit('Unexpected manifest schema')
+    if manifest.get('qt'):
+        raise SystemExit('Manifest claims Qt linkage in a no-Qt release')
+    if manifest.get('powershell_appx_discovery'):
+        raise SystemExit('Manifest claims PowerShell discovery in a native-discovery release')
+    if manifest.get('subsystem') != 'console':
+        raise SystemExit('Manifest must record the console subsystem')
+    if manifest.get('crt') != 'static':
+        raise SystemExit('Manifest must record the static CRT')
+
+    executable = release / 'CodexProxyGuard.exe'
+    if not executable.is_file():
+        raise SystemExit('CodexProxyGuard.exe missing from the release')
+    exe_bytes = executable.read_bytes()
+    exe_digest = file_digest(executable)
+    if manifest['executable'].get('sha256') != exe_digest:
+        raise SystemExit('EXE digest does not match the manifest')
+    if manifest['executable'].get('size') != len(exe_bytes):
+        raise SystemExit('EXE size does not match the manifest')
+    if manifest['executable'].get('qt') is not False:
+        raise SystemExit('Executable record must record qt=false')
+    if pe_subsystem(exe_bytes) != 3:
+        raise SystemExit('EXE is not a console-subsystem binary')
+    imports = pe_imports(exe_bytes)
+    if not imports:
+        raise SystemExit('EXE import table is empty or unreadable')
+    forbidden = [name for name in imports if not name.startswith(ALLOWED_IMPORT_PREFIXES)]
+    if forbidden:
+        raise SystemExit(f'Non-system import detected: {", ".join(forbidden)}')
+    for name in imports:
+        if name.startswith(('QT6', 'MSVCP140', 'VCRUNTIME140', 'CONCRT140', 'VCRUNTIME140_1')):
+            raise SystemExit(f'Forbidden CRT/Qt import: {name}')
+
+    # Execute the packaged EXE itself for provenance and licenses (skipped
+    # only by the fixture suite, which cannot execute its synthetic payload).
+    if not args.skip_execution:
+        info = json.loads(run(executable, 'build-info'))
+        if info.get('version') != manifest['version']:
+            raise SystemExit('Packaged build-info version mismatch')
+        if info.get('commit') != manifest['commit']:
+            raise SystemExit('Packaged build-info commit mismatch')
+        if info.get('language') != 'C++20':
+            raise SystemExit('Packaged build-info language mismatch')
+        licenses = run(executable, 'licenses')
+        if '===== LICENSE =====' not in licenses or '===== json/LICENSE.MIT =====' not in licenses:
+            raise SystemExit('Embedded license stream incomplete')
+
+    # Transport ZIP: exactly the EXE, digest-bound by sidecar and manifest.
+    zips = sorted(release.glob('*.zip'))
+    transport = [path for path in zips if 'source' not in path.name]
+    if len(transport) != 1:
+        raise SystemExit('Expected exactly one transport ZIP')
+    zip_digest = check_sidecar(transport[0])
+    with zipfile.ZipFile(transport[0]) as bundle:
+        if bundle.testzip() is not None:
+            raise SystemExit('ZIP CRC failed')
+        names = [entry.filename.replace('\\', '/') for entry in bundle.infolist()
+                 if not entry.is_dir()]
+        if sorted(names) != ['CodexProxyGuard.exe']:
+            raise SystemExit(f'Transport ZIP must contain only the EXE, found: {names}')
+        if digest(bundle.read('CodexProxyGuard.exe')) != exe_digest:
+            raise SystemExit('Transport ZIP EXE digest mismatch')
+    if manifest.get('transport_zip', {}).get('sha256') != zip_digest:
+        raise SystemExit('Transport ZIP digest does not match the manifest')
+
+    source = [path for path in zips if 'source' in path.name]
+    if len(source) != 1:
+        raise SystemExit('Expected exactly one source ZIP')
+    check_sidecar(source[0])
+
+    sums = release / 'SHA256SUMS.txt'
+    if not sums.is_file():
+        raise SystemExit('SHA256SUMS.txt missing')
+    recorded = {}
+    for line in sums.read_text(encoding='utf-8-sig').splitlines():
+        parts = line.split()
+        if len(parts) == 2:
+            recorded[parts[1]] = parts[0]
+    if recorded.get('CodexProxyGuard.exe') != exe_digest:
+        raise SystemExit('SHA256SUMS.txt EXE digest mismatch')
+    if recorded.get(transport[0].name) != zip_digest:
+        raise SystemExit('SHA256SUMS.txt transport ZIP digest mismatch')
+
+    if manifest['executable'].get('signed') and manifest.get('authenticode_status') != 'Valid':
+        raise SystemExit('Signed release must record authenticode_status=Valid')
+    if not manifest['executable'].get('signed') and not manifest.get('unsigned_dev'):
+        raise SystemExit('Unsigned release must be explicitly marked unsigned_dev')
+    print(f'verified {release.name}: {exe_digest[:16]}... '
+          f'({len(exe_bytes)} bytes, imports: {", ".join(imports)})')
 
 
 if __name__ == '__main__':

@@ -1,26 +1,22 @@
 # Security Model
 
-## GUI process boundary
+## Interactive frontend boundary
 
-The Qt GUI uses the bundled C++ engine through a strict, bounded stdio protocol;
-it cannot issue arbitrary commands. It never edits TOML or `.env` itself. Backend
-consent and repair each require an explicit Cancel-default dialog and a single-use
-C++ confirmation token bound to the displayed scope and current configuration.
-These supplement the console/CLI authorization paths described below.
+The TUI runs the engine in-process through the shared EngineSession: it
+renders the session snapshot (the same view model every frontend consumes)
+and maps keys to typed session requests. It cannot issue arbitrary engine
+operations, edit TOML or `.env` itself, or bypass candidate validation. Backend
+consent and repair each require a YES-typed modal bound to a single-use C++
+confirmation token tied to the displayed scope and current configuration.
+The plain line console is the same contract in line form.
 
-The GUI runs asInvoker. C++ remains the final authority on elevation, loopback
-proxy validation, package identity and repair gates. A malformed/mismatched engine
-response disables actions; no submitted operation is auto-retried. Raw stderr is
-not displayed. Shutdown cancels cooperatively before any last-resort termination
-of the GUI-owned bridge child; it never kills Desktop or the shared daemon.
-
-Concurrent frontends cannot replace the authorized Home while a revoke transaction
-is running: Windows configuration handles deny concurrent writes/deletion and
-compare the expected state before any Home change. Launch holds a read-only lease
-until cleanup, so stale launches cannot recreate blocks after consent is revoked.
-Invalid-config repair refuses to overwrite a newly valid configuration. A storage
-failure during Guard config commit attempts rollback and remains an explicit
-error; no crash-atomicity promise is made for the Guard configuration file.
+Guard runs asInvoker. The engine remains the final authority on elevation,
+loopback proxy validation, package identity and repair gates. A
+malformed/mismatched snapshot disables actions; no submitted operation is
+auto-retried. Raw stderr is not displayed. Shutdown cancels cooperatively and
+never kills Desktop or the shared daemon; only Guard's own short-lived helper
+children (activation worker, repair CLI) are terminated and reaped, through
+held handles, on timeout or cancellation.
 
 ## 强制边界
 
@@ -83,7 +79,7 @@ codex app-server daemon stop
 
 ## Codex Home `.env` 授权代理块
 
-默认关闭。仅当用户确认 GUI 对话框，或在控制台 `B` 对显示的确切 Home 输入 `YES` 后，Guard 才会在该
+默认关闭。仅当用户在 TUI/控制台 `B` 的确认模态中对显示的确切 Home 键入 `YES` 后，Guard 才会在该
 Home 的 `.env` 中维护一个 BEGIN/END 标记的 `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` 块。
 该块影响之后从同一 Home 启动的所有 Codex 客户端，不只本次 Desktop；确认文案必须说明
 这一作用域。块的编辑规则：
@@ -127,8 +123,7 @@ Guard 不以管理员身份启动 Desktop。Guard 用 `TokenElevation` 查询及
 ## 信任边界
 
 配置文件由当前用户控制，但仍必须通过 loopback HTTP 校验；host 的校验与 URL 构造使用
-同一规则。APPX 与 override 路径在启动前必须是现存普通文件；APPX 查询固定使用系统目录
-下 Windows PowerShell 的绝对路径。APPX 清单入口必须是安装目录内的相对路径，
+同一规则。APPX 与 override 路径在启动前必须是现存普通文件；APPX 查询使用原生 AppModel API（`FindPackagesByPackageFamily` 等），不启动 PowerShell。APPX 清单入口必须是安装目录内的相对路径，
 canonicalize 后不得逃逸至安装目录外；清单缺失或多入口歧义时阻断，不以文件名猜测
 后备程序。
 `cli_executable_override` 只在指向现存绝对路径 `.exe` 时生效，失效报错而不换源；CLI 与

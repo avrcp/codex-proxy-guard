@@ -17,6 +17,9 @@
 #include <windows.h>
 
 #include <atomic>
+#include <cstdio>
+#include <cwchar>
+#include <exception>
 #include <string>
 
 namespace cpg::tui {
@@ -93,11 +96,14 @@ bool copyDiagnostic(const std::wstring &text)
     return true;
 }
 
+// Same missing-key contract as tui_state's at(): an empty object, never null
+// (nlohmann's value() throws on a null receiver and the TUI must render
+// before the first session snapshot arrives).
 const Json &snapshotField(const Json &snapshot, const char *key)
 {
-    static const Json nullValue = Json();
+    static const Json empty = Json::object();
     const auto entry = snapshot.find(key);
-    return entry == snapshot.end() ? nullValue : *entry;
+    return entry == snapshot.end() ? empty : *entry;
 }
 
 int runInteractive(const std::filesystem::path &configPath)
@@ -236,9 +242,24 @@ int runInteractive(const std::filesystem::path &configPath)
 
 int runTui(const std::filesystem::path &configPath, bool plainOverride)
 {
-    if (plainOverride || !TerminalSession::isInteractiveConsole())
+    const bool interactive = TerminalSession::isInteractiveConsole();
+    if (plainOverride || !interactive)
         return runPlainConsole(configPath);
-    return runInteractive(configPath);
+    try {
+        return runInteractive(configPath);
+    } catch (const std::exception &error) {
+        // Diagnostic hook for the interactive-acceptance probe; the plain
+        // fallback cannot render an exception that escaped the render loop.
+        if (wchar_t *temp = _wgetenv(L"TEMP")) {
+            FILE *log = _wfsopen((std::wstring(temp) + L"\\cpg_tui_crash.txt").c_str(),
+                                 L"w", _SH_DENYNO);
+            if (log) {
+                std::fwprintf(log, L"%hs\n", error.what());
+                fclose(log);
+            }
+        }
+        return 1;
+    }
 }
 
 } // namespace cpg::tui

@@ -11,31 +11,43 @@ stale or unhealthy index.
 
 ## Workspace responsibilities
 
+- `foundation/`: STL/Win32 primitives shared by everything — strict UTF-8 and
+  `publicText` redaction, Windows path normalization/containment/canonicalization,
+  strict JSON object parsing (duplicate keys rejected at every level), Win32-event
+  `Cancellation`, `UniqueHandle`, `UnicodeEnvironment` and the bounded
+  `runOwnedProcess` runner (post-submission activation failures report
+  `APPX_ACTIVATION_OUTCOME_UNKNOWN`).
 - `backend/src/core.*`: strict configuration/domain validation, redaction,
   held config transactions/leases and scoped `.env` operations.
-- `backend/src/platform.*`: bounded APPX discovery, process/elevation checks,
+- `backend/src/platform.*` + `package_discovery.*`: native AppModel package
+  discovery (no PowerShell, no fallback to it), process/elevation checks,
   owned helpers and native application-model activation/identity observation.
 - `backend/src/launch.*`: proxy plans/environment, startup locking, public daemon
   compatibility and shared launch orchestration.
-- `backend/src/bridge.*` and `cli.*`: foreground state boundary, versioned
-  stdio bridge, minimal CLI, `licenses` notice streamer and interactive console.
-- `gui/`: Qt Widgets, controller and child-process client plus `gui_entry.*`;
-  no system-operation duplication. All production code is C++20; no Rust/FFI
-  fallback.
+- `backend/src/session.*`: the transport-free engine session (snapshot view
+  model, single-use confirmation tokens, one-foreground-effect gate).
+- `backend/src/cli.*`: minimal CLI and the `licenses` notice streamer.
+- `tui/`: Win32 VT TUI (terminal session, input, screen renderer, display
+  width, modal state machine, plain-console fallback). The TUI never
+  recomputes engine business rules; it renders the session snapshot.
 - `app/`: the single production entry point. `startup_mode.*` classifies the
-  Unicode command line into the GUI or headless role before any Application
-  object is constructed; `main.cpp` then builds exactly one QApplication or
-  QCoreApplication. GUI and bridge are separate processes of the same
-  executable file (`applicationFilePath()` relaunch); the activation worker
-  spawns the same way. `guard_gui` never links `guard_engine` business code.
+  Unicode command line; `main.cpp` runs the interactive TUI (in-process
+  engine session) or the headless CLI. The activation worker is the same
+  EXE's hidden subcommand — the only self-spawned child.
 
-Preserve the state boundary `Action -> candidate reduce -> authorize -> commit ->
-dispatch -> TaskResult`. Only one foreground operation may be active. Guard shutdown
-must not terminate Desktop. Guard reaps only its own children through held
-process handles — never by executable name (GUI, bridge and worker share one
-EXE).
+All production code is C++20; no Qt, no Rust/FFI, no PowerShell in the
+product. Preserve the state boundary `Action -> candidate reduce -> authorize
+-> commit -> dispatch -> TaskResult`. Only one foreground operation may be
+active. Guard shutdown must not terminate Desktop. Guard reaps only its own
+children through held process handles — never by executable name.
 
 ## Security invariants
+
+Production must not contain Qt and must not launch powershell.exe/pwsh.exe
+for package discovery; there is no PowerShell fallback. The TUI does not
+duplicate engine business judgment, and the default no-argument invocation is
+the in-process TUI (no bridge/self-relaunch child; the activation worker and
+the explicitly confirmed Codex CLI helper are the only child processes).
 
 Only loopback HTTP/Mixed proxies are allowed. Never read Token/Cookie/auth files,
 decrypt TLS, modify the Windows system proxy, edit `~/.codex/config.toml`, or add
@@ -69,13 +81,13 @@ confirmation per launch; the stop may interrupt shared tasks of other clients on
 the same Codex Home). For registered targets the repair launch additionally
 requires the authorized backend proxy block (`BACKEND_PROXY_REQUIRED_FOR_REPAIR`
 without it), and the block is always prepared before the daemon stop so a failed
-preparation never leaves the shared daemon interrupted. The Guard must never connect to the app-server socket, read
-daemon private state, inspect auth data, start/restart/update/bootstrap the
-daemon, or directly terminate shared Codex or Desktop processes. Guard may
-terminate and reap only its own short-lived helper children (bounded output,
-bounded wait) on timeout or cancellation. Guard must refuse to launch when it is
-itself running elevated — or when the elevation query itself fails — matching the
-Codex background-server elevation requirement.
+preparation never leaves the shared daemon interrupted. The Guard must never
+connect to the app-server socket, read daemon private state, inspect auth data,
+start/restart/update/bootstrap the daemon, or directly terminate shared Codex or
+Desktop processes. Guard may terminate and reap only its own short-lived helper
+children (bounded output, bounded wait) on timeout or cancellation. Guard must
+refuse to launch when it is itself running elevated — or when the elevation
+query itself fails — matching the Codex background-server elevation requirement.
 
 Do not add network health probes, Node Readiness, Usage/account telemetry, Codex
 app-server or private IPC, v2rayN management, sing-box management, network
@@ -100,20 +112,25 @@ elevation, and creation time through held process handles to verify what was
 actually activated. Normal launch still never resolves the Codex CLI or stops
 the shared daemon.
 
+Public releases must carry a valid Authenticode signature unless explicitly
+built and marked as an unsigned development build. Never add packers, UPX,
+obfuscators, self-extracting shells, runtime DLL extraction or a hand-written
+PE loader; never attempt to evade antivirus detection in code.
+
 ## Completion commands
 
 ```powershell
 codegraph status .
-.\scripts\test-cpp.ps1          # dynamic SDK development build + all suites
-.\scripts\test-cpp.ps1 -StaticQt -QtRoot target\qt-static\<key>\install -BuildDirectory target\cpp-static-dev
+.\scripts\test-noqt.ps1              # development build + all suites
 git diff --check
-.\scripts\build-portable.cmd -StaticQt   # canonical single-file release (clean tree)
+.\scripts\build-portable.cmd -AllowUnsignedDev       # unsigned dev release (clean tree)
+.\scripts\build-portable.cmd -Sign -CertificateSha1 <thumbprint>   # public release
 ```
 
-Windows portable artifacts must always come from the canonical script; the
-static single-file release additionally requires the pinned static Qt SDK
-(`scripts\build-qt-static.ps1`, cached under `target\qt-static\<recipe-key>`).
+Windows portable artifacts must always come from the canonical script, which
+re-verifies every artifact through `scripts/verify-package.py --schema
+static-single` (the verifier executes the packaged EXE) before promotion.
 Completion also requires release build/package smoke, SHA/build-info
-verification (verifier executes the packaged EXE), import-table scan, diff
-review, and documentation synchronization. Automated tests must never touch a
-real Codex Home, start the real Desktop or stop a shared daemon.
+verification, import-table scan, diff review, and documentation
+synchronization. Automated tests must never touch a real Codex Home, start
+the real Desktop or stop a shared daemon.

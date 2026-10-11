@@ -27,9 +27,9 @@ std::string randomToken()
 
 const Json &at(const Json &object, const char *key)
 {
-    static const Json nullValue = Json();
+    static const Json empty = Json::object();
     const auto entry = object.find(key);
-    return entry == object.end() ? nullValue : *entry;
+    return entry == object.end() ? empty : *entry;
 }
 
 } // namespace

@@ -51,7 +51,12 @@ semantic unchanged. Rollback: tag `qt-gui-v0.6.1-rc.1` (see
    `authenticode_status` in `release-manifest.json`. Unsorted development
    artifacts are explicitly marked unsigned.
 
-## Commit ladder (as executed)
+## Commit ladder (as executed — completed 2026-10-11)
+
+Commits 1-7 all landed on `feature/win32-tui-no-qt`; steps 3+4 stayed split
+exactly as planned (engine migration, then native discovery with its own
+parity gate). The removal commit landed the Qt-reference gate clean and the
+1.09 MiB console EXE.
 
 | # | Commit | Gate beyond build+tests |
 |---|--------|--------------------------|

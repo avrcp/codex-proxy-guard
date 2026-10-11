@@ -1,30 +1,53 @@
-# Release checklist — single executable
+# Release checklist (no-Qt single EXE)
 
-- [ ] Review `git diff --check`, config/consent scope, activation boundaries and dependency changes.
-- [ ] Run `scripts/test-cpp.ps1` (dynamic SDK development build, all suites).
-- [ ] Run `scripts/test-cpp.ps1 -StaticQt -QtRoot target\qt-static\<key>\install -BuildDirectory target\cpp-static-dev` (static SDK, all suites incl. offscreen-import tests).
-- [ ] Check CodeGraph status if installed; use current source when restructuring makes the index stale.
-- [ ] Verify normal launch tests never resolve CLI or call daemon stop.
-- [ ] Verify repair tests prepare the authorized block before exactly one public stop; failure/cancel prevents later activation.
-- [ ] Verify duplicate JSON keys, invalid UTF-8, input/output overflow, unknown fields, timeout, helper cleanup and stale tokens fail closed.
-- [ ] Verify `.env` byte preservation, export-variable conflicts, edited-block rejection, revoke failure and config read/write exclusion.
-- [ ] Verify worker identity/creation/elevation/early-exit classifications and no bare-EXE fallback for registered applications.
-- [ ] Verify role classification tests (values containing role words, `--`, contradictory modes) and that headless roles never create a QPA platform.
-- [ ] Verify the static Qt cache: exactly one completed `target\qt-static\<recipe-key>` with matching source digest; `scripts/build-qt-static.ps1` reuses it.
-- [ ] Synchronize README, architecture, security, protocol, notices, rebuild guide and acceptance records.
-- [ ] Commit in stages and push the intended branch.
-- [ ] Run canonical `scripts\build-portable.cmd -StaticQt` from the clean pushed commit (refuses a dirty tree).
-- [ ] Check release tests, embedded provenance (both `build-info` spellings), isolated-PATH role smokes, bridge hello/shutdown with stdin held open, malformed-worker rejection, full `licenses` output, and the dumpbin import scan (no Qt6*/msvcp140*/vcruntime140*/concrt140*/unexpected third-party DLL).
-- [ ] Verify staging → promotion: `dist/releases/<version>-<commit>` created only after every gate; a failed run leaves no partial release and never overwrites an existing one.
-- [ ] Verify `scripts/verify-package.py --schema static-single`: single-EXE transport ZIP, sidecar digests, release-manifest linkage, embedded build-info obtained by executing the extracted executable, compliance recipe key, upstream Qt source digest, every compliance member hash.
-- [ ] Confirm the runtime ZIP contains only `CodexProxyGuard.exe`; all notices are embedded (103 notice sections at 0.6.1-rc.1).
-- [ ] Confirm the source-compliance archive contains the app snapshot (exact commit), upstream Qt source, static recipe, toolchain record, licenses, REBUILD.md, SOURCE_REVISION.txt and SOURCE_ACCESS.txt; verify its availability alongside the runtime archive before announcing publication (`publication_pending` until then).
-- [ ] Optionally rebuild from the compliance archive per `docs/STATIC_QT_REBUILD.md` (unmodified rebuild and one modified-Qt rebuild) before sealing a release series.
+Every item is a gate; a release ships only when all are checked.
 
-Live launch, shared-daemon repair, clean Windows VM loading (no Qt/MSVC/VC redist
-installed), Windows 10, high DPI, IME and screen-reader checks are separate
-acceptance activities. Record which actually ran; a unit fixture or package
-smoke must never be reported as live network or clean-machine verification. Do
-not publish a release or sign artifacts implicitly. The transitional dynamic
-split package (`scripts\build-portable.cmd` without `-StaticQt`) keeps its own
-legacy checklist entries above where they still apply.
+## Build and tests
+
+- [ ] Run `.\scripts\test-noqt.ps1` (dev build, all doctest suites:
+      foundation, app startup classification, TUI, engine core/platform/
+      launch/CLI, verifier fixtures).
+- [ ] Confirm `git diff --check` is clean and the tree is clean.
+- [ ] Run canonical `.\scripts\build-portable.cmd -Sign -CertificateSha1 <thumbprint>`
+      from the clean pushed commit (refuses a dirty tree). Development
+      builds may pass `-AllowUnsignedDev` and are marked unsigned everywhere.
+- [ ] Check release tests, embedded provenance (both `build-info` spellings),
+      plain-console smoke, full `licenses` output, and the import scan
+      (no Qt6*/msvcp140*/vcruntime140*/concrt140*/unexpected third-party DLL;
+      console subsystem; static CRT).
+
+## Package verification
+
+- [ ] Verify `scripts/verify-package.py --schema static-single`: single-EXE
+      transport ZIP (EXE only), sidecar digests, SHA256SUMS linkage,
+      release-manifest consistency (qt=false, powershell_appx_discovery=false,
+      subsystem=console, crt=static), embedded build-info obtained by
+      executing the packaged executable, PE subsystem byte and import scan.
+- [ ] Confirm the source ZIP contains the exact commit snapshot
+      (`git ls-files`) and the size report is present.
+- [ ] Confirm Authenticode: signed releases record `authenticode_status=Valid`
+      and nothing touches the EXE after signing; unsigned releases are
+      explicitly marked `UNSIGNED DEVELOPMENT BUILD`.
+
+## Acceptance (recorded in docs/TUI_ACCEPTANCE.md)
+
+- [ ] Windows Terminal and legacy conhost: TUI renders, resizes, restores the
+      console state on exit (including Ctrl+C and window close).
+- [ ] PowerShell and cmd launches; Explorer double-click opens a console.
+- [ ] Chinese/space directory and renamed EXE stay fully functional.
+- [ ] Real-machine matrix: normal launch receipt (created/reused), backend
+      authorization prepare/revoke, repair flow — compared against the
+      0.6.1-rc.1 Qt release on the same Desktop version.
+- [ ] AV evidence: Microsoft Defender quick scan, SmartScreen download/run
+      exercise, at least one third-party engine, one machine that never ran
+      Guard; record signed state, detection name (if any), action,
+      timestamp, SHA-256. Submit false positives through the vendor channel
+      (Microsoft sample submission portal for Defender); never try to evade
+      detection in code.
+
+## Publication
+
+- [ ] Promote to `dist/releases/<version>-<commit>/` (the build script does
+      this after independent re-verification) and announce the SHA-256.
+- [ ] For an unsigned development build, state prominently that it is not
+      for public distribution.
