@@ -1,61 +1,66 @@
 #include "startup_mode.h"
 
 #include "cli.h"
-#include "gui_entry.h"
+#include "cpg/text.h"
 
-#include <QApplication>
-#include <QCoreApplication>
-#include <QDir>
-#include <QStringList>
+#ifdef CPG_ENABLE_QT_GUI
+#include "gui_entry.h"
+#endif
+
 #include <windows.h>
 #include <shellapi.h>
 
+#include <string>
+#include <vector>
+
 namespace {
 
-// Bounded diagnostic output for rejected startups. GUI-subsystem processes may
-// have no console; a missing standard error handle is a clean nonzero exit.
-void writeStdError(const QString &message) {
-    const auto bytes = message.toUtf8() + '\n';
+// Bounded diagnostic output for rejected startups.
+void writeStdError(const std::wstring &message)
+{
+    const std::string bytes = cpg::wideToUtf8(message) + "\n";
     const HANDLE error = GetStdHandle(STD_ERROR_HANDLE);
     if (error == INVALID_HANDLE_VALUE || error == nullptr) return;
     DWORD written = 0;
-    WriteFile(error, bytes.constData(), static_cast<DWORD>(bytes.size()), &written, nullptr);
+    WriteFile(error, bytes.data(), static_cast<DWORD>(bytes.size()), &written, nullptr);
 }
 
-QStringList wideArguments(int argc, char *argv[]) {
-    // Unicode-safe early read; Qt's own arguments() uses the same wide command
-    // line, keeping classification identical to what the parser will see.
+std::vector<std::wstring> wideArguments()
+{
+    // Unicode-safe early read; the CLI parser sees the same wide command line,
+    // keeping classification identical to what runCli will parse.
     int count = 0;
+    std::vector<std::wstring> arguments;
     if (LPWSTR *wide = CommandLineToArgvW(GetCommandLineW(), &count)) {
-        QStringList arguments;
-        arguments.reserve(count > 1 ? count - 1 : 0);
+        arguments.reserve(count > 1 ? static_cast<std::size_t>(count - 1) : 0);
         for (int index = 1; index < count; ++index)
-            arguments.append(QString::fromWCharArray(wide[index]));
+            arguments.emplace_back(wide[index]);
         LocalFree(wide);
         return arguments;
     }
-    QStringList arguments;
-    for (int index = 1; index < argc; ++index)
-        arguments.append(QString::fromLocal8Bit(argv[index]));
     return arguments;
 }
 
 } // namespace
 
-int main(int argc, char *argv[]) {
-    Q_INIT_RESOURCE(discovery);
-    const cpg::StartupMode mode = cpg::classifyStartup(wideArguments(argc, argv));
+int main(int argc, char *argv[])
+{
+    (void)argc;
+    (void)argv;
+    const std::vector<std::wstring> arguments = wideArguments();
+    const cpg::StartupMode mode = cpg::classifyStartup(arguments);
     if (mode.shouldExit) {
         writeStdError(mode.errorMessage);
         return mode.exitCode;
     }
     if (mode.role == cpg::StartupRole::Gui) {
-        QApplication app(argc, argv);
-        QString configPath = mode.configPath;
-        if (!configPath.isEmpty() && QDir::isRelativePath(configPath))
-            configPath = QDir(QDir::currentPath()).absoluteFilePath(configPath);
-        return guard::runGui(app, configPath, mode.smokeTest);
+#ifdef CPG_ENABLE_QT_GUI
+        return guard::runGui(mode.configPath, mode.smokeTest);
+#else
+        // No-Qt interim build: the interactive frontend is the console until
+        // the TUI lands; headless roles parse the same arguments.
+        return cpg::runCli(arguments);
+#endif
     }
-    QCoreApplication app(argc, argv);
-    return cpg::runCli(app);
+    return cpg::runCli(arguments);
 }

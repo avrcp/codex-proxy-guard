@@ -1,7 +1,7 @@
 #pragma once
 
-#include <QString>
-#include <QStringList>
+#include <string>
+#include <vector>
 
 namespace cpg {
 
@@ -9,14 +9,14 @@ enum class StartupRole { Gui, Cli };
 
 struct StartupMode {
     StartupRole role = StartupRole::Gui;
-    // Gui role only: --config value to forward to the bridge child process.
-    QString configPath;
+    // Gui role only: --config value to forward to the interactive frontend.
+    std::wstring configPath;
     bool smokeTest = false;
     // Classification failure: print errorMessage to standard error and exit
-    // with exitCode without constructing any Application object.
+    // with exitCode without entering any role.
     bool shouldExit = false;
     int exitCode = 0;
-    QString errorMessage;
+    std::wstring errorMessage;
 };
 
 // Classify the raw argument vector (excluding argv[0]) into the process role.
@@ -25,6 +25,6 @@ struct StartupMode {
 // the role. Every spelling the full CLI parser accepts (--config=path
 // included) is recognized; anything else is delegated to the parser or
 // rejected here with a nonzero exit.
-StartupMode classifyStartup(const QStringList &arguments);
+StartupMode classifyStartup(const std::vector<std::wstring> &arguments);
 
-}
+} // namespace cpg

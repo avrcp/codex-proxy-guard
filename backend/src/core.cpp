@@ -1,4 +1,6 @@
 #include "core.h"
+#include "cpg/path.h"
+#include "cpg/win_handle.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -9,21 +11,16 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
-#include <shlobj.h>
 #include <ktmw32.h>
-#include <QDir>
-#include <QFile>
-#include <QFileInfo>
-#include <QJsonArray>
-#include <QJsonDocument>
-#include <QJsonParseError>
-#include <QRegularExpression>
-#include <QSet>
-#include <QStringDecoder>
+
 #include <algorithm>
+#include <cctype>
+#include <cstdint>
 #include <functional>
 #include <limits>
+#include <map>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <utility>
 #include <vector>
@@ -38,103 +35,197 @@
 
 namespace cpg {
 namespace {
-constexpr qsizetype configLimit = 64 * 1024;
-constexpr qsizetype envLimit = 1024 * 1024;
-const QByteArray blockBegin = "# BEGIN CODEX PROXY GUARD: proxy-v1";
-const QByteArray blockEnd = "# END CODEX PROXY GUARD: proxy-v1";
+constexpr std::size_t configLimit = 64 * 1024;
+constexpr std::size_t envLimit = 1024 * 1024;
+const char *blockBegin = "# BEGIN CODEX PROXY GUARD: proxy-v1";
+const char *blockEnd = "# END CODEX PROXY GUARD: proxy-v1";
 // Private linked-test seam, never configured from requests or the environment.
 thread_local std::function<void(bool)> envTransactionHook;
 
-[[noreturn]] void fail(const QString &code, const QString &message) { throw Error(code, message); }
-const wchar_t *wide(const QString &s) { return reinterpret_cast<const wchar_t *>(s.utf16()); }
-struct Handle {
-    HANDLE value = INVALID_HANDLE_VALUE;
-    explicit Handle(HANDLE handle = INVALID_HANDLE_VALUE) : value(handle) {}
-    ~Handle() { if (value != INVALID_HANDLE_VALUE) CloseHandle(value); }
-    Handle(const Handle &) = delete;
-    Handle &operator=(const Handle &) = delete;
-};
+[[noreturn]] void fail(const std::string &code, const std::string &message)
+{
+    throw Error(code, message);
+}
 
-QByteArray readHandle(HANDLE handle, qsizetype limit, const QString &code)
+std::string asciiTrimmed(std::string_view value)
+{
+    std::size_t begin = 0, end = value.size();
+    while (begin < end && std::isspace(static_cast<unsigned char>(value[begin]))) ++begin;
+    while (end > begin && std::isspace(static_cast<unsigned char>(value[end - 1]))) --end;
+    return std::string(value.substr(begin, end - begin));
+}
+
+std::string asciiFolded(std::string_view value)
+{
+    std::string folded(value);
+    for (char &character : folded)
+        character = static_cast<char>(std::tolower(static_cast<unsigned char>(character)));
+    return folded;
+}
+
+bool asciiEqualsFolded(std::string_view left, std::string_view right)
+{
+    if (left.size() != right.size()) return false;
+    for (std::size_t index = 0; index < left.size(); ++index)
+        if (std::tolower(static_cast<unsigned char>(left[index]))
+            != std::tolower(static_cast<unsigned char>(right[index])))
+            return false;
+    return true;
+}
+
+bool startsWith(std::string_view text, std::string_view prefix)
+{
+    return text.size() >= prefix.size() && text.substr(0, prefix.size()) == prefix;
+}
+
+void appendUtf8CodePoint(std::string &out, char32_t point)
+{
+    if (point < 0x80) {
+        out.push_back(static_cast<char>(point));
+    } else if (point < 0x800) {
+        out.push_back(static_cast<char>(0xc0 | (point >> 6)));
+        out.push_back(static_cast<char>(0x80 | (point & 0x3f)));
+    } else if (point < 0x10000) {
+        out.push_back(static_cast<char>(0xe0 | (point >> 12)));
+        out.push_back(static_cast<char>(0x80 | ((point >> 6) & 0x3f)));
+        out.push_back(static_cast<char>(0x80 | (point & 0x3f)));
+    } else {
+        out.push_back(static_cast<char>(0xf0 | (point >> 18)));
+        out.push_back(static_cast<char>(0x80 | ((point >> 12) & 0x3f)));
+        out.push_back(static_cast<char>(0x80 | ((point >> 6) & 0x3f)));
+        out.push_back(static_cast<char>(0x80 | (point & 0x3f)));
+    }
+}
+
+bool containsInsensitive(std::string_view text, std::string_view needle)
+{
+    if (needle.empty() || text.size() < needle.size()) return false;
+    const std::string haystack = asciiFolded(text);
+    const std::string token = asciiFolded(needle);
+    return haystack.find(token) != std::string::npos;
+}
+
+bool startsWithInsensitive(std::string_view text, std::string_view prefix)
+{
+    if (text.size() < prefix.size()) return false;
+    for (std::size_t index = 0; index < prefix.size(); ++index)
+        if (std::tolower(static_cast<unsigned char>(text[index]))
+            != std::tolower(static_cast<unsigned char>(prefix[index])))
+            return false;
+    return true;
+}
+
+std::string readHandle(HANDLE handle, std::size_t limit, const std::string &code)
 {
     LARGE_INTEGER size{};
-    if (!GetFileSizeEx(handle, &size) || size.QuadPart < 0 || size.QuadPart > limit)
+    if (!GetFileSizeEx(handle, &size) || size.QuadPart < 0
+        || static_cast<unsigned long long>(size.QuadPart) > limit)
         fail(code, "File is unreadable or exceeds its size limit.");
     LARGE_INTEGER zero{};
     if (!SetFilePointerEx(handle, zero, nullptr, FILE_BEGIN)) fail(code, "Cannot seek the file.");
-    QByteArray bytes(static_cast<qsizetype>(size.QuadPart), Qt::Uninitialized);
+    std::string bytes(static_cast<std::size_t>(size.QuadPart), '\0');
     DWORD got = 0;
-    if (!bytes.isEmpty() && (!ReadFile(handle, bytes.data(), static_cast<DWORD>(bytes.size()), &got, nullptr)
-                            || got != static_cast<DWORD>(bytes.size())))
+    if (!bytes.empty() && (!ReadFile(handle, bytes.data(), static_cast<DWORD>(bytes.size()), &got, nullptr)
+                           || got != static_cast<DWORD>(bytes.size())))
         fail(code, "Cannot read the file completely.");
     return bytes;
 }
 
-bool writeHandle(HANDLE handle, const QByteArray &bytes)
+bool writeHandle(HANDLE handle, const std::string &bytes)
 {
     LARGE_INTEGER zero{};
     DWORD wrote = 0;
     return SetFilePointerEx(handle, zero, nullptr, FILE_BEGIN)
-        && (bytes.isEmpty() || (WriteFile(handle, bytes.constData(), static_cast<DWORD>(bytes.size()), &wrote, nullptr)
-                               && wrote == static_cast<DWORD>(bytes.size())))
+        && (bytes.empty() || (WriteFile(handle, bytes.data(), static_cast<DWORD>(bytes.size()), &wrote, nullptr)
+                              && wrote == static_cast<DWORD>(bytes.size())))
         && SetEndOfFile(handle) && FlushFileBuffers(handle);
 }
 
-void ensureParent(const QString &path, const QString &code)
+void ensureParent(const std::filesystem::path &path, const std::string &code)
 {
-    if (!QDir().mkpath(QFileInfo(path).absolutePath())) fail(code, "Cannot create the destination directory.");
+    std::error_code error;
+    const std::filesystem::path parent = path.parent_path();
+    if (!parent.empty() && !std::filesystem::create_directories(parent, error) && error)
+        fail(code, "Cannot create the destination directory.");
 }
 
-std::optional<Config> tryConfig(const QByteArray &bytes)
+std::optional<Config> tryConfig(const std::string &bytes)
 {
     try { return Config::parse(bytes); } catch (const Error &) { return std::nullopt; }
 }
 
-bool mayContainConsent(const QByteArray &bytes)
+std::string decodeTomlEscapes(std::string_view text)
+{
+    // Decode \uXXXX / \UXXXXXXXX escapes so key spellings are compared after
+    // decoding, exactly like the previous implementation.
+    std::string decoded;
+    decoded.reserve(text.size());
+    for (std::size_t index = 0; index < text.size(); ++index) {
+        if (text[index] != '\\' || index + 1 >= text.size()) {
+            decoded.push_back(text[index]);
+            continue;
+        }
+        const char kind = text[++index];
+        const std::size_t width = kind == 'u' ? 4 : kind == 'U' ? 8 : 0;
+        if (width == 0 || index + width > text.size()) {
+            decoded.push_back('\\');
+            decoded.push_back(kind);
+            continue;
+        }
+        std::uint32_t point = 0;
+        bool valid = true;
+        for (std::size_t step = 1; step <= width; ++step) {
+            const char digit = text[index + step];
+            int value = 0;
+            if (digit >= '0' && digit <= '9') value = digit - '0';
+            else if (digit >= 'a' && digit <= 'f') value = digit - 'a' + 10;
+            else if (digit >= 'A' && digit <= 'F') value = digit - 'A' + 10;
+            else { valid = false; break; }
+            point = (point << 4) | static_cast<std::uint32_t>(value);
+        }
+        if (!valid || point > 0x10ffff || (point >= 0xd800 && point <= 0xdfff)) {
+            decoded.push_back('\\');
+            decoded.push_back(kind);
+            continue;
+        }
+        appendUtf8CodePoint(decoded, point);
+        index += width;
+    }
+    return decoded;
+}
+
+bool mayContainConsent(const std::string &bytes)
 {
     // A broken configuration may be the only durable record of a managed Home.
     // Never erase that evidence during default-based editor recovery or reset.
     // Decode key escapes as well; malformed TOML cannot be trusted to have only
     // bare keys, and ambiguous/comment-only evidence deliberately fails closed.
     if (!strictUtf8(bytes)) return true;
-    QString text = QString::fromUtf8(bytes);
-    static const QRegularExpression escape("\\\\(?:u([0-9a-fA-F]{4})|U([0-9a-fA-F]{8}))");
-    QString decoded;
-    qsizetype copied = 0;
-    auto matches = escape.globalMatch(text);
-    while (matches.hasNext()) {
-        const auto match = matches.next();
-        decoded += text.mid(copied, match.capturedStart() - copied);
-        const auto hex = match.captured(1).isEmpty() ? match.captured(2) : match.captured(1);
-        const char32_t point = hex.toUInt(nullptr, 16);
-        if (point <= 0x10ffff && !(point >= 0xd800 && point <= 0xdfff)) decoded += QString::fromUcs4(&point, 1);
-        else decoded += match.captured();
-        copied = match.capturedEnd();
-    }
-    decoded += text.mid(copied);
-    return decoded.contains("manage_codex_proxy_env", Qt::CaseInsensitive)
-        || decoded.contains("proxy_env_home", Qt::CaseInsensitive);
+    const std::string decoded = decodeTomlEscapes(bytes);
+    return containsInsensitive(decoded, "manage_codex_proxy_env")
+        || containsInsensitive(decoded, "proxy_env_home");
 }
 
 class Transaction {
 public:
-    Handle handle;
-    QByteArray original;
-    Transaction(const QString &path, const Config *expected, bool invalid, bool create = false)
+    UniqueHandle handle;
+    std::string original;
+    Transaction(const std::filesystem::path &path, const Config *expected, bool invalid, bool create = false)
     {
         if (create || invalid) ensureParent(path, "CONFIG_LOCK_FAILED");
-        handle.value = CreateFileW(wide(QDir::toNativeSeparators(path)), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ,
-                                   nullptr, create ? CREATE_NEW : OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        handle.reset(CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ,
+                                 nullptr, create ? CREATE_NEW : OPEN_EXISTING,
+                                 FILE_ATTRIBUTE_NORMAL, nullptr));
         bool created = create;
-        if (handle.value == INVALID_HANDLE_VALUE && !create && invalid
+        if (!handle.valid() && !create && invalid
             && (GetLastError() == ERROR_FILE_NOT_FOUND || GetLastError() == ERROR_PATH_NOT_FOUND)) {
-            handle.value = CreateFileW(wide(QDir::toNativeSeparators(path)), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ,
-                                       nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
-            created = handle.value != INVALID_HANDLE_VALUE;
+            handle.reset(CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ,
+                                     nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr));
+            created = handle.valid();
         }
-        if (handle.value == INVALID_HANDLE_VALUE)
+        if (!handle.valid())
             fail("CONFIG_LOCK_FAILED", "Configuration is busy, missing, or not writable.");
-        original = readHandle(handle.value, configLimit, "CONFIG_READ_FAILED");
+        original = readHandle(handle.get(), configLimit, "CONFIG_READ_FAILED");
         const auto current = tryConfig(original);
         if (!created && ((invalid && current) || (expected && (!current || *current != *expected))))
             fail("CONFIG_CHANGED", "Refresh and confirm the configuration again.");
@@ -143,44 +234,61 @@ public:
     }
     void commit(const Config &config)
     {
-        const QByteArray bytes = config.toml();
+        const std::string bytes = config.toml();
         if (bytes.size() > configLimit) fail("CONFIG_TOO_LARGE", "Configuration exceeds 64 KiB.");
-        if (!writeHandle(handle.value, bytes)) {
-            if (!writeHandle(handle.value, original))
+        if (!writeHandle(handle.get(), bytes)) {
+            if (!writeHandle(handle.get(), original))
                 fail("CONFIG_ROLLBACK_FAILED", "The device rejected both the write and restoration; inspect the Guard configuration.");
             fail("CONFIG_WRITE_FAILED", "The original configuration was restored.");
         }
     }
 };
 
-QString knownFolder(REFKNOWNFOLDERID id)
+bool absoluteHome(const std::filesystem::path &home)
 {
-    PWSTR result = nullptr;
-    if (FAILED(SHGetKnownFolderPath(id, KF_FLAG_DONT_VERIFY, nullptr, &result)))
-        fail("CONFIG_PATH_UNAVAILABLE", "Cannot resolve the user directory.");
-    const QString path = QString::fromWCharArray(result);
-    CoTaskMemFree(result);
-    return path;
-}
-
-bool absoluteHome(const QString &home)
-{
-    // Qt treats drive-relative and root-relative Windows paths differently from
-    // fully qualified paths. Require a drive root or a server/share explicitly.
-    if (home.isEmpty() || home.size() >= 4096 || home.contains(QChar::Null)
-        || home.contains('\r') || home.contains('\n')) return false;
-    QString normalized = QDir::fromNativeSeparators(home);
+    // Require a drive root or a server/share explicitly. Drive-relative and
+    // root-relative Windows paths are not accepted.
+    const std::wstring wide = home.wstring();
+    if (wide.empty() || wide.size() >= 4096) return false;
+    for (const wchar_t character : wide)
+        if (character == L'\0' || character == L'\r' || character == L'\n') return false;
+    std::wstring normalized = wide;
+    for (wchar_t &character : normalized) if (character == L'\\') character = L'/';
     // Rust canonicalize() persisted extended drive/UNC paths. Accept those
     // existing bindings, while refusing arbitrary Windows device namespaces.
-    if (normalized.startsWith("//?/UNC/", Qt::CaseInsensitive)) normalized = "//" + normalized.mid(8);
-    else if (normalized.startsWith("//?/")) normalized = normalized.mid(4);
-    if (normalized.startsWith("//./")) return false;
-    static const QRegularExpression drive("^[A-Za-z]:/");
-    static const QRegularExpression unc("^//[^/]+/[^/]+(?:/|$)");
-    return drive.match(normalized).hasMatch() || unc.match(normalized).hasMatch();
+    const auto starts = [&normalized](const wchar_t *prefix, std::size_t width) {
+        if (normalized.size() < width) return false;
+        for (std::size_t index = 0; index < width; ++index)
+            if (towlower(normalized[index]) != towlower(prefix[index])) return false;
+        return true;
+    };
+    if (starts(L"//?/unc/", 8)) normalized = L"//" + normalized.substr(8);
+    else if (starts(L"//?/", 4)) normalized = normalized.substr(4);
+    if (starts(L"//./", 4)) return false;
+    const bool drive = normalized.size() >= 3
+        && ((normalized[0] >= L'A' && normalized[0] <= L'Z')
+            || (normalized[0] >= L'a' && normalized[0] <= L'z'))
+        && normalized[1] == L':' && normalized[2] == L'/';
+    if (drive) return true;
+    if (!starts(L"//", 2)) return false;
+    // //server/share... : two non-empty segments before any further content.
+    std::size_t index = 2;
+    std::size_t segments = 0;
+    std::size_t segmentLength = 0;
+    for (; index <= normalized.size(); ++index) {
+        if (index == normalized.size() || normalized[index] == L'/') {
+            if (segmentLength == 0) return false; // empty component
+            ++segments;
+            segmentLength = 0;
+            if (segments == 2) return index == normalized.size() || normalized[index] == L'/';
+            continue;
+        }
+        ++segmentLength;
+    }
+    return false;
 }
 
-QString boundHome(const Config &config)
+std::filesystem::path boundHome(const Config &config)
 {
     if (!config.manageBackend || !absoluteHome(config.home))
         fail("BACKEND_PROXY_SCOPE_UNCONFIRMED", "An absolute Codex Home must be explicitly authorized first.");
@@ -190,7 +298,7 @@ QString boundHome(const Config &config)
 void checkKeys(const toml::table &table, std::initializer_list<std::string_view> keys)
 {
     for (const auto &[key, value] : table) {
-        Q_UNUSED(value);
+        (void)value;
         if (std::find(keys.begin(), keys.end(), key.str()) == keys.end())
             fail("CONFIG_INVALID", "Configuration contains an unknown field.");
     }
@@ -202,12 +310,18 @@ const toml::table *subtable(const toml::table &table, std::string_view key)
     if (!node->is_table()) fail("CONFIG_INVALID", "Configuration section has the wrong type.");
     return node->as_table();
 }
-void stringField(const toml::table &table, std::string_view key, QString &value)
+void stringField(const toml::table &table, std::string_view key, std::string &value)
 {
     if (const auto *node = table.get(key)) {
         if (!node->is_string()) fail("CONFIG_INVALID", "Configuration string has the wrong type.");
-        value = QString::fromStdString(node->as_string()->get());
+        value = node->as_string()->get();
     }
+}
+void pathField(const toml::table &table, std::string_view key, std::filesystem::path &value)
+{
+    std::string text;
+    stringField(table, key, text);
+    if (table.get(key)) value = std::filesystem::path(utf8ToWide(text));
 }
 void boolField(const toml::table &table, std::string_view key, bool &value)
 {
@@ -229,10 +343,10 @@ void intField(const toml::table &table, std::string_view key, int &value)
 
 struct EnvFile {
     bool exists = false;
-    QByteArray bytes;
-    qsizetype begin = -1;
-    qsizetype end = -1;
-    QMap<QByteArray, QByteArray> values;
+    std::string bytes;
+    std::ptrdiff_t begin = -1;
+    std::ptrdiff_t end = -1;
+    std::map<std::string, std::string> values;
     bool conflict = false;
 };
 
@@ -243,7 +357,7 @@ struct EnvFile {
 // marker recognition and byte-splice editing are only safe when every physical
 // line is an independent single-line construct. Returns the 1-based number of
 // the first line Guard refuses to edit, or 0 when the whole file is safe.
-qsizetype unsafeEnvLine(const QByteArray &bytes)
+std::ptrdiff_t unsafeEnvLine(const std::string &bytes)
 {
     enum class Ctx { Start, Key, Value, Comment };
     Ctx ctx = Ctx::Start;
@@ -251,11 +365,11 @@ qsizetype unsafeEnvLine(const QByteArray &bytes)
     char quoteChar = 0;
     bool escaped = false;
     bool spaced = false;
-    qsizetype line = 1;
-    qsizetype offset = bytes.startsWith("\xef\xbb\xbf") ? 3 : 0;
-    const qsizetype size = bytes.size();
+    std::ptrdiff_t line = 1;
+    std::size_t offset = bytes.rfind("\xef\xbb\xbf", 0) == 0 ? 3 : 0;
+    const std::size_t size = bytes.size();
     for (; offset < size; ++offset) {
-        const char ch = bytes.at(offset);
+        const char ch = bytes[offset];
         if (inQuote) {
             if (ch == '\n') return line; // The quoted value spans a physical line.
             if (escaped) escaped = false;
@@ -275,7 +389,7 @@ qsizetype unsafeEnvLine(const QByteArray &bytes)
         if (ch == '\\') {
             // Outside quotes dotenv joins a trailing backslash with the next
             // physical line; refuse to guess what that continuation means.
-            if (offset + 1 >= size || bytes.at(offset + 1) == '\n') return line;
+            if (offset + 1 >= size || bytes[offset + 1] == '\n') return line;
             escaped = true;
             continue;
         }
@@ -300,27 +414,30 @@ qsizetype unsafeEnvLine(const QByteArray &bytes)
     return 0;
 }
 
-bool generatedNoProxy(const QByteArray &bytes)
+bool generatedNoProxy(const std::string &bytes)
 {
-    if (bytes.isEmpty() || bytes.size() > 4096 || bytes.contains('\r') || bytes.contains('\n') || bytes.contains('\0')) return false;
+    if (bytes.empty() || bytes.size() > 4096 || bytes.find('\r') != std::string::npos
+        || bytes.find('\n') != std::string::npos || bytes.find('\0') != std::string::npos)
+        return false;
     // Configuration entries can themselves contain commas. Find a partition
     // into at most 32 valid entries instead of falsely rejecting a block that
     // Guard itself generated from such entries.
-    QList<qsizetype> boundaries{-1};
-    for (qsizetype i = 0; i < bytes.size(); ++i) if (bytes.at(i) == ',') boundaries.append(i);
-    boundaries.append(bytes.size());
-    std::vector<int> fewest(static_cast<size_t>(boundaries.size()), 33);
+    std::vector<std::ptrdiff_t> boundaries{-1};
+    for (std::size_t i = 0; i < bytes.size(); ++i) if (bytes[i] == ',') boundaries.push_back(static_cast<std::ptrdiff_t>(i));
+    boundaries.push_back(static_cast<std::ptrdiff_t>(bytes.size()));
+    std::vector<int> fewest(boundaries.size(), 33);
     fewest[0] = 0;
-    for (qsizetype i = 0; i < boundaries.size() - 1; ++i) {
-        if (fewest[static_cast<size_t>(i)] >= 32) continue;
-        for (qsizetype j = i + 1; j < boundaries.size(); ++j) {
+    for (std::size_t i = 0; i + 1 < boundaries.size(); ++i) {
+        if (fewest[i] >= 32) continue;
+        for (std::size_t j = i + 1; j < boundaries.size(); ++j) {
             const auto length = boundaries[j] - boundaries[i] - 1;
             if (length > 255) break;
             if (length == 0) continue;
-            const auto entry = QString::fromUtf8(bytes.mid(boundaries[i] + 1, length));
-            if (entry != entry.trimmed()) continue;
-            auto &next = fewest[static_cast<size_t>(j)];
-            next = std::min(next, fewest[static_cast<size_t>(i)] + 1);
+            const std::string entry = asciiTrimmed(std::string_view(bytes).substr(
+                static_cast<std::size_t>(boundaries[i] + 1), static_cast<std::size_t>(length)));
+            if (entry.size() != static_cast<std::size_t>(length)) continue;
+            auto &next = fewest[j];
+            next = std::min(next, fewest[i] + 1);
         }
     }
     return fewest.back() <= 32;
@@ -328,76 +445,106 @@ bool generatedNoProxy(const QByteArray &bytes)
 
 void validateManagedValues(const EnvFile &env)
 {
-    const auto http = env.values.value("HTTP_PROXY");
-    if (http != env.values.value("HTTPS_PROXY") || !generatedNoProxy(env.values.value("NO_PROXY")))
+    const std::string &http = env.values.at("HTTP_PROXY");
+    if (http != env.values.at("HTTPS_PROXY") || !generatedNoProxy(env.values.at("NO_PROXY")))
         fail("BACKEND_PROXY_BLOCK_INVALID", "The managed block contains values Guard could not have generated.");
-    static const QRegularExpression endpoint("^http://(\\[[^\\]]+\\]|[^:/?#@\\s]+):([0-9]{1,5})$");
-    const auto match = endpoint.match(QString::fromUtf8(http));
-    if (!match.hasMatch()) fail("BACKEND_PROXY_BLOCK_INVALID", "The managed block proxy endpoint was edited.");
+    // ^http://(\[[^\]]+\]|[^:/?#\s]+):([0-9]{1,5})$
+    std::size_t offset = 0;
+    const std::string prefix = "http://";
+    if (http.size() < prefix.size() || http.compare(0, prefix.size(), prefix) != 0)
+        fail("BACKEND_PROXY_BLOCK_INVALID", "The managed block proxy endpoint was edited.");
+    offset = prefix.size();
+    std::string host;
+    if (offset < http.size() && http[offset] == '[') {
+        const std::size_t close = http.find(']', offset);
+        if (close == std::string::npos) fail("BACKEND_PROXY_BLOCK_INVALID", "The managed block proxy endpoint was edited.");
+        host = http.substr(offset + 1, close - offset - 1);
+        if (host.empty()) fail("BACKEND_PROXY_BLOCK_INVALID", "The managed block proxy endpoint was edited.");
+        offset = close + 1;
+    } else {
+        const std::size_t start = offset;
+        while (offset < http.size()) {
+            const char ch = http[offset];
+            if (ch == ':' || ch == '/' || ch == '?' || ch == '#' || std::isspace(static_cast<unsigned char>(ch))) break;
+            ++offset;
+        }
+        host = http.substr(start, offset - start);
+        if (host.empty()) fail("BACKEND_PROXY_BLOCK_INVALID", "The managed block proxy endpoint was edited.");
+    }
+    if (offset >= http.size() || http[offset] != ':')
+        fail("BACKEND_PROXY_BLOCK_INVALID", "The managed block proxy endpoint was edited.");
+    ++offset;
+    const std::size_t digitsStart = offset;
+    while (offset < http.size() && http[offset] >= '0' && http[offset] <= '9') ++offset;
+    if (offset - digitsStart < 1 || offset - digitsStart > 5 || offset != http.size())
+        fail("BACKEND_PROXY_BLOCK_INVALID", "The managed block proxy endpoint was edited.");
     Config generated;
-    generated.host = match.captured(1);
-    if (generated.host.startsWith('[')) generated.host = generated.host.mid(1, generated.host.size() - 2);
-    generated.port = match.captured(2).toInt();
+    generated.host = host;
+    generated.port = std::stoi(http.substr(digitsStart, offset - digitsStart));
     try { generated.validate(); }
     catch (const Error &) { fail("BACKEND_PROXY_BLOCK_INVALID", "The managed block proxy endpoint is not a valid loopback proxy."); }
-    if (generated.proxyUrl().toUtf8() != http)
+    if (generated.proxyUrl() != http)
         fail("BACKEND_PROXY_BLOCK_INVALID", "The managed block proxy endpoint was edited.");
 }
 
-EnvFile readEnv(const QString &path)
+EnvFile readEnv(const std::filesystem::path &path)
 {
     EnvFile env;
-    Handle file(CreateFileW(wide(QDir::toNativeSeparators(path)), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
-    if (file.value == INVALID_HANDLE_VALUE) {
+    UniqueHandle file(CreateFileW(path.c_str(), GENERIC_READ,
+                                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                  nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
+    if (!file.valid()) {
         if (GetLastError() == ERROR_FILE_NOT_FOUND || GetLastError() == ERROR_PATH_NOT_FOUND) return env;
         fail("BACKEND_PROXY_ENV_IO", "Cannot read the authorized Home proxy file.");
     }
     env.exists = true;
-    env.bytes = readHandle(file.value, envLimit, "BACKEND_PROXY_ENV_IO");
+    env.bytes = readHandle(file.get(), envLimit, "BACKEND_PROXY_ENV_IO");
     if (!strictUtf8(env.bytes)) fail("BACKEND_PROXY_ENV_ENCODING", "The proxy file is not valid UTF-8.");
-    const qsizetype unsafe = unsafeEnvLine(env.bytes);
+    const std::ptrdiff_t unsafe = unsafeEnvLine(env.bytes);
     if (unsafe > 0)
         fail("BACKEND_PROXY_ENV_SYNTAX_UNSUPPORTED",
-             QString("The proxy file uses multi-line or unterminated quoting at line %1; "
-                     "Guard cannot safely edit it automatically. Fix the file manually and retry.")
-                 .arg(unsafe));
+             "The proxy file uses multi-line or unterminated quoting at line " + std::to_string(unsafe)
+                 + "; Guard cannot safely edit it automatically. Fix the file manually and retry.");
     bool inside = false;
-    qsizetype offset = 0;
+    std::size_t offset = 0;
     while (offset < env.bytes.size()) {
-        const auto newline = env.bytes.indexOf('\n', offset);
-        const auto stop = newline < 0 ? env.bytes.size() : newline;
-        QByteArray line = env.bytes.mid(offset, stop - offset);
-        if (line.endsWith('\r')) line.chop(1);
-        const bool bom = offset == 0 && line.startsWith("\xef\xbb\xbf");
-        if (bom) line.remove(0, 3);
-        const auto next = newline < 0 ? env.bytes.size() : newline + 1;
+        const auto newline = env.bytes.find('\n', offset);
+        const std::size_t stop = newline == std::string::npos ? env.bytes.size() : newline;
+        std::string line = env.bytes.substr(offset, stop - offset);
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        const bool bom = offset == 0 && line.rfind("\xef\xbb\xbf", 0) == 0;
+        if (bom) line.erase(0, 3);
+        const std::size_t next = newline == std::string::npos ? env.bytes.size() : newline + 1;
         if (line == blockBegin) {
             if (env.begin >= 0 || env.end >= 0) fail("BACKEND_PROXY_BLOCK_INVALID", "Duplicate or misordered Guard block.");
-            env.begin = offset + (bom ? 3 : 0);
+            env.begin = static_cast<std::ptrdiff_t>(offset + (bom ? 3 : 0));
             inside = true;
         } else if (line == blockEnd) {
             if (!inside || env.end >= 0) fail("BACKEND_PROXY_BLOCK_INVALID", "Duplicate or misordered Guard block end.");
-            env.end = next;
+            env.end = static_cast<std::ptrdiff_t>(next);
             inside = false;
-        } else if (line.startsWith("# BEGIN CODEX PROXY GUARD:") || line.startsWith("# END CODEX PROXY GUARD:")) {
+        } else if (startsWith(line, "# BEGIN CODEX PROXY GUARD:")
+                   || startsWith(line, "# END CODEX PROXY GUARD:")) {
             fail("BACKEND_PROXY_BLOCK_INVALID", "Unknown Guard block version.");
         } else if (inside) {
-            const auto equal = line.indexOf('=');
-            const auto key = line.left(equal);
-            if (equal < 0 || (key != "HTTP_PROXY" && key != "HTTPS_PROXY" && key != "NO_PROXY")
-                || env.values.contains(key))
+            const auto equal = line.find('=');
+            const std::string key = equal == std::string::npos ? "" : line.substr(0, equal);
+            if (equal == std::string::npos
+                || (key != "HTTP_PROXY" && key != "HTTPS_PROXY" && key != "NO_PROXY")
+                || env.values.count(key) > 0)
                 fail("BACKEND_PROXY_BLOCK_INVALID", "The Guard block has been edited or contains duplicate keys.");
-            env.values.insert(key, line.mid(equal + 1));
+            env.values.emplace(key, line.substr(equal + 1));
         } else {
-            QString text = QString::fromUtf8(line).trimmed();
-            if (!text.startsWith('#')) {
-                const auto equal = text.indexOf('=');
-                if (equal >= 0) {
-                    QString key = text.left(equal).trimmed();
-                    if (key.startsWith("export") && key.size() > 6 && key.at(6).isSpace()) key = key.mid(6).trimmed();
-                    key = key.toUpper();
-                    if (key == "HTTP_PROXY" || key == "HTTPS_PROXY" || key == "NO_PROXY" || key == "ALL_PROXY") env.conflict = true;
+            const std::string text = asciiTrimmed(line);
+            if (!text.empty() && text[0] != '#') {
+                const auto equal = text.find('=');
+                if (equal != std::string::npos) {
+                    std::string key = asciiTrimmed(text.substr(0, equal));
+                    if (key.starts_with("export") && key.size() > 6 && std::isspace(static_cast<unsigned char>(key[6])))
+                        key = asciiTrimmed(key.substr(6));
+                    key = asciiFolded(key);
+                    if (key == "http_proxy" || key == "https_proxy" || key == "no_proxy" || key == "all_proxy")
+                        env.conflict = true;
                 }
             }
         }
@@ -411,46 +558,45 @@ EnvFile readEnv(const QString &path)
 
 bool currentValues(const EnvFile &env, const Config &config)
 {
-    return env.begin >= 0 && env.values.value("HTTP_PROXY") == config.proxyUrl().toUtf8()
-        && env.values.value("HTTPS_PROXY") == config.proxyUrl().toUtf8()
-        && env.values.value("NO_PROXY") == config.noProxyValue().toUtf8();
+    return env.begin >= 0 && env.values.at("HTTP_PROXY") == config.proxyUrl()
+        && env.values.at("HTTPS_PROXY") == config.proxyUrl()
+        && env.values.at("NO_PROXY") == config.noProxyValue();
 }
 
 class EnvTransaction {
-    Handle handle_;
+    UniqueHandle handle_;
     bool committed_ = false;
 public:
     EnvTransaction() : handle_(CreateTransaction(nullptr, nullptr, 0, 0, 0, 5000, nullptr))
     {
-        if (handle_.value == INVALID_HANDLE_VALUE)
+        if (!handle_.valid())
             fail("BACKEND_PROXY_ENV_ATOMIC_UNAVAILABLE", "Windows file transactions are unavailable; the proxy file was not changed.");
     }
-    ~EnvTransaction() { if (!committed_) RollbackTransaction(handle_.value); }
-    HANDLE handle() const { return handle_.value; }
+    ~EnvTransaction() { if (!committed_) RollbackTransaction(handle_.get()); }
+    HANDLE handle() const { return handle_.get(); }
     void commit()
     {
-        if (!CommitTransaction(handle_.value))
+        if (!CommitTransaction(handle_.get()))
             fail("BACKEND_PROXY_ENV_IO", "The proxy file transaction could not commit; no partial edit was published.");
         committed_ = true;
     }
 };
 
-void atomicEnv(const QString &path, const EnvFile &expected, const QByteArray &updated, bool remove = false)
+void atomicEnv(const std::filesystem::path &path, const EnvFile &expected, const std::string &updated, bool remove = false)
 {
     if (updated.size() > envLimit) fail("BACKEND_PROXY_ENV_IO", "The updated proxy file exceeds 1 MiB.");
     ensureParent(path, "BACKEND_PROXY_ENV_IO");
-    const QString target = QDir::toNativeSeparators(path);
     EnvTransaction transaction;
     {
         // A transacted writer locks both data and namespace identity, including
         // against non-transacted rename-and-save editors. The lock survives the
         // file-handle close until commit/rollback. A normal shared-delete handle
         // plus pathname rename cannot provide this compare-and-write guarantee.
-        Handle file(CreateFileTransactedW(wide(target), GENERIC_READ | GENERIC_WRITE | DELETE,
+        UniqueHandle file(CreateFileTransactedW(path.c_str(), GENERIC_READ | GENERIC_WRITE | DELETE,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
             expected.exists ? OPEN_EXISTING : CREATE_NEW, FILE_ATTRIBUTE_NORMAL,
             nullptr, transaction.handle(), nullptr, nullptr));
-        if (file.value == INVALID_HANDLE_VALUE) {
+        if (!file.valid()) {
             const DWORD error = GetLastError();
             if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND || error == ERROR_FILE_EXISTS || error == ERROR_ALREADY_EXISTS)
                 fail("BACKEND_PROXY_CONFIG_CONFLICT", "The proxy file changed; no changes were applied.");
@@ -459,228 +605,169 @@ void atomicEnv(const QString &path, const EnvFile &expected, const QByteArray &u
                 fail("BACKEND_PROXY_ENV_ATOMIC_UNAVAILABLE", "This location does not support the required Windows file transactions; the proxy file was not changed.");
             fail("BACKEND_PROXY_ENV_IO", "Cannot lock the proxy file for an atomic transaction.");
         }
-        if (readHandle(file.value, envLimit, "BACKEND_PROXY_ENV_IO") != expected.bytes)
+        if (readHandle(file.get(), envLimit, "BACKEND_PROXY_ENV_IO") != expected.bytes)
             fail("BACKEND_PROXY_CONFIG_CONFLICT", "The proxy file changed; no changes were applied.");
         if (envTransactionHook) envTransactionHook(false);
         if (remove) {
-            if (!DeleteFileTransactedW(wide(target), transaction.handle()))
+            if (!DeleteFileTransactedW(path.c_str(), transaction.handle()))
                 fail("BACKEND_PROXY_ENV_IO", "Cannot remove the managed proxy file transactionally.");
-        } else if (!writeHandle(file.value, updated)) {
+        } else if (!writeHandle(file.get(), updated)) {
             fail("BACKEND_PROXY_ENV_IO", "Cannot stage the proxy file transaction.");
         }
         if (envTransactionHook) envTransactionHook(true);
     }
     transaction.commit();
 }
-
-// QJsonDocument validates syntax but deliberately coalesces duplicate keys.
-// Walk its already-validated source to reject duplicates at every nesting level,
-// comparing decoded keys (including escaped spellings) before they are lost.
-class JsonKeys {
-    const QByteArray &bytes;
-    qsizetype position = 0;
-    QString code;
-    void white() { while (position < bytes.size() && QByteArray(" \t\r\n").contains(bytes.at(position))) ++position; }
-    QByteArray stringToken()
-    {
-        const auto start = position++;
-        while (position < bytes.size()) {
-            const char ch = bytes.at(position++);
-            if (ch == '\\') ++position;
-            else if (ch == '"') return bytes.mid(start, position - start);
-        }
-        fail(code, "Invalid JSON string.");
-    }
-    void value(int depth)
-    {
-        if (depth > 64) fail(code, "JSON nesting exceeds its limit.");
-        white();
-        if (position >= bytes.size()) fail(code, "Incomplete JSON value.");
-        const char ch = bytes.at(position);
-        if (ch == '{') {
-            ++position; white(); QSet<QString> keys;
-            while (position < bytes.size() && bytes.at(position) != '}') {
-                const QByteArray token = stringToken();
-                const auto key = QJsonDocument::fromJson("[" + token + "]").array().at(0).toString();
-                if (keys.contains(key)) fail(code, "Duplicate JSON object key.");
-                keys.insert(key); white(); ++position; value(depth + 1); white();
-                if (bytes.at(position) != ',') break;
-                ++position; white();
-            }
-            ++position;
-        } else if (ch == '[') {
-            ++position; white();
-            while (position < bytes.size() && bytes.at(position) != ']') {
-                value(depth + 1); white(); if (bytes.at(position) != ',') break; ++position; white();
-            }
-            ++position;
-        } else if (ch == '"') { stringToken(); }
-        else { while (position < bytes.size() && !QByteArray(" \t\r\n,]}").contains(bytes.at(position))) ++position; }
-    }
-public:
-    JsonKeys(const QByteArray &input, QString errorCode) : bytes(input), code(std::move(errorCode)) {}
-    void check() { if (bytes.startsWith("\xef\xbb\xbf")) position = 3; value(0); }
-};
 } // namespace
 
 namespace testing {
 void setEnvTransactionHook(std::function<void(bool)> hook) { envTransactionHook = std::move(hook); }
 }
 
-Error::Error(QString errorCode, QString text)
-    : std::runtime_error(errorCode.toStdString()), code(std::move(errorCode)), message(publicText(text, 1024)) {}
-QJsonObject Error::json() const { return {{"code", code}, {"message", message}}; }
-void Cancellation::check() const { if (cancelled()) fail("LAUNCH_CANCELLED", "Operation cancelled."); }
-
-bool strictUtf8(const QByteArray &bytes)
-{
-    QStringDecoder decoder(QStringDecoder::Utf8, QStringConverter::Flag::Stateless);
-    const QString decoded = decoder.decode(bytes);
-    Q_UNUSED(decoded);
-    return !decoder.hasError();
-}
-
-QJsonObject parseJsonObject(const QByteArray &bytes, qsizetype limit, const QString &errorCode)
-{
-    if (bytes.size() > limit || !strictUtf8(bytes)) fail(errorCode, "JSON input is oversized or not valid UTF-8.");
-    QJsonParseError error{};
-    const auto document = QJsonDocument::fromJson(bytes, &error);
-    if (error.error != QJsonParseError::NoError || !document.isObject()) fail(errorCode, "Expected a valid JSON object.");
-    JsonKeys(bytes, errorCode).check();
-    return document.object();
-}
-
-QString publicText(const QString &input, int limit)
-{
-    QString text = input;
-    const QString profile = qEnvironmentVariable("USERPROFILE");
-    if (!profile.isEmpty()) {
-        text.replace(profile, "%USERPROFILE%", Qt::CaseInsensitive);
-        text.replace(QDir::fromNativeSeparators(profile), "%USERPROFILE%", Qt::CaseInsensitive);
-    }
-    static const QRegularExpression ansi("\\x1b(?:\\[[0-?]*[ -/]*[@-~]|\\][^\\x07]*(?:\\x07|\\x1b\\\\))");
-    text.remove(ansi);
-    static const QRegularExpression credentials("(://)[^\\s/@]+@", QRegularExpression::CaseInsensitiveOption);
-    text.replace(credentials, "\\1[REDACTED]@");
-    static const QRegularExpression secret("(?i)(proxy-authorization:|authorization:|set-cookie:|cookie:|token\\s*=|api[_-]?key\\s*=|authorization\\s*=|cookie\\s*=|password\\s*=|secret\\s*=)[^\\r\\n]*");
-    text.replace(secret, "\\1[REDACTED]");
-    QString safe;
-    for (const auto ch : text) {
-        if (ch.isSpace()) safe += ' ';
-        else if (ch.category() != QChar::Other_Control && ch.category() != QChar::Other_Format
-                 && ch.category() != QChar::Other_Surrogate) safe += ch;
-    }
-    safe = safe.simplified();
-    return safe.left(std::max(0, limit));
-}
-
 void Config::validate() const
 {
     if (version != 2) fail("CONFIG_INVALID", "Unsupported configuration version; expected version 2.");
-    if (scheme.compare("http", Qt::CaseInsensitive) != 0) fail("CONFIG_INVALID", "Proxy scheme must be http.");
+    if (!asciiEqualsFolded(scheme, "http")) fail("CONFIG_INVALID", "Proxy scheme must be http.");
     if (port < 1 || port > 65535) fail("CONFIG_INVALID", "Proxy port must be between 1 and 65535.");
-    if (host.isEmpty() || host != host.trimmed() || host.contains(QChar::Null)) fail("CONFIG_INVALID", "Invalid proxy host.");
+    if (host.empty() || asciiTrimmed(host) != host || host.find('\0') != std::string::npos)
+        fail("CONFIG_INVALID", "Invalid proxy host.");
     IN_ADDR ipv4{};
     IN6_ADDR ipv6{};
-    bool loopback = host.compare("localhost", Qt::CaseInsensitive) == 0;
-    if (InetPtonW(AF_INET, wide(host), &ipv4) == 1) loopback = reinterpret_cast<const unsigned char *>(&ipv4)[0] == 127;
-    if (InetPtonW(AF_INET6, wide(host), &ipv6) == 1) {
+    bool loopback = asciiEqualsFolded(host, "localhost");
+    const std::wstring wideHost = utf8ToWide(host);
+    if (InetPtonW(AF_INET, wideHost.c_str(), &ipv4) == 1)
+        loopback = reinterpret_cast<const unsigned char *>(&ipv4)[0] == 127;
+    if (InetPtonW(AF_INET6, wideHost.c_str(), &ipv6) == 1) {
         const auto *bytes = reinterpret_cast<const unsigned char *>(&ipv6);
         loopback = std::all_of(bytes, bytes + 15, [](unsigned char c) { return c == 0; }) && bytes[15] == 1;
     }
     if (!loopback) fail("CONFIG_INVALID", "Proxy host must be localhost or a loopback IP address.");
-    if (noProxy.isEmpty() || noProxy.size() > 32 || noProxyValue().toUtf8().size() > 4096)
+    if (noProxy.empty() || noProxy.size() > 32 || noProxyValue().size() > 4096)
         fail("CONFIG_INVALID", "Proxy exclusions must contain 1 to 32 bounded entries.");
     for (const auto &entry : noProxy) {
-        if (entry.isEmpty() || entry != entry.trimmed() || entry.toUtf8().size() > 255
-            || entry.contains('\r') || entry.contains('\n') || entry.contains(QChar::Null))
+        if (entry.empty() || asciiTrimmed(entry) != entry || entry.size() > 255
+            || entry.find('\r') != std::string::npos || entry.find('\n') != std::string::npos
+            || entry.find('\0') != std::string::npos)
             fail("CONFIG_INVALID", "Proxy exclusions contain an invalid entry.");
     }
     if (alternateScreen != "auto" && alternateScreen != "always" && alternateScreen != "never")
         fail("CONFIG_INVALID", "Invalid alternate-screen setting.");
 }
-QString Config::proxyUrl() const { return "http://" + (host.contains(':') ? "[" + host + "]" : host) + ":" + QString::number(port); }
-QString Config::noProxyValue() const { return noProxy.join(','); }
 
-Config Config::parse(const QByteArray &bytes)
+std::string Config::proxyUrl() const
 {
-    if (bytes.size() > configLimit || !strictUtf8(bytes)) fail("CONFIG_INVALID", "Configuration exceeds 64 KiB or is not valid UTF-8.");
+    const std::string bracketed = host.find(':') != std::string::npos ? "[" + host + "]" : host;
+    return "http://" + bracketed + ":" + std::to_string(port);
+}
+std::string Config::noProxyValue() const
+{
+    std::string joined;
+    for (std::size_t index = 0; index < noProxy.size(); ++index) {
+        if (index > 0) joined += ',';
+        joined += noProxy[index];
+    }
+    return joined;
+}
+
+Config Config::parse(const std::string &bytes)
+{
+    if (bytes.size() > configLimit || !strictUtf8(bytes))
+        fail("CONFIG_INVALID", "Configuration exceeds 64 KiB or is not valid UTF-8.");
     try {
-        const auto table = toml::parse(std::string_view(bytes.constData(), static_cast<size_t>(bytes.size())));
+        const auto table = toml::parse(std::string_view(bytes));
         checkKeys(table, {"version", "proxy", "codex", "tui"});
         Config config;
         intField(table, "version", config.version);
         if (const auto *proxy = subtable(table, "proxy")) {
             checkKeys(*proxy, {"scheme", "host", "port", "no_proxy"});
-            stringField(*proxy, "scheme", config.scheme); stringField(*proxy, "host", config.host); intField(*proxy, "port", config.port);
+            stringField(*proxy, "scheme", config.scheme);
+            stringField(*proxy, "host", config.host);
+            intField(*proxy, "port", config.port);
             if (const auto *node = proxy->get("no_proxy")) {
                 if (!node->is_array()) fail("CONFIG_INVALID", "Proxy exclusions must be an array.");
                 config.noProxy.clear();
                 for (const auto &entry : *node->as_array()) {
                     if (!entry.is_string()) fail("CONFIG_INVALID", "Proxy exclusions must be strings.");
-                    config.noProxy.append(QString::fromStdString(entry.as_string()->get()));
+                    config.noProxy.push_back(entry.as_string()->get());
                 }
             }
         }
         if (const auto *codex = subtable(table, "codex")) {
             checkKeys(*codex, {"executable_override", "cli_executable_override", "refuse_if_running", "manage_codex_proxy_env", "proxy_env_home"});
-            stringField(*codex, "executable_override", config.executableOverride);
-            stringField(*codex, "cli_executable_override", config.cliOverride);
-            stringField(*codex, "proxy_env_home", config.home);
+            pathField(*codex, "executable_override", config.executableOverride);
+            pathField(*codex, "cli_executable_override", config.cliOverride);
+            pathField(*codex, "proxy_env_home", config.home);
             boolField(*codex, "refuse_if_running", config.refuseIfRunning);
             boolField(*codex, "manage_codex_proxy_env", config.manageBackend);
         }
         if (const auto *tui = subtable(table, "tui")) {
-            checkKeys(*tui, {"alternate_screen"}); stringField(*tui, "alternate_screen", config.alternateScreen);
+            checkKeys(*tui, {"alternate_screen"});
+            stringField(*tui, "alternate_screen", config.alternateScreen);
         }
-        config.validate(); return config;
+        config.validate();
+        return config;
     } catch (const toml::parse_error &) { fail("CONFIG_INVALID", "Configuration is not valid TOML."); }
 }
 
-QByteArray Config::toml() const
+std::string Config::toml() const
 {
     validate();
     toml::array exclusions;
-    for (const auto &entry : noProxy) exclusions.push_back(entry.toStdString());
+    for (const auto &entry : noProxy) exclusions.push_back(entry);
     toml::table table{{"version", version},
-        {"proxy", toml::table{{"scheme", scheme.toStdString()}, {"host", host.toStdString()}, {"port", port}, {"no_proxy", std::move(exclusions)}}},
-        {"codex", toml::table{{"executable_override", executableOverride.toStdString()}, {"cli_executable_override", cliOverride.toStdString()},
-             {"refuse_if_running", refuseIfRunning}, {"manage_codex_proxy_env", manageBackend}, {"proxy_env_home", home.toStdString()}}},
-        {"tui", toml::table{{"alternate_screen", alternateScreen.toStdString()}}}};
-    std::ostringstream output; output << table;
-    return QByteArray::fromStdString(output.str()) + '\n';
+        {"proxy", toml::table{{"scheme", scheme}, {"host", host}, {"port", port}, {"no_proxy", std::move(exclusions)}}},
+        {"codex", toml::table{{"executable_override", wideToUtf8(executableOverride.wstring())},
+             {"cli_executable_override", wideToUtf8(cliOverride.wstring())},
+             {"refuse_if_running", refuseIfRunning}, {"manage_codex_proxy_env", manageBackend},
+             {"proxy_env_home", wideToUtf8(home.wstring())}}},
+        {"tui", toml::table{{"alternate_screen", alternateScreen}}}};
+    std::ostringstream output;
+    output << table;
+    return output.str() + '\n';
 }
-QString Config::defaultPath() { return QDir(knownFolder(FOLDERID_RoamingAppData)).filePath("codex-proxy-guard/config.toml"); }
-QString Config::defaultHome() { return QDir(knownFolder(FOLDERID_Profile)).filePath(".codex"); }
-Config Config::load(const QString &path)
+
+std::filesystem::path Config::defaultPath()
 {
-    Handle file(CreateFileW(wide(QDir::toNativeSeparators(path)), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
-    if (file.value == INVALID_HANDLE_VALUE) fail("CONFIG_READ_FAILED", "Cannot read the Guard configuration.");
-    return parse(readHandle(file.value, configLimit, "CONFIG_READ_FAILED"));
+    return knownFolder(FOLDERID_RoamingAppData) / "codex-proxy-guard" / "config.toml";
 }
-Config Config::loadOrCreate(const QString &path)
+std::filesystem::path Config::defaultHome()
 {
-    if (QFileInfo::exists(path)) return load(path);
+    return knownFolder(FOLDERID_Profile) / ".codex";
+}
+
+Config Config::load(const std::filesystem::path &path)
+{
+    UniqueHandle file(CreateFileW(path.c_str(), GENERIC_READ,
+                                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                  nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
+    if (!file.valid()) fail("CONFIG_READ_FAILED", "Cannot read the Guard configuration.");
+    return parse(readHandle(file.get(), configLimit, "CONFIG_READ_FAILED"));
+}
+
+Config Config::loadOrCreate(const std::filesystem::path &path)
+{
+    if (std::filesystem::exists(path)) return load(path);
     try { initializeConfig(path, Config{}, false); }
-    catch (const Error &) { if (QFileInfo::exists(path)) return load(path); throw; }
+    catch (const Error &) { if (std::filesystem::exists(path)) return load(path); throw; }
     return load(path);
 }
 
-struct ConfigLease::Impl { Handle handle; };
-ConfigLease::ConfigLease(const QString &path, const Config &expected) : impl_(std::make_unique<Impl>())
+struct ConfigLease::Impl { UniqueHandle handle; };
+ConfigLease::ConfigLease(const std::filesystem::path &path, const Config &expected)
+    : impl_(std::make_unique<Impl>())
 {
-    impl_->handle.value = CreateFileW(wide(QDir::toNativeSeparators(path)), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (impl_->handle.value == INVALID_HANDLE_VALUE) fail("CONFIG_LOCK_FAILED", "Configuration is changing or unavailable.");
-    const auto current = tryConfig(readHandle(impl_->handle.value, configLimit, "CONFIG_READ_FAILED"));
+    impl_->handle.reset(CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                    OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
+    if (!impl_->handle.valid()) fail("CONFIG_LOCK_FAILED", "Configuration is changing or unavailable.");
+    const auto current = tryConfig(readHandle(impl_->handle.get(), configLimit, "CONFIG_READ_FAILED"));
     if (!current || *current != expected) fail("CONFIG_CHANGED", "Refresh before launching with the new configuration.");
 }
 ConfigLease::~ConfigLease() = default;
 
-void initializeConfig(const QString &path, const Config &config, bool force)
+void initializeConfig(const std::filesystem::path &path, const Config &config, bool force)
 {
     config.validate();
-    if (!force || !QFileInfo::exists(path)) { Transaction(path, nullptr, false, true).commit(config); return; }
+    if (!force || !std::filesystem::exists(path)) { Transaction(path, nullptr, false, true).commit(config); return; }
     // Force initialization still holds the same write/delete exclusion as every
     // editor and must never silently discard an existing authorization binding.
     Transaction transaction(path, nullptr, false);
@@ -690,19 +777,26 @@ void initializeConfig(const QString &path, const Config &config, bool force)
     transaction.commit(config);
 }
 
-Config updateProxy(const QString &path, const Config &expected, bool invalid, const QString &host, int port)
+Config updateProxy(const std::filesystem::path &path, const Config &expected, bool invalid,
+                   const std::string &host, int port)
 {
     Transaction transaction(path, invalid ? nullptr : &expected, invalid);
-    Config updated = expected; updated.host = host; updated.port = port;
-    transaction.commit(updated); return updated;
+    Config updated = expected;
+    updated.host = host;
+    updated.port = port;
+    transaction.commit(updated);
+    return updated;
 }
-QString consentHome(const Config &config)
+
+std::filesystem::path consentHome(const Config &config)
 {
-    const QString home = config.home.isEmpty() ? Config::defaultHome() : config.home;
+    const std::filesystem::path home = config.home.empty() ? Config::defaultHome() : config.home;
     if (!absoluteHome(home)) fail("BACKEND_PROXY_SCOPE_UNCONFIRMED", "The Codex Home must be an absolute path.");
     return home;
 }
-Config updateConsent(const QString &path, const Config &expected, bool enable, const QString &confirmedHome)
+
+Config updateConsent(const std::filesystem::path &path, const Config &expected, bool enable,
+                     const std::filesystem::path &confirmedHome)
 {
     Transaction transaction(path, &expected, false);
     if (!absoluteHome(confirmedHome) || consentHome(expected) != confirmedHome)
@@ -710,21 +804,22 @@ Config updateConsent(const QString &path, const Config &expected, bool enable, c
     Config updated = expected;
     if (enable) {
         if (expected.manageBackend) fail("CONFIG_CHANGED", "Proxy management is already authorized; refresh before confirming.");
-        const auto canonical = QFileInfo(confirmedHome).canonicalFilePath();
-        updated.home = canonical.isEmpty() ? confirmedHome : canonical;
+        const auto canonical = canonicalPathOf(confirmedHome, true);
+        updated.home = canonical.value_or(confirmedHome);
         updated.manageBackend = true;
     } else {
         if (!expected.manageBackend || expected.home != confirmedHome)
             fail("CONFIG_CHANGED", "Proxy management is no longer authorized for the confirmed Home.");
         try { revokeProxyEnv(confirmedHome); }
         catch (const Error &error) {
-            static const QSet<QString> reasons{"BACKEND_PROXY_ENV_IO", "BACKEND_PROXY_ENV_ATOMIC_UNAVAILABLE",
+            static const std::set<std::string> reasons{"BACKEND_PROXY_ENV_IO", "BACKEND_PROXY_ENV_ATOMIC_UNAVAILABLE",
                 "BACKEND_PROXY_CONFIG_CONFLICT", "BACKEND_PROXY_BLOCK_INVALID", "BACKEND_PROXY_ENV_ENCODING",
                 "BACKEND_PROXY_ENV_SYNTAX_UNSUPPORTED", "BACKEND_PROXY_SCOPE_UNCONFIRMED"};
-            const QString reason = reasons.contains(error.code) ? error.code : "BACKEND_PROXY_ENV_FAILURE";
+            const std::string reason = reasons.count(error.code) ? error.code : "BACKEND_PROXY_ENV_FAILURE";
             fail("BACKEND_PROXY_REVOKE_FAILED", "The managed block was not safely removed; consent and its bound Home remain unchanged. Cause: " + reason + ".");
         }
-        updated.manageBackend = false; updated.home.clear();
+        updated.manageBackend = false;
+        updated.home.clear();
     }
     try { transaction.commit(updated); }
     catch (const Error &error) {
@@ -735,12 +830,12 @@ Config updateConsent(const QString &path, const Config &expected, bool enable, c
     return updated;
 }
 
-QString inspectProxyEnv(const Config &config)
+std::string inspectProxyEnv(const Config &config)
 {
     if (!config.manageBackend) return "not_authorized";
     try {
         config.validate();
-        const EnvFile env = readEnv(QDir(boundHome(config)).filePath(".env"));
+        const EnvFile env = readEnv(boundHome(config) / ".env");
         if (env.conflict) return "conflict";
         if (env.begin < 0) return "pending";
         return currentValues(env, config) ? "current" : "stale";
@@ -750,27 +845,36 @@ QString inspectProxyEnv(const Config &config)
         return "invalid";
     }
 }
+
 void prepareProxyEnv(const Config &config)
 {
     config.validate();
-    const QString path = QDir(boundHome(config)).filePath(".env");
+    const std::filesystem::path path = boundHome(config) / ".env";
     const EnvFile env = readEnv(path);
     if (env.conflict) fail("BACKEND_PROXY_CONFIG_CONFLICT", "Proxy keys already exist outside Guard's block; resolve them manually.");
     if (currentValues(env, config)) return;
-    const auto url = config.proxyUrl().toUtf8();
-    const QByteArray block = blockBegin + "\nHTTP_PROXY=" + url + "\nHTTPS_PROXY=" + url + "\nNO_PROXY=" + config.noProxyValue().toUtf8() + "\n" + blockEnd + "\n";
-    QByteArray updated;
-    if (env.begin >= 0) updated = env.bytes.left(env.begin) + block + env.bytes.mid(env.end);
-    else updated = env.bytes + ((!env.bytes.isEmpty() && !env.bytes.endsWith('\n')) ? "\n" : "") + block;
+    const std::string url = config.proxyUrl();
+    const std::string block = std::string(blockBegin) + "\nHTTP_PROXY=" + url + "\nHTTPS_PROXY=" + url
+        + "\nNO_PROXY=" + config.noProxyValue() + "\n" + blockEnd + "\n";
+    std::string updated;
+    if (env.begin >= 0) {
+        updated = env.bytes.substr(0, static_cast<std::size_t>(env.begin)) + block
+            + env.bytes.substr(static_cast<std::size_t>(env.end));
+    } else {
+        updated = env.bytes + ((!env.bytes.empty() && env.bytes.back() != '\n') ? "\n" : "") + block;
+    }
     atomicEnv(path, env, updated);
 }
-void revokeProxyEnv(const QString &home)
+
+void revokeProxyEnv(const std::filesystem::path &home)
 {
     if (!absoluteHome(home)) fail("BACKEND_PROXY_SCOPE_UNCONFIRMED", "The Codex Home must be an absolute path.");
-    const QString path = QDir(home).filePath(".env");
+    const std::filesystem::path path = home / ".env";
     const EnvFile env = readEnv(path);
     if (env.begin < 0) return;
-    const QByteArray updated = env.bytes.left(env.begin) + env.bytes.mid(env.end);
-    atomicEnv(path, env, updated, updated.isEmpty());
+    const std::string updated = env.bytes.substr(0, static_cast<std::size_t>(env.begin))
+        + env.bytes.substr(static_cast<std::size_t>(env.end));
+    atomicEnv(path, env, updated, updated.empty());
 }
+
 } // namespace cpg

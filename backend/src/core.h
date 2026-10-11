@@ -1,52 +1,48 @@
 #pragma once
-#include <QByteArray>
-#include <QJsonObject>
-#include <QString>
-#include <QStringList>
-#include <atomic>
+
+#include "cpg/cancellation.h"
+#include "cpg/error.h"
+#include "cpg/json.h"
+#include "cpg/text.h"
+
+#include <filesystem>
 #include <memory>
-#include <stdexcept>
+#include <string>
+#include <vector>
 
 namespace cpg {
-struct Error final : std::runtime_error {
-    QString code;
-    QString message;
-    Error(QString code, QString message);
-    QJsonObject json() const;
-};
-struct Cancellation {
-    std::shared_ptr<std::atomic_bool> flag = std::make_shared<std::atomic_bool>(false);
-    bool cancelled() const { return flag->load(); }
-    void cancel() const { flag->store(true); }
-    void check() const;
-};
+
 struct Config {
     int version = 2;
-    QString scheme = "http";
-    QString host = "127.0.0.1";
+    std::string scheme = "http";
+    std::string host = "127.0.0.1";
     int port = 10808;
-    QStringList noProxy{"localhost", "127.0.0.1", "::1"};
-    QString executableOverride;
-    QString cliOverride;
+    std::vector<std::string> noProxy{"localhost", "127.0.0.1", "::1"};
+
+    std::filesystem::path executableOverride;
+    std::filesystem::path cliOverride;
+
     bool refuseIfRunning = true;
     bool manageBackend = false;
-    QString home;
-    QString alternateScreen = "auto";
+    std::filesystem::path home;
+
+    std::string alternateScreen = "auto";
     bool operator==(const Config &) const = default;
     void validate() const;
-    QString proxyUrl() const;
-    QString noProxyValue() const;
-    QByteArray toml() const;
-    static Config parse(const QByteArray &bytes);
-    static Config load(const QString &path);
-    static Config loadOrCreate(const QString &path);
-    static QString defaultPath();
-    static QString defaultHome();
+    std::string proxyUrl() const;
+    std::string noProxyValue() const;
+    std::string toml() const;
+    static Config parse(const std::string &bytes);
+    static Config load(const std::filesystem::path &path);
+    static Config loadOrCreate(const std::filesystem::path &path);
+    static std::filesystem::path defaultPath();
+    static std::filesystem::path defaultHome();
 };
+
 // Opaque held Windows handle; a launch lease excludes all config mutations.
 class ConfigLease {
 public:
-    ConfigLease(const QString &path, const Config &expected);
+    ConfigLease(const std::filesystem::path &path, const Config &expected);
     ~ConfigLease();
     ConfigLease(const ConfigLease &) = delete;
     ConfigLease &operator=(const ConfigLease &) = delete;
@@ -54,16 +50,15 @@ private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
-void initializeConfig(const QString &path, const Config &config, bool force);
-Config updateProxy(const QString &path, const Config &expected, bool invalid,
-                   const QString &host, int port);
-Config updateConsent(const QString &path, const Config &expected, bool enable,
-                     const QString &confirmedHome);
-QString consentHome(const Config &config);
-QString inspectProxyEnv(const Config &config); // unknown/not_authorized/pending/current/stale/conflict/invalid/unavailable/unsupported
+
+void initializeConfig(const std::filesystem::path &path, const Config &config, bool force);
+Config updateProxy(const std::filesystem::path &path, const Config &expected, bool invalid,
+                   const std::string &host, int port);
+Config updateConsent(const std::filesystem::path &path, const Config &expected, bool enable,
+                     const std::filesystem::path &confirmedHome);
+std::filesystem::path consentHome(const Config &config);
+std::string inspectProxyEnv(const Config &config); // unknown/not_authorized/pending/current/stale/conflict/invalid/unavailable/unsupported
 void prepareProxyEnv(const Config &config);
-void revokeProxyEnv(const QString &home);
-bool strictUtf8(const QByteArray &bytes);
-QJsonObject parseJsonObject(const QByteArray &bytes, qsizetype limit, const QString &errorCode);
-QString publicText(const QString &text, int limit = 160);
-}
+void revokeProxyEnv(const std::filesystem::path &home);
+
+} // namespace cpg

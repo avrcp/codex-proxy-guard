@@ -1,20 +1,18 @@
 #include "platform.h"
+#include "cpg/build_info.h"
+#include "cpg/path.h"
+#include "cpg/win_handle.h"
 #include "platform_protocol_p.h"
-#include <QCoreApplication>
-#include <QDir>
-#include <QElapsedTimer>
-#include <QFile>
-#include <QFileInfo>
-#include <QJsonArray>
-#include <QJsonDocument>
-#include <QProcess>
-#include <QRegularExpression>
-#include <QThread>
+
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cctype>
+#include <cstdio>
+#include <cstring>
 #include <limits>
 #include <vector>
+
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
@@ -23,128 +21,190 @@
 #include <shobjidl.h>
 #include <tlhelp32.h>
 
+// Generated at configure time from resources/appx-discovery.ps1 so the engine
+// needs no Qt resource system.
+#include "discovery_script.h"
+
 namespace cpg {
 namespace {
-constexpr qsizetype requestLimit = 16 * 1024;
-constexpr qsizetype receiptLimit = 64 * 1024;
-const QString discoveryError = QStringLiteral("APPX_DISCOVERY_PROTOCOL_INVALID");
-const QString activationError = QStringLiteral("APPX_ACTIVATION_PROTOCOL_INVALID");
+constexpr std::size_t requestLimit = 16 * 1024;
+constexpr std::size_t receiptLimit = 64 * 1024;
+const char *discoveryError = "APPX_DISCOVERY_PROTOCOL_INVALID";
+const char *activationError = "APPX_ACTIVATION_PROTOCOL_INVALID";
 
-[[noreturn]] void fail(const QString &code, const QString &message)
+[[noreturn]] void fail(const std::string &code, const std::string &message)
 {
     throw Error(code, message);
 }
-class Handle {
-public:
-    explicit Handle(HANDLE value = nullptr) : value_(value) {}
-    ~Handle() { if (value_ && value_ != INVALID_HANDLE_VALUE) CloseHandle(value_); }
-    Handle(const Handle &) = delete;
-    Handle &operator=(const Handle &) = delete;
-    HANDLE get() const { return value_; }
-    bool valid() const { return value_ && value_ != INVALID_HANDLE_VALUE; }
-private:
-    HANDLE value_;
-};
-const wchar_t *wide(const QString &text) { return reinterpret_cast<const wchar_t *>(text.utf16()); }
-QString field(const QJsonObject &object, const QString &key, const QString &code,
-              bool optional = false, bool nullable = false)
+
+const Json &field(const Json &object, const char *key)
 {
-    const auto value = object.value(key);
-    if ((optional && value.isUndefined()) || (nullable && value.isNull())) return {};
-    if (!value.isString()) fail(code, "Invalid string field: " + key);
-    const auto result = value.toString();
-    if (result.contains(QChar::Null)) fail(code, "Embedded NUL in field: " + key);
+    static const Json nullValue = Json();
+    const auto entry = object.find(key);
+    return entry == object.end() ? nullValue : *entry;
+}
+
+bool isNullish(const Json &value)
+{
+    return value.is_null();
+}
+
+bool asciiEquals(const std::string &left, const std::string &right)
+{
+    if (left.size() != right.size()) return false;
+    for (std::size_t index = 0; index < left.size(); ++index)
+        if (std::tolower(static_cast<unsigned char>(left[index]))
+            != std::tolower(static_cast<unsigned char>(right[index])))
+            return false;
+    return true;
+}
+
+std::string asciiTrimmedUtf8(std::string_view value)
+{
+    std::size_t begin = 0, end = value.size();
+    while (begin < end && std::isspace(static_cast<unsigned char>(value[begin]))) ++begin;
+    while (end > begin && std::isspace(static_cast<unsigned char>(value[end - 1]))) --end;
+    return std::string(value.substr(begin, end - begin));
+}
+
+// Qt QJsonValue::toString() semantics: non-strings read as empty.
+std::string stringValue(const Json &value)
+{
+    return value.is_string() ? value.get<std::string>() : std::string();
+}
+
+std::string stringField(const Json &object, const char *key, const char *code,
+                        bool optional = false, bool nullable = false)
+{
+    const Json &value = field(object, key);
+    if ((optional && object.find(key) == object.end()) || (nullable && isNullish(value))) return {};
+    if (!value.is_string()) fail(code, std::string("Invalid string field: ") + key);
+    const std::string result = value.get<std::string>();
+    if (result.find('\0') != std::string::npos) fail(code, std::string("Embedded NUL in field: ") + key);
     return result;
 }
-void exactKeys(const QJsonObject &object, const QStringList &allowed, const QString &code)
+
+void exactKeys(const Json &object, std::initializer_list<const char *> allowed, const char *code)
 {
-    for (auto it = object.begin(); it != object.end(); ++it)
-        if (!allowed.contains(it.key())) fail(code, "Unexpected protocol field");
+    for (auto entry = object.begin(); entry != object.end(); ++entry) {
+        const std::string &key = entry.key();
+        bool known = false;
+        for (const char *candidate : allowed)
+            if (key == candidate) { known = true; break; }
+        if (!known) fail(code, "Unexpected protocol field");
+    }
 }
-QString canonicalFile(const QString &path)
+
+std::filesystem::path canonicalFile(const std::filesystem::path &path)
 {
-    const QFileInfo info(path);
-    if (!info.isAbsolute() || !info.isFile()) fail("CODEX_EXECUTABLE_MISSING", "Desktop executable is not an existing absolute file");
-    const auto canonical = info.canonicalFilePath();
-    if (canonical.isEmpty()) fail("CODEX_EXECUTABLE_INVALID", "Cannot resolve Desktop executable");
-    return canonical;
+    if (!path.is_absolute() || !std::filesystem::exists(path) || !std::filesystem::is_regular_file(path))
+        fail("CODEX_EXECUTABLE_MISSING", "Desktop executable is not an existing absolute file");
+    const auto canonical = canonicalPathOf(path, false);
+    if (!canonical) fail("CODEX_EXECUTABLE_INVALID", "Cannot resolve Desktop executable");
+    return *canonical;
 }
-bool within(const QString &root, const QString &path)
+
+bool supported(const std::string &name)
 {
-    const auto prefix = normalizedWindowsPath(root) + '/';
-    return normalizedWindowsPath(path).startsWith(prefix);
+    return name == "OpenAI.Codex" || name == "OpenAI.ChatGPT-Desktop";
 }
-bool supported(const QString &name) { return name == "OpenAI.Codex" || name == "OpenAI.ChatGPT-Desktop"; }
-QString runtime(const QJsonObject &app)
+
+std::string runtime(const Json &app)
 {
-    const auto entry = field(app, "entry_point", discoveryError, true);
-    if (entry.compare("Windows.FullTrustApplication", Qt::CaseInsensitive) == 0) return "full_trust_desktop";
-    if (entry.trimmed().isEmpty()
-        && field(app, "runtime_behavior", discoveryError, true, true).trimmed().isEmpty()
-        && field(app, "trust_level", discoveryError, true, true).trimmed().isEmpty()) return "unknown";
+    const std::string entry = stringField(app, "entry_point", discoveryError, true);
+    if (asciiEquals(entry, "Windows.FullTrustApplication")) return "full_trust_desktop";
+    if (asciiTrimmedUtf8(entry).empty()
+        && asciiTrimmedUtf8(stringField(app, "runtime_behavior", discoveryError, true, true)).empty()
+        && asciiTrimmedUtf8(stringField(app, "trust_level", discoveryError, true, true)).empty())
+        return "unknown";
     return "app_container";
 }
-void validateRecord(const QJsonObject &record)
+
+std::string toForwardSlashes(std::string path)
 {
-    for (const auto &key : {"package_name", "package_version", "install_location"})
-        (void)field(record, key, discoveryError);
-    for (const auto &key : {"package_full_name", "package_family_name", "architecture"})
-        (void)field(record, key, discoveryError, true);
-    const auto apps = record.value("applications");
-    if (!apps.isUndefined() && !apps.isArray()) fail(discoveryError, "Applications must be an array");
-    if (apps.toArray().size() > 16) fail(discoveryError, "Too many application records");
-    for (const auto &value : apps.toArray()) {
-        if (!value.isObject()) fail(discoveryError, "Application must be an object");
-        const auto app = value.toObject();
-        for (const auto &key : {"application_id", "manifest_executable", "entry_point"})
-            (void)field(app, key, discoveryError, true);
-        for (const auto &key : {"runtime_behavior", "trust_level"})
-            (void)field(app, key, discoveryError, true, true);
+    for (char &character : path) if (character == '\\') character = '/';
+    return path;
+}
+
+std::string baseName(const std::string &forwardPath)
+{
+    const std::size_t slash = forwardPath.rfind('/');
+    return slash == std::string::npos ? forwardPath : forwardPath.substr(slash + 1);
+}
+
+void validateRecord(const Json &record)
+{
+    for (const char *key : {"package_name", "package_version", "install_location"})
+        (void)stringField(record, key, discoveryError);
+    for (const char *key : {"package_full_name", "package_family_name", "architecture"})
+        (void)stringField(record, key, discoveryError, true);
+    const auto applications = record.find("applications");
+    if (applications != record.end()) {
+        if (!applications->is_array()) fail(discoveryError, "Applications must be an array");
+        if (applications->size() > 16) fail(discoveryError, "Too many application records");
+        for (const auto &value : *applications) {
+            if (!value.is_object()) fail(discoveryError, "Application must be an object");
+            for (const char *key : {"application_id", "manifest_executable", "entry_point"})
+                (void)stringField(value, key, discoveryError, true);
+            for (const char *key : {"runtime_behavior", "trust_level"})
+                (void)stringField(value, key, discoveryError, true, true);
+        }
     }
 }
-Desktop registeredDesktop(const QJsonObject &record)
+
+Desktop registeredDesktop(const Json &record)
 {
     Desktop desktop;
-    desktop.packageName = field(record, "package_name", discoveryError);
+    desktop.packageName = stringField(record, "package_name", discoveryError);
     desktop.product = desktop.packageName == "OpenAI.Codex" ? "chat_gpt" : "chat_gpt_classic";
     desktop.displayName = desktop.packageName == "OpenAI.Codex" ? "ChatGPT Desktop" : "ChatGPT Desktop (Classic)";
-    desktop.packageVersion = field(record, "package_version", discoveryError);
-    desktop.architecture = field(record, "architecture", discoveryError, true).trimmed();
-    if (desktop.architecture.isEmpty()) desktop.architecture = "unknown";
-    desktop.packageFullName = field(record, "package_full_name", discoveryError, true).trimmed();
-    desktop.packageFamilyName = field(record, "package_family_name", discoveryError, true).trimmed();
-    if (desktop.packageFullName.isEmpty() || desktop.packageFamilyName.isEmpty())
+    desktop.packageVersion = stringField(record, "package_version", discoveryError);
+    desktop.architecture = asciiTrimmedUtf8(stringField(record, "architecture", discoveryError, true));
+    if (desktop.architecture.empty()) desktop.architecture = "unknown";
+    desktop.packageFullName = asciiTrimmedUtf8(stringField(record, "package_full_name", discoveryError, true));
+    desktop.packageFamilyName = asciiTrimmedUtf8(stringField(record, "package_family_name", discoveryError, true));
+    if (desktop.packageFullName.empty() || desktop.packageFamilyName.empty())
         fail("APPX_METADATA_INCOMPLETE", "Package identity metadata is missing");
-    const QFileInfo root(field(record, "install_location", discoveryError));
-    if (!root.isAbsolute() || !root.isDir() || root.canonicalFilePath().isEmpty())
+    const std::filesystem::path root(utf8ToWide(stringField(record, "install_location", discoveryError)));
+    if (!root.is_absolute() || !std::filesystem::is_directory(root))
         fail("APPX_INSTALL_LOCATION_INVALID", "Package installation directory is unavailable");
-    desktop.installLocation = root.canonicalFilePath();
-    QJsonArray candidates;
-    for (const auto &value : record.value("applications").toArray()) {
-        const auto app = value.toObject();
-        const auto manifest = field(app, "manifest_executable", discoveryError, true);
-        QString relative = manifest;
-        relative.replace('\\', '/');
-        const bool trusted = desktop.packageName == "OpenAI.Codex"
-            ? field(app, "application_id", discoveryError, true) == "App"
-                && relative.compare("app/ChatGPT.exe", Qt::CaseInsensitive) == 0
-            : runtime(app) == "full_trust_desktop"
-                && relative.section('/', -1).compare("ChatGPT.exe", Qt::CaseInsensitive) == 0;
-        if (trusted) candidates.append(app);
+    const auto canonicalRoot = canonicalPathOf(root, true);
+    if (!canonicalRoot) fail("APPX_INSTALL_LOCATION_INVALID", "Package installation directory is unavailable");
+    desktop.installLocation = *canonicalRoot;
+    std::vector<Json> candidates;
+    const Json &apps = field(record, "applications");
+    if (apps.is_array()) {
+        for (const auto &value : apps) {
+            const std::string manifest = stringField(value, "manifest_executable", discoveryError, true);
+            const std::string relative = toForwardSlashes(manifest);
+            const bool trusted = desktop.packageName == "OpenAI.Codex"
+                ? stringField(value, "application_id", discoveryError, true) == "App"
+                    && asciiEquals(relative, "app/ChatGPT.exe")
+                : runtime(value) == "full_trust_desktop"
+                    && asciiEquals(baseName(relative), "ChatGPT.exe");
+            if (trusted) candidates.push_back(value);
+        }
     }
-    if (candidates.isEmpty()) fail("APPX_APPLICATION_MISSING", "No trusted Desktop application was found");
+    if (candidates.empty()) fail("APPX_APPLICATION_MISSING", "No trusted Desktop application was found");
     if (candidates.size() != 1) fail("APPX_APPLICATION_AMBIGUOUS", "Multiple trusted Desktop applications were found");
-    const auto app = candidates.first().toObject();
-    desktop.applicationId = field(app, "application_id", discoveryError, true).trimmed();
-    desktop.manifestExecutable = field(app, "manifest_executable", discoveryError, true).trimmed();
-    if (desktop.applicationId.isEmpty() || desktop.manifestExecutable.isEmpty())
+    const Json &app = candidates.front();
+    desktop.applicationId = asciiTrimmedUtf8(stringField(app, "application_id", discoveryError, true));
+    desktop.manifestExecutable = asciiTrimmedUtf8(stringField(app, "manifest_executable", discoveryError, true));
+    if (desktop.applicationId.empty() || desktop.manifestExecutable.empty())
         fail("APPX_METADATA_INCOMPLETE", "Application identity metadata is missing");
-    QString relative = desktop.manifestExecutable;
-    relative.replace('\\', '/');
-    if (relative.startsWith('/') || relative.contains(':') || relative.split('/').contains(".."))
+    const std::string relative = toForwardSlashes(desktop.manifestExecutable);
+    if (!relative.empty() && relative.front() == '/')
         fail("APPX_EXECUTABLE_INVALID", "Manifest executable must remain within the package directory");
-    desktop.executable = canonicalFile(QDir(desktop.installLocation).filePath(relative));
-    if (!within(desktop.installLocation, desktop.executable))
+    if (relative.find(':') != std::string::npos)
+        fail("APPX_EXECUTABLE_INVALID", "Manifest executable must remain within the package directory");
+    bool dotDot = false;
+    for (std::size_t position = 0; position + 1 < relative.size(); ++position)
+        if (relative[position] == '.' && relative[position + 1] == '.'
+            && (position + 2 == relative.size() || relative[position + 2] == '/'))
+            dotDot = true;
+    if (dotDot) fail("APPX_EXECUTABLE_INVALID", "Manifest executable must remain within the package directory");
+    desktop.executable = canonicalFile(desktop.installLocation / utf8ToWide(relative));
+    if (!pathWithin(desktop.installLocation, desktop.executable))
         fail("APPX_EXECUTABLE_INVALID", "Manifest executable resolves outside the package directory");
     desktop.aumid = desktop.packageFamilyName + '!' + desktop.applicationId;
     desktop.runtimeKind = runtime(app);
@@ -152,30 +212,34 @@ Desktop registeredDesktop(const QJsonObject &record)
     desktop.discoverySource = "appx_manifest";
     return desktop;
 }
-QString tokenElevation(HANDLE process)
+
+std::string tokenElevation(HANDLE process)
 {
     HANDLE raw = nullptr;
     if (!OpenProcessToken(process, TOKEN_QUERY, &raw)) return "unknown";
-    const Handle token(raw);
+    const UniqueHandle token(raw);
     TOKEN_ELEVATION result{};
     DWORD size = 0;
     if (!GetTokenInformation(token.get(), TokenElevation, &result, sizeof(result), &size)
         || size != sizeof(result)) return "unknown";
     return result.TokenIsElevated ? "elevated" : "not_elevated";
 }
-QString imagePath(HANDLE process)
+
+std::wstring imagePath(HANDLE process)
 {
     std::array<wchar_t, 32768> buffer{};
     DWORD size = static_cast<DWORD>(buffer.size());
     if (!QueryFullProcessImageNameW(process, 0, buffer.data(), &size)) return {};
-    return QString::fromWCharArray(buffer.data(), static_cast<int>(size));
+    return std::wstring(buffer.data(), size);
 }
-quint64 ticks(const FILETIME &time)
+
+std::uint64_t ticks(const FILETIME &time)
 {
-    return (static_cast<quint64>(time.dwHighDateTime) << 32) | time.dwLowDateTime;
+    return (static_cast<std::uint64_t>(time.dwHighDateTime) << 32) | time.dwLowDateTime;
 }
-void observeIdentity(HANDLE process, QJsonObject &receipt, const QString &expected,
-                     const QString &stateField, const QString &observedField, bool appId)
+
+void observeIdentity(HANDLE process, Json &receipt, const std::string &expected,
+                     const char *stateField, const char *observedField, bool appId)
 {
     UINT32 size = 0;
     auto query = appId ? GetApplicationUserModelId : GetPackageFullName;
@@ -195,26 +259,28 @@ void observeIdentity(HANDLE process, QJsonObject &receipt, const QString &expect
         receipt[stateField] = "query_failed";
         return;
     }
-    const auto text = QString::fromWCharArray(buffer.data(), static_cast<int>(size - 1));
-    if (text.contains(QChar::Null) || !text.isValidUtf16()) {
+    const std::string text = wideToUtf8(std::wstring(buffer.data(), size - 1));
+    if (text.find('\0') != std::string::npos || !strictUtf8(text)) {
         receipt[stateField] = "query_failed";
         return;
     }
     receipt[observedField] = text;
     receipt[stateField] = text == expected ? "matched" : "mismatch";
 }
-QJsonObject emptyReceipt()
+
+Json emptyReceipt()
 {
-    return {{"version", 1}, {"failure", QJsonValue::Null}, {"activation_returned", false},
-            {"activation_hresult", QJsonValue::Null}, {"pid", QJsonValue::Null},
-            {"instance", "unknown"}, {"package_identity", "not_queried"},
-            {"observed_package_full_name", QJsonValue::Null}, {"aumid", "not_queried"},
-            {"observed_aumid", QJsonValue::Null}, {"elevation", QJsonValue::Null},
-            {"early_exit_code", QJsonValue::Null}, {"observation_failure", QJsonValue::Null}};
+    return Json{{"version", 1}, {"failure", nullptr}, {"activation_returned", false},
+                {"activation_hresult", nullptr}, {"pid", nullptr},
+                {"instance", "unknown"}, {"package_identity", "not_queried"},
+                {"observed_package_full_name", nullptr}, {"aumid", "not_queried"},
+                {"observed_aumid", nullptr}, {"elevation", nullptr},
+                {"early_exit_code", nullptr}, {"observation_failure", nullptr}};
 }
-QJsonObject activateAndObserve(const QJsonObject &request)
+
+Json activateAndObserve(const Json &request)
 {
-    auto receipt = emptyReceipt();
+    Json receipt = emptyReceipt();
     const HRESULT initialized = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     if (FAILED(initialized)) {
         receipt["failure"] = "APPX_ACTIVATION_COM_INIT_FAILED: Cannot initialize COM";
@@ -223,7 +289,7 @@ QJsonObject activateAndObserve(const QJsonObject &request)
     struct ComScope { ~ComScope() { CoUninitialize(); } } comScope;
     IApplicationActivationManager *manager = nullptr;
     const HRESULT created = CoCreateInstance(CLSID_ApplicationActivationManager, nullptr,
-        CLSCTX_LOCAL_SERVER, IID_PPV_ARGS(&manager));
+                                             CLSCTX_LOCAL_SERVER, IID_PPV_ARGS(&manager));
     if (FAILED(created) || !manager) {
         receipt["failure"] = "APPX_ACTIVATION_MANAGER_UNAVAILABLE: Cannot create activation manager";
         return receipt;
@@ -231,177 +297,140 @@ QJsonObject activateAndObserve(const QJsonObject &request)
     struct ManagerScope { IApplicationActivationManager *value; ~ManagerScope() { value->Release(); } } managerScope{manager};
     FILETIME submitted{};
     GetSystemTimeAsFileTime(&submitted);
-    const auto aumid = request.value("aumid").toString();
-    const auto arguments = request.value("arguments").toString();
+    const std::string aumid = request.value("aumid", "");
+    const std::string arguments = request.value("arguments", "");
     DWORD pid = 0;
-    const HRESULT activated = manager->ActivateApplication(wide(aumid), wide(arguments), AO_NONE, &pid);
+    const std::wstring wideAumid = utf8ToWide(aumid);
+    const std::wstring wideArguments = utf8ToWide(arguments);
+    const HRESULT activated = manager->ActivateApplication(wideAumid.c_str(), wideArguments.c_str(),
+                                                           AO_NONE, &pid);
     if (FAILED(activated)) {
-        receipt["activation_hresult"] = QString("0x%1").arg(static_cast<quint32>(activated), 8, 16, QChar('0')).toUpper();
+        char buffer[16] = {};
+        std::snprintf(buffer, sizeof buffer, "0x%08X", static_cast<unsigned>(activated));
+        std::string text(buffer);
+        for (char &character : text) character = static_cast<char>(std::toupper(static_cast<unsigned char>(character)));
+        receipt["activation_hresult"] = text;
         return receipt;
     }
     receipt["activation_returned"] = true;
-    receipt["pid"] = static_cast<qint64>(pid);
-    const Handle process(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, pid));
+    receipt["pid"] = static_cast<std::uint64_t>(pid);
+    const UniqueHandle process(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, pid));
     if (!process.valid()) {
         receipt["package_identity"] = "query_failed";
         receipt["aumid"] = "query_failed";
         receipt["observation_failure"] = "APPX_TARGET_VERIFY_FAILED: Cannot open activated process";
         return receipt;
     }
-    observeIdentity(process.get(), receipt, request.value("expected_package_full_name").toString(),
+    observeIdentity(process.get(), receipt, request.value("expected_package_full_name", ""),
                     "package_identity", "observed_package_full_name", false);
     observeIdentity(process.get(), receipt, aumid, "aumid", "observed_aumid", true);
-    const auto elevated = tokenElevation(process.get());
+    const std::string elevated = tokenElevation(process.get());
     if (elevated != "unknown") receipt["elevation"] = elevated == "elevated";
     FILETIME creation{}, exited{}, kernel{}, user{};
     if (GetProcessTimes(process.get(), &creation, &exited, &kernel, &user))
         receipt["instance"] = ticks(creation) + 250ULL * 10000ULL < ticks(submitted) ? "reused" : "created";
     else receipt["observation_failure"] = "APPX_TARGET_TIME_QUERY_FAILED: Cannot query process creation time";
-    const auto actualPath = imagePath(process.get());
-    if (!actualPath.isEmpty() && normalizedWindowsPath(actualPath)
-        != normalizedWindowsPath(request.value("expected_executable").toString()))
+    const std::wstring actualPath = imagePath(process.get());
+    if (!actualPath.empty()
+        && normalizedWindowsPath(actualPath) != normalizedWindowsPath(utf8ToWide(request.value("expected_executable", ""))))
         receipt["observation_failure"] = "APPX_TARGET_IMAGE_MISMATCH: Activated executable differs from selected Desktop";
     const DWORD wait = WaitForSingleObject(process.get(), 150);
     if (wait == WAIT_OBJECT_0) {
         DWORD code = 0;
-        if (GetExitCodeProcess(process.get(), &code)) receipt["early_exit_code"] = static_cast<qint64>(code);
+        if (GetExitCodeProcess(process.get(), &code)) receipt["early_exit_code"] = static_cast<std::uint64_t>(code);
         else receipt["observation_failure"] = "APPX_TARGET_EXIT_QUERY_FAILED: Cannot query early exit";
     } else if (wait != WAIT_TIMEOUT) {
         receipt["observation_failure"] = "APPX_TARGET_WAIT_FAILED: Cannot observe target lifetime";
     }
     return receipt;
 }
-bool unsignedNumber(const QJsonValue &value, bool zeroAllowed)
+
+bool unsignedNumber(const Json &value, bool zeroAllowed)
 {
-    if (!value.isDouble()) return false;
-    const auto number = value.toDouble();
+    if (value.is_number_unsigned()) {
+        const std::uint64_t number = value.get<std::uint64_t>();
+        return number >= (zeroAllowed ? 0 : 1) && number <= 0xffffffffull;
+    }
+    if (value.is_number_integer()) {
+        const std::int64_t number = value.get<std::int64_t>();
+        return number >= (zeroAllowed ? 0 : 1) && number <= 0xffffffffll;
+    }
+    if (!value.is_number_float()) return false;
+    const double number = value.get<double>();
     return std::isfinite(number) && std::floor(number) == number
-        && number >= (zeroAllowed ? 0 : 1) && number <= std::numeric_limits<quint32>::max();
+        && number >= (zeroAllowed ? 0 : 1) && number <= 0xffffffffull;
 }
+} // namespace
+
+HelperResult runHelper(const std::filesystem::path &program,
+                       const std::vector<std::wstring> &arguments,
+                       std::string_view input, const Cancellation &cancel,
+                       std::chrono::milliseconds timeout, std::size_t outputLimit,
+                       const UnicodeEnvironment &environment, bool activationSubmission)
+{
+    ProcessRequest request;
+    request.program = program;
+    request.arguments = arguments;
+    request.stdinBytes = std::string(input);
+    request.environment = environment;
+    request.timeout = timeout;
+    request.stdoutLimit = outputLimit;
+    request.stderrLimit = outputLimit;
+    request.createNoWindow = true;
+    request.activationSubmission = activationSubmission;
+    const ProcessResult result = runOwnedProcess(request, cancel);
+    return {result.out, result.err, result.exitCode, result.submitted};
 }
 
-QString normalizedWindowsPath(const QString &path)
+Json Desktop::publicJson() const
 {
-    QString result = path;
-    result.replace('\\', '/');
-    if (result.startsWith("//?/UNC/", Qt::CaseInsensitive)) result = "//" + result.mid(8);
-    else if (result.startsWith("//?/")) result = result.mid(4);
-    return QDir::cleanPath(result).toCaseFolded();
+    return Json{{"state", "found"}, {"product", product}, {"display_name", displayName},
+                {"package_version", publicText(packageVersion)}, {"architecture", publicText(architecture)},
+                {"application_id", registered ? Json(publicText(applicationId)) : Json(nullptr)},
+                {"manifest_executable", registered ? Json(publicText(manifestExecutable)) : Json(nullptr)},
+                {"runtime_kind", registered ? Json(runtimeKind) : Json(nullptr)}};
 }
-QJsonObject Desktop::publicJson() const
-{
-    return {{"state", "found"}, {"product", product}, {"display_name", displayName},
-            {"package_version", publicText(packageVersion)}, {"architecture", publicText(architecture)},
-            {"application_id", registered ? QJsonValue(publicText(applicationId)) : QJsonValue(QJsonValue::Null)},
-            {"manifest_executable", registered ? QJsonValue(publicText(manifestExecutable)) : QJsonValue(QJsonValue::Null)},
-            {"runtime_kind", registered ? QJsonValue(runtimeKind) : QJsonValue(QJsonValue::Null)}};
-}
-QString elevation() { return tokenElevation(GetCurrentProcess()); }
+
+std::string elevation() { return tokenElevation(GetCurrentProcess()); }
+
 void requireNonElevated()
 {
-    const auto state = elevation();
+    const std::string state = elevation();
     if (state == "elevated") fail("GUARD_ELEVATED", "Launch requires a non-elevated Guard process");
     if (state != "not_elevated") fail("GUARD_ELEVATION_QUERY_FAILED", "Cannot verify that Guard is not elevated");
 }
-HelperResult runHelper(const QString &program, const QStringList &arguments, const QByteArray &input,
-                       const Cancellation &cancel, int timeoutMs, qsizetype outputLimit,
-                       const QProcessEnvironment &environment, bool activationSubmission)
-{
-    cancel.check();
-    if (timeoutMs <= 0 || outputLimit <= 0 || input.size() > receiptLimit)
-        fail("HELPER_BUDGET_INVALID", "Invalid helper input or budget");
-    QProcess child;
-    child.setProgram(program);
-    child.setArguments(arguments);
-    child.setProcessEnvironment(environment);
-    child.setProcessChannelMode(QProcess::SeparateChannels);
-    child.setCreateProcessArgumentsModifier([](QProcess::CreateProcessArguments *args) {
-        args->flags |= CREATE_NO_WINDOW;
-    });
-    HelperResult result;
-    QElapsedTimer timer;
-    timer.start();
-    const auto stop = [&child] {
-        if (child.state() != QProcess::NotRunning) {
-            child.kill(); // TerminateProcess on this owned direct child only.
-            (void)child.waitForFinished(3000);
-        }
-    };
-    const auto abort = [&](const QString &code, const QString &message) -> void {
-        stop();
-        if (activationSubmission && result.submitted)
-            fail("APPX_ACTIVATION_OUTCOME_UNKNOWN", "Activation request was submitted; refresh Desktop state before retrying. " + message);
-        fail(code, message);
-    };
-    const auto check = [&] {
-        if (cancel.cancelled()) abort("LAUNCH_CANCELLED", "Operation cancelled");
-        if (timer.elapsed() >= timeoutMs) abort("HELPER_TIMEOUT", "Owned helper exceeded its time budget");
-    };
-    const auto drain = [&] {
-        const auto out = child.readAllStandardOutput();
-        const auto err = child.readAllStandardError();
-        if (out.size() > outputLimit - result.out.size() || err.size() > outputLimit - result.err.size())
-            abort("HELPER_OUTPUT_LIMIT", "Owned helper exceeded its output budget");
-        result.out += out;
-        result.err += err;
-    };
-    child.start();
-    while (child.state() == QProcess::Starting) {
-        check();
-        (void)child.waitForStarted(20);
-    }
-    if (child.state() == QProcess::NotRunning) abort("HELPER_START_FAILED", "Cannot start owned helper");
-    check();
-    if (!input.isEmpty()) {
-        const qint64 accepted = child.write(input);
-        if (accepted == input.size()) result.submitted = true;
-        if (accepted != input.size()) abort("HELPER_IO_FAILED", "Cannot deliver complete helper request");
-        while (child.bytesToWrite() > 0 && child.state() != QProcess::NotRunning) {
-            check();
-            (void)child.waitForBytesWritten(20);
-            drain();
-        }
-    }
-    child.closeWriteChannel();
-    while (child.state() != QProcess::NotRunning) {
-        check();
-        (void)child.waitForReadyRead(20);
-        drain();
-    }
-    drain();
-    check();
-    result.exitCode = child.exitStatus() == QProcess::NormalExit ? child.exitCode() : -1;
-    return result;
-}
 
-Desktop parseDiscovery(const QByteArray &json, const QString &overrideExecutable)
+Desktop parseDiscovery(const std::string &json, const std::filesystem::path &overrideExecutable)
 {
-    const auto envelope = parseJsonObject(json, 64 * 1024, discoveryError);
-    if (!envelope.value("schema_version").isDouble() || envelope.value("schema_version").toDouble() != 1)
+    const Json envelope = parseStrictJsonObject(json, 64 * 1024, discoveryError);
+    const Json &schema = field(envelope, "schema_version");
+    if (!schema.is_number() || schema.get<double>() != 1)
         fail("APPX_DISCOVERY_PROTOCOL_UNSUPPORTED", "Unsupported APPX discovery schema");
-    const auto recordsValue = envelope.value("records");
-    if (!recordsValue.isArray()) fail(discoveryError, "Discovery records must be an array");
-    const auto records = recordsValue.toArray();
+    const Json &recordsValue = field(envelope, "records");
+    if (!recordsValue.is_array()) fail(discoveryError, "Discovery records must be an array");
+    const Json &records = recordsValue;
     if (records.size() > 16) fail(discoveryError, "Too many package records");
     for (const auto &value : records) {
-        if (!value.isObject()) fail(discoveryError, "Package record must be an object");
-        validateRecord(value.toObject());
+        if (!value.is_object()) fail(discoveryError, "Package record must be an object");
+        validateRecord(value);
     }
-    if (!overrideExecutable.isEmpty()) {
-        const auto executable = canonicalFile(overrideExecutable);
+    if (!overrideExecutable.empty()) {
+        const std::filesystem::path executable = canonicalFile(overrideExecutable);
         for (const auto &value : records) {
-            const auto record = value.toObject();
-            if (!supported(record.value("package_name").toString())) continue;
-            const auto root = QFileInfo(record.value("install_location").toString()).canonicalFilePath();
-            if (root.isEmpty() || !within(root, executable)) continue;
-            auto result = registeredDesktop(record);
-            if (normalizedWindowsPath(executable) != normalizedWindowsPath(result.executable))
+            const std::string name = value.value("package_name", "");
+            if (!supported(name)) continue;
+            const std::filesystem::path root(utf8ToWide(value.value("install_location", "")));
+            const auto canonicalRoot = root.empty() ? std::nullopt : canonicalPathOf(root, true);
+            if (!canonicalRoot || !pathWithin(*canonicalRoot, executable)) continue;
+            Desktop result = registeredDesktop(value);
+            if (normalizedWindowsPath(executable.wstring())
+                != normalizedWindowsPath(result.executable.wstring()))
                 fail("APPX_OVERRIDE_INVALID", "Override is inside a package but is not its registered Desktop entry");
             result.discoverySource = "executable_override";
             return result;
         }
         // A package path can never become a bare executable by omitting discovery metadata.
-        if (normalizedWindowsPath(executable).contains("/windowsapps/"))
+        if (normalizedWindowsPath(executable.wstring()).find(L"/windowsapps/") != std::wstring::npos)
             fail("APPX_OVERRIDE_INVALID", "Package executable requires registered discovery metadata");
         Desktop result;
         result.product = "executable_override";
@@ -411,54 +440,61 @@ Desktop parseDiscovery(const QByteArray &json, const QString &overrideExecutable
         result.architecture = "manual";
         result.discoverySource = "executable_override";
         result.executable = executable;
-        result.installLocation = QFileInfo(executable).absolutePath();
+        result.installLocation = executable.parent_path();
         return result;
     }
-    for (const auto &name : {"OpenAI.Codex", "OpenAI.ChatGPT-Desktop"}) {
+    for (const char *name : {"OpenAI.Codex", "OpenAI.ChatGPT-Desktop"}) {
         for (const auto &value : records) {
-            const auto record = value.toObject();
-            if (record.value("package_name").toString() == name) return registeredDesktop(record);
+            if (value.value("package_name", "") == name) return registeredDesktop(value);
         }
     }
     fail("CODEX_NOT_INSTALLED", "No supported Desktop package is installed");
 }
+
 Desktop discoverDesktop(const Config &config, const Cancellation &cancel)
 {
     cancel.check();
-    QFile resource(":/resources/appx-discovery.ps1");
-    if (!resource.open(QIODevice::ReadOnly)) fail("APPX_DISCOVERY_FAILED", "Discovery resource is unavailable");
-    const auto script = resource.read(64 * 1024 + 1);
-    if (script.size() > 64 * 1024 || !strictUtf8(script)) fail("APPX_DISCOVERY_FAILED", "Invalid discovery resource");
+    const std::size_t scriptSize = std::strlen(discoveryScript);
+    if (scriptSize > 64 * 1024 || !strictUtf8(std::string_view(discoveryScript, scriptSize)))
+        fail("APPX_DISCOVERY_FAILED", "Invalid discovery resource");
     std::array<wchar_t, MAX_PATH + 1> buffer{};
     const UINT size = GetSystemDirectoryW(buffer.data(), static_cast<UINT>(buffer.size()));
     if (!size || size >= buffer.size()) fail("APPX_DISCOVERY_FAILED", "Cannot resolve system PowerShell");
-    const QString powershell = QString::fromWCharArray(buffer.data(), static_cast<int>(size))
-        + "/WindowsPowerShell/v1.0/powershell.exe";
-    const auto result = runHelper(powershell, {"-NoLogo", "-NoProfile", "-NonInteractive", "-Command", QString::fromUtf8(script)},
-                                  {}, cancel, 15000, 128 * 1024);
+    const std::filesystem::path powershell = std::filesystem::path(std::wstring(buffer.data(), size))
+        / L"WindowsPowerShell" / L"v1.0" / L"powershell.exe";
+    const HelperResult result = runHelper(powershell,
+        {L"-NoLogo", L"-NoProfile", L"-NonInteractive", L"-Command", utf8ToWide(std::string_view(discoveryScript, scriptSize))},
+        {}, cancel, std::chrono::milliseconds(15000), 128 * 1024);
     if (result.out.size() > 64 * 1024) fail("APPX_DISCOVERY_OUTPUT_LIMIT", "Discovery output exceeded 64 KiB");
     if (result.exitCode != 0) fail("APPX_DISCOVERY_FAILED", "System PowerShell discovery failed");
     return parseDiscovery(result.out, config.executableOverride);
 }
+
 ProcessState desktopProcessState(const Desktop &desktop)
 {
-    const Handle snapshot(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0));
+    const UniqueHandle snapshot(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0));
     if (!snapshot.valid()) return {};
     PROCESSENTRY32W entry{};
     entry.dwSize = sizeof(entry);
     if (!Process32FirstW(snapshot.get(), &entry)) return {};
-    struct Candidate { DWORD pid; DWORD parent; QString path; };
+    struct Candidate { DWORD pid; DWORD parent; std::wstring path; };
     std::vector<Candidate> candidates;
     bool unknown = false;
-    const auto targetName = QFileInfo(desktop.executable).fileName();
+    const std::wstring targetName = desktop.executable.filename().wstring();
     do {
-        if (QString::fromWCharArray(entry.szExeFile).compare(targetName, Qt::CaseInsensitive) != 0) continue;
-        const Handle process(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, entry.th32ProcessID));
+        const std::wstring name(entry.szExeFile);
+        if (name.size() != targetName.size()) continue;
+        bool same = true;
+        for (std::size_t index = 0; index < name.size(); ++index)
+            if (towlower(name[index]) != towlower(targetName[index])) { same = false; break; }
+        if (!same) continue;
+        const UniqueHandle process(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE,
+                                               entry.th32ProcessID));
         if (!process.valid()) { unknown = true; continue; }
         if (WaitForSingleObject(process.get(), 0) == WAIT_OBJECT_0) continue;
-        const auto path = imagePath(process.get());
-        if (path.isEmpty()) { unknown = true; continue; }
-        if (normalizedWindowsPath(path) == normalizedWindowsPath(desktop.executable))
+        const std::wstring path = imagePath(process.get());
+        if (path.empty()) { unknown = true; continue; }
+        if (normalizedWindowsPath(path) == normalizedWindowsPath(desktop.executable.wstring()))
             candidates.push_back({entry.th32ProcessID, entry.th32ParentProcessID, path});
     } while (Process32NextW(snapshot.get(), &entry));
     if (GetLastError() != ERROR_NO_MORE_FILES) return {};
@@ -469,123 +505,171 @@ ProcessState desktopProcessState(const Desktop &desktop)
         });
         if (!child) return {"running", candidate.pid};
     }
-    return {unknown || !candidates.empty() ? "unknown" : "stopped", 0};
+    return {(unknown || !candidates.empty()) ? "unknown" : "stopped", 0};
 }
 
 namespace detail {
-QJsonObject activationRequest(const QByteArray &bytes)
+Json activationRequest(const std::string &bytes)
 {
-    auto request = parseJsonObject(bytes, requestLimit, activationError);
-    exactKeys(request, {"version", "aumid", "expected_package_full_name", "expected_executable", "arguments"}, activationError);
-    if (request.value("version").toDouble(-1) != 1) fail(activationError, "Unsupported activation protocol version");
-    const auto aumid = field(request, "aumid", activationError);
-    const auto package = field(request, "expected_package_full_name", activationError);
-    const auto executable = field(request, "expected_executable", activationError);
-    const auto arguments = field(request, "arguments", activationError);
-    static const QRegularExpression identity("^[!-~]+$");
-    if (aumid.size() > 2048 || !identity.match(aumid).hasMatch() || aumid.count('!') != 1
-        || aumid.startsWith('!') || aumid.endsWith('!')) fail(activationError, "Invalid application identity");
-    if (package.size() > 1024 || !identity.match(package).hasMatch()) fail(activationError, "Invalid package identity");
-    if (executable.isEmpty() || !QFileInfo(executable).isAbsolute()) fail(activationError, "Expected executable must be absolute");
+    Json request = parseStrictJsonObject(bytes, requestLimit, activationError);
+    exactKeys(request, {"version", "aumid", "expected_package_full_name", "expected_executable", "arguments"},
+              activationError);
+    if (!field(request, "version").is_number() || field(request, "version").get<double>() != 1)
+        fail(activationError, "Unsupported activation protocol version");
+    const std::string aumid = stringField(request, "aumid", activationError);
+    const std::string package = stringField(request, "expected_package_full_name", activationError);
+    const std::string executable = stringField(request, "expected_executable", activationError);
+    const std::string arguments = stringField(request, "arguments", activationError);
+    // Identity strings (AUMID, package full name) are restricted to the
+    // printable non-space ASCII range of the previous validation regex.
+    const auto identityPrintable = [](const std::string &value) {
+        for (const char character : value)
+            if (static_cast<unsigned char>(character) < 0x21
+                || static_cast<unsigned char>(character) > 0x7e) return false;
+        return true;
+    };
+    // Activation arguments allow a space but no other control or non-ASCII.
+    const auto argumentPrintable = [](const std::string &value) {
+        for (const char character : value)
+            if (static_cast<unsigned char>(character) < 0x20
+                || static_cast<unsigned char>(character) > 0x7e) return false;
+        return true;
+    };
+    const auto exclamations = [](const std::string &value) {
+        std::size_t count = 0;
+        for (const char character : value) if (character == '!') ++count;
+        return count;
+    };
+    if (aumid.size() > 2048 || !identityPrintable(aumid) || exclamations(aumid) != 1
+        || aumid.front() == '!' || aumid.back() == '!')
+        fail(activationError, "Invalid application identity");
+    if (package.size() > 1024 || !identityPrintable(package)) fail(activationError, "Invalid package identity");
+    if (executable.empty() || !std::filesystem::path(utf8ToWide(executable)).is_absolute())
+        fail(activationError, "Expected executable must be absolute");
     if (arguments.size() > 4096) fail(activationError, "Activation arguments exceed 4 KiB");
-    for (const auto c : arguments)
-        if (c.unicode() < 0x20 || c.unicode() > 0x7e) fail(activationError, "Activation arguments must be printable ASCII");
+    if (!argumentPrintable(arguments)) fail(activationError, "Activation arguments must be printable ASCII");
     return request;
 }
-QJsonObject activationReceipt(const QByteArray &bytes)
+
+Json activationReceipt(const std::string &bytes)
 {
-    const auto receipt = parseJsonObject(bytes, receiptLimit, activationError);
-    const auto shape = emptyReceipt();
-    exactKeys(receipt, shape.keys(), activationError);
-    if (receipt.keys() != shape.keys() || receipt.value("version").toDouble(-1) != 1
-        || !receipt.value("activation_returned").isBool()) fail(activationError, "Invalid activation receipt shape");
-    for (const auto &key : {"failure", "activation_hresult", "observed_package_full_name", "observed_aumid", "observation_failure"})
-        (void)field(receipt, key, activationError, false, true);
-    for (const auto &key : {"pid", "early_exit_code"}) {
-        const auto value = receipt.value(key);
-        if (!value.isNull() && !unsignedNumber(value, QString(key) == "early_exit_code"))
+    const Json receipt = parseStrictJsonObject(bytes, receiptLimit, activationError);
+    const Json shape = emptyReceipt();
+    exactKeys(receipt, {"version", "failure", "activation_returned", "activation_hresult", "pid",
+                        "instance", "package_identity", "observed_package_full_name", "aumid",
+                        "observed_aumid", "elevation", "early_exit_code", "observation_failure"},
+              activationError);
+    for (const char *key : {"version", "failure", "activation_returned", "activation_hresult", "pid",
+                            "instance", "package_identity", "observed_package_full_name", "aumid",
+                            "observed_aumid", "elevation", "early_exit_code", "observation_failure"})
+        if (receipt.find(key) == receipt.end()) fail(activationError, "Invalid activation receipt shape");
+    if (field(receipt, "version") != field(shape, "version")
+        || !field(receipt, "activation_returned").is_boolean())
+        fail(activationError, "Invalid activation receipt shape");
+    for (const char *key : {"failure", "activation_hresult", "observed_package_full_name",
+                            "observed_aumid", "observation_failure"})
+        (void)stringField(receipt, key, activationError, false, true);
+    for (const char *key : {"pid", "early_exit_code"}) {
+        const Json &value = field(receipt, key);
+        if (!value.is_null() && !unsignedNumber(value, std::string(key) == "early_exit_code"))
             fail(activationError, "Invalid process identifier or exit code");
     }
-    if (!receipt.value("elevation").isNull() && !receipt.value("elevation").isBool())
+    const Json &elevationField = field(receipt, "elevation");
+    if (!elevationField.is_null() && !elevationField.is_boolean())
         fail(activationError, "Invalid target elevation");
-    if (!QStringList{"unknown", "created", "reused"}.contains(receipt.value("instance").toString()))
+    const std::string instance = stringValue(field(receipt, "instance"));
+    if (instance != "unknown" && instance != "created" && instance != "reused")
         fail(activationError, "Invalid instance observation");
-    for (const auto &key : {"package_identity", "aumid"})
-        if (!QStringList{"not_queried", "matched", "missing", "mismatch", "query_failed"}.contains(receipt.value(key).toString()))
+    for (const char *key : {"package_identity", "aumid"}) {
+        const std::string observation = stringValue(field(receipt, key));
+        if (observation != "not_queried" && observation != "matched" && observation != "missing"
+            && observation != "mismatch" && observation != "query_failed")
             fail(activationError, "Invalid identity observation");
-    const bool returned = receipt.value("activation_returned").toBool();
-    if (returned != !receipt.value("pid").isNull()
-        || (returned && (!receipt.value("failure").isNull() || !receipt.value("activation_hresult").isNull())))
+    }
+    const bool returned = field(receipt, "activation_returned").get<bool>();
+    if (returned != !field(receipt, "pid").is_null()
+        || (returned && (!field(receipt, "failure").is_null()
+                         || !field(receipt, "activation_hresult").is_null())))
         fail(activationError, "Contradictory activation facts");
     return receipt;
 }
-}
-QJsonObject activateDesktop(const Desktop &desktop, const QString &arguments, const Cancellation &cancel)
+} // namespace detail
+
+Json activateDesktop(const Desktop &desktop, const std::string &arguments, const Cancellation &cancel)
 {
     if (!desktop.registered) fail(activationError, "Application activation requires a registered target");
     requireNonElevated();
-    const QJsonObject request{{"version", 1}, {"aumid", desktop.aumid},
-        {"expected_package_full_name", desktop.packageFullName}, {"expected_executable", desktop.executable},
+    const Json request{{"version", 1}, {"aumid", desktop.aumid},
+        {"expected_package_full_name", desktop.packageFullName},
+        {"expected_executable", wideToUtf8(desktop.executable.wstring())},
         {"arguments", arguments}};
-    const auto bytes = QJsonDocument(request).toJson(QJsonDocument::Compact);
+    const std::string bytes = jsonDump(request);
     (void)detail::activationRequest(bytes);
-    const auto result = runHelper(QCoreApplication::applicationFilePath(), {"internal-activate-package"},
-                                  bytes, cancel, 30000, receiptLimit, QProcessEnvironment::systemEnvironment(), true);
-    QJsonObject receipt;
+    const HelperResult result = runHelper(currentExecutablePath(), {L"internal-activate-package"},
+                                          bytes, cancel, std::chrono::milliseconds(30000),
+                                          receiptLimit, UnicodeEnvironment::current(), true);
+    Json receipt;
     try {
         if (result.exitCode != 0) fail(activationError, "Activation worker exited without a successful receipt");
         receipt = detail::activationReceipt(result.out);
     } catch (const Error &) {
         fail("APPX_ACTIVATION_OUTCOME_UNKNOWN", "Activation request was submitted but the receipt is unavailable or invalid; refresh Desktop state");
     }
-    if (!receipt.value("failure").isNull()) {
-        const auto message = receipt.value("failure").toString();
+    if (!field(receipt, "failure").is_null()) {
+        const std::string message = receipt.value("failure", "");
         fail("APPX_ACTIVATION_WORKER_FAILED", publicText(message));
     }
     return receipt;
 }
+
 int activationWorker()
 {
     try {
         const HANDLE input = GetStdHandle(STD_INPUT_HANDLE);
         const auto type = GetFileType(input);
-        if (type != FILE_TYPE_PIPE && type != FILE_TYPE_DISK) fail(activationError, "Worker requires bounded redirected input");
-        QElapsedTimer timer;
-        timer.start();
-        QByteArray bytes;
+        if (type != FILE_TYPE_PIPE && type != FILE_TYPE_DISK)
+            fail(activationError, "Worker requires bounded redirected input");
+        const auto started = std::chrono::steady_clock::now();
+        std::string bytes;
         std::array<char, 4096> buffer{};
         for (;;) {
-            if (timer.elapsed() >= 30000) fail(activationError, "Worker request read timed out");
+            if (std::chrono::steady_clock::now() - started >= std::chrono::seconds(30))
+                fail(activationError, "Worker request read timed out");
             DWORD available = static_cast<DWORD>(buffer.size());
             if (type == FILE_TYPE_PIPE) {
                 if (!PeekNamedPipe(input, nullptr, 0, nullptr, &available, nullptr)) {
                     if (GetLastError() == ERROR_BROKEN_PIPE) break;
                     fail(activationError, "Cannot read worker input");
                 }
-                if (!available) { QThread::msleep(10); continue; }
+                if (!available) { Sleep(10); continue; }
             }
             DWORD count = 0;
-            if (!ReadFile(input, buffer.data(), std::min(available, static_cast<DWORD>(buffer.size())), &count, nullptr)) {
+            if (!ReadFile(input, buffer.data(),
+                          static_cast<DWORD>(std::min<DWORD>(available, static_cast<DWORD>(buffer.size()))),
+                          &count, nullptr)) {
                 if (GetLastError() == ERROR_BROKEN_PIPE) break;
                 fail(activationError, "Cannot read worker input");
             }
             if (!count) break;
-            bytes.append(buffer.data(), static_cast<qsizetype>(count));
+            bytes.append(buffer.data(), count);
             if (bytes.size() > requestLimit) fail(activationError, "Worker request exceeds 16 KiB");
         }
-        const auto request = detail::activationRequest(bytes);
+        const Json request = detail::activationRequest(bytes);
         requireNonElevated();
-        const auto receipt = activateAndObserve(request);
-        const auto output = QJsonDocument(receipt).toJson(QJsonDocument::Compact) + '\n';
+        const Json receipt = activateAndObserve(request);
+        const std::string output = jsonDump(receipt) + "\n";
         DWORD written = 0;
-        if (!WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), output.constData(), static_cast<DWORD>(output.size()), &written, nullptr)
+        if (!WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), output.data(),
+                       static_cast<DWORD>(output.size()), &written, nullptr)
             || written != static_cast<DWORD>(output.size())) return 1;
         return 0;
     } catch (const Error &error) {
-        const auto output = (error.code + ": " + publicText(error.message) + '\n').toUtf8();
+        const std::string output = error.code + ": " + publicText(error.message) + "\n";
         DWORD written = 0;
-        (void)WriteFile(GetStdHandle(STD_ERROR_HANDLE), output.constData(), static_cast<DWORD>(output.size()), &written, nullptr);
+        (void)WriteFile(GetStdHandle(STD_ERROR_HANDLE), output.data(),
+                        static_cast<DWORD>(output.size()), &written, nullptr);
         return 1;
     }
 }
-}
+
+} // namespace cpg

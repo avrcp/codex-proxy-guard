@@ -1,20 +1,27 @@
 #pragma once
+
 #include "launch.h"
+
+#include <chrono>
 #include <future>
 #include <optional>
-#include <QElapsedTimer>
+#include <string>
+#include <vector>
 
 namespace cpg {
+
 // Candidate validation/authorization is synchronous; exactly one committed
 // effect executes off-thread. Results are applied only by the session owner.
+// Interim migration component: the TUI session (session.h) extracts the
+// transport-free half; both are deleted together with the bridge role.
 class BridgeSession {
 public:
-    explicit BridgeSession(QString path,
+    explicit BridgeSession(std::filesystem::path path,
         std::function<Desktop(const Config &, const Cancellation &)> discovery = discoverDesktop,
-        std::function<QString()> queryElevation = elevation);
+        std::function<std::string()> queryElevation = elevation);
     ~BridgeSession();
-    QList<QJsonObject> request(const QByteArray &frame);
-    QList<QJsonObject> poll();
+    std::vector<Json> request(const std::string &frame);
+    std::vector<Json> poll();
     void cancel();
     bool closed() const { return closed_; }
     bool busy() const { return pending_; }
@@ -25,26 +32,28 @@ private:
         bool snapshot = false;
         std::optional<Desktop> desktop;
         ProcessState process;
-        QString coverage = "unknown";
-        QJsonObject value;
+        std::string coverage = "unknown";
+        Json value = Json(nullptr);
         std::optional<Error> error;
     };
-    QString path_;
+    std::filesystem::path path_;
     std::function<Desktop(const Config &, const Cancellation &)> discovery_;
-    std::function<QString()> queryElevation_;
+    std::function<std::string()> queryElevation_;
     Result state_;
     bool hello_ = false, closed_ = false, pending_ = false, launching_ = false;
-    qint64 lastId_ = 0, pendingId_ = 0, operation_ = 0;
-    QString consentToken_, repairToken_, confirmedHome_;
+    std::int64_t lastId_ = 0, pendingId_ = 0, operation_ = 0;
+    std::string consentToken_, repairToken_;
+    std::filesystem::path confirmedHome_;
     Config confirmedConfig_;
     Cancellation cancellation_;
     std::future<Result> task_;
-    QElapsedTimer timer_;
+    std::chrono::steady_clock::time_point timer_;
     void invalidate();
     void confirmations();
-    QJsonObject snapshot() const;
-    void dispatch(qint64 id, bool launch, std::function<Result()> effect);
+    Json snapshot() const;
+    void dispatch(std::int64_t id, bool launch, std::function<Result()> effect);
     Result refresh(const Cancellation &cancel) const;
 };
-int runBridge(const QString &configPath);
-}
+int runBridge(const std::filesystem::path &configPath);
+
+} // namespace cpg

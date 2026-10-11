@@ -1,9 +1,11 @@
 #pragma once
-#include <QByteArray>
-#include <QJsonObject>
+
+#include "core.h"
 
 namespace cpg::detail {
+
 // Pure protocol validators; exposed privately for side-effect-free fixtures.
-QJsonObject activationRequest(const QByteArray &bytes);
-QJsonObject activationReceipt(const QByteArray &bytes);
-}
+Json activationRequest(const std::string &bytes);
+Json activationReceipt(const std::string &bytes);
+
+} // namespace cpg::detail

@@ -22,8 +22,8 @@ add_library(guard_gui STATIC
     src/ui/theme.cpp src/ui/theme.h
     src/ui/widgets/info_row.cpp src/ui/widgets/info_row.h
 )
-target_include_directories(guard_gui PUBLIC src)
-target_link_libraries(guard_gui PUBLIC Qt6::Core Qt6::Gui Qt6::Widgets)
+target_include_directories(guard_gui PUBLIC src ${CMAKE_SOURCE_DIR}/foundation/include)
+target_link_libraries(guard_gui PUBLIC Qt6::Core Qt6::Gui Qt6::Widgets guard_foundation)
 target_compile_definitions(guard_gui PUBLIC
     CPG_PRODUCT_VERSION="${CPG_PRODUCT_VERSION}"
     CPG_BUILD_COMMIT="${CPG_BUILD_COMMIT}"

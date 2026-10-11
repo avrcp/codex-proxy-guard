@@ -6,15 +6,15 @@ option(CPG_DISABLE_QT_GUI "Never build the interim legacy Qt GUI/bridge regressi
 if(CPG_STATIC_QT)
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
-project(CodexProxyGuard VERSION 0.6.1 LANGUAGES CXX)
+project(CodexProxyGuard VERSION 0.6.1 LANGUAGES CXX RC)
 if(NOT WIN32)
     message(FATAL_ERROR "Codex Proxy Guard requires Windows.")
 endif()
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Interim migration state: the no-Qt product (foundation + migrated engine)
-# is the default build; the legacy Qt GUI/bridge stays buildable as a
-# regression client only while a matching dynamic Qt 6.8 SDK is present and
+# is the default build; the legacy Qt GUI stays buildable as a regression
+# client only while a matching dynamic Qt 6.8 SDK is present and
 # CPG_DISABLE_QT_GUI is off.
 find_package(Qt6 6.8 QUIET COMPONENTS Core Gui Widgets)
 set(CPG_QT_GUI OFF)
@@ -44,22 +44,20 @@ if(CPG_STATIC_QT AND CPG_QT_GUI)
 endif()
 include(CTest)
 add_subdirectory(foundation)
+add_subdirectory(backend)
+add_subdirectory(app)
 if(BUILD_TESTING)
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
     add_subdirectory(tests/foundation)
+    add_subdirectory(tests/app)
+    # Engine integration tests spawn the unified production executable, so they
+    # are registered only after the app target exists (no CMake cycles).
+    add_subdirectory(backend/tests)
     add_test(NAME verify_package_fixtures
         COMMAND Python3::Interpreter "${CMAKE_SOURCE_DIR}/scripts/tests/test_verify_package.py")
     set_tests_properties(verify_package_fixtures PROPERTIES TIMEOUT 120)
 endif()
 if(CPG_QT_GUI)
     message(STATUS "Qt 6.8 found: building the legacy GUI/bridge regression client alongside the no-Qt product.")
-    add_subdirectory(backend)
     add_subdirectory(gui)
-    add_subdirectory(app)
-    # Backend integration tests spawn the unified production executable, so they
-    # are registered only after the app target exists (no CMake cycles).
-    if(BUILD_TESTING)
-        find_package(Qt6 6.8 REQUIRED COMPONENTS Test)
-        add_subdirectory(backend/tests)
-    endif()
 endif()

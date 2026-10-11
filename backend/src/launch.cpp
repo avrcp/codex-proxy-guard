@@ -1,11 +1,15 @@
 #include "launch_internal.h"
-#include <QDateTime>
-#include <QDir>
-#include <QFileInfo>
-#include <QJsonDocument>
-#include <QRegularExpression>
+#include "cpg/path.h"
+#include "cpg/win_handle.h"
+
 #include <algorithm>
+#include <array>
+#include <cctype>
+#include <chrono>
+#include <cstdint>
+#include <limits>
 #include <vector>
+
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -18,18 +22,38 @@
 
 namespace cpg {
 namespace {
-constexpr qsizetype daemonOutputLimit = 64 * 1024;
+constexpr std::size_t daemonOutputLimit = 64 * 1024;
 
-class Handle final {
-public:
-    explicit Handle(HANDLE value = INVALID_HANDLE_VALUE) : value_(value) {}
-    ~Handle() { if (value_ && value_ != INVALID_HANDLE_VALUE) CloseHandle(value_); }
-    Handle(const Handle &) = delete;
-    Handle &operator=(const Handle &) = delete;
-    HANDLE get() const { return value_; }
-private:
-    HANDLE value_;
-};
+std::uint64_t millisecondsSinceEpoch()
+{
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+bool asciiEqualsFolded(std::string_view left, std::string_view right)
+{
+    if (left.size() != right.size()) return false;
+    for (std::size_t index = 0; index < left.size(); ++index)
+        if (std::tolower(static_cast<unsigned char>(left[index]))
+            != std::tolower(static_cast<unsigned char>(right[index])))
+            return false;
+    return true;
+}
+
+std::string asciiTrimmed(std::string_view value)
+{
+    std::size_t begin = 0, end = value.size();
+    while (begin < end && std::isspace(static_cast<unsigned char>(value[begin]))) ++begin;
+    while (end > begin && std::isspace(static_cast<unsigned char>(value[end - 1]))) --end;
+    return std::string(value.substr(begin, end - begin));
+}
+
+std::string toLower(std::string value)
+{
+    for (char &character : value)
+        character = static_cast<char>(std::tolower(static_cast<unsigned char>(character)));
+    return value;
+}
 
 class StartupLock final {
 public:
@@ -39,56 +63,81 @@ public:
         if (!ReadFile(handle_.get(), previous, sizeof(previous), &count, nullptr))
             throw Error("LAUNCH_BUSY", "Cannot read the cross-process startup lock.");
         bool valid = false;
-        const qint64 last = QByteArray(previous, static_cast<qsizetype>(count)).trimmed().toLongLong(&valid);
-        const qint64 now = QDateTime::currentMSecsSinceEpoch();
+        const std::int64_t last = parseTimestamp(std::string(previous, count), valid);
+        const std::int64_t now = static_cast<std::int64_t>(millisecondsSinceEpoch());
         if (valid && last <= now && now - last < 5000)
             throw Error("LAUNCH_BUSY", "Another Guard instance just launched Desktop; refresh before retrying.");
     }
     void markSubmitted() {
         LARGE_INTEGER zero{};
-        const QByteArray timestamp = QByteArray::number(QDateTime::currentMSecsSinceEpoch());
+        const std::string timestamp = std::to_string(millisecondsSinceEpoch());
         DWORD written = 0;
         if (!SetFilePointerEx(handle_.get(), zero, nullptr, FILE_BEGIN)
             || !SetEndOfFile(handle_.get())
-            || !WriteFile(handle_.get(), timestamp.constData(), static_cast<DWORD>(timestamp.size()), &written, nullptr)
+            || !WriteFile(handle_.get(), timestamp.data(), static_cast<DWORD>(timestamp.size()), &written, nullptr)
             || written != static_cast<DWORD>(timestamp.size()) || !FlushFileBuffers(handle_.get()))
             throw Error("LAUNCH_BUSY", "Cannot record the startup guard; Desktop was not submitted.");
     }
 private:
+    static std::int64_t parseTimestamp(const std::string &text, bool &valid)
+    {
+        valid = false;
+        const std::string trimmed = asciiTrimmed(text);
+        if (trimmed.empty() || trimmed.size() > 20) return 0;
+        std::int64_t value = 0;
+        for (const char character : trimmed) {
+            if (character < '0' || character > '9') return 0;
+            const signed char digit = static_cast<signed char>(character - '0');
+            if (value > (std::numeric_limits<std::int64_t>::max() - digit) / 10) return 0;
+            value = value * 10 + digit;
+        }
+        valid = true;
+        return value;
+    }
     static HANDLE open() {
-        const QString path = QDir::toNativeSeparators(QDir::temp().filePath("codex-proxy-guard-startup.lock"));
-        HANDLE result = CreateFileW(reinterpret_cast<LPCWSTR>(path.utf16()), GENERIC_READ | GENERIC_WRITE,
+        wchar_t base[MAX_PATH + 1] = {};
+        const DWORD size = GetTempPathW(MAX_PATH + 1, base);
+        if (!size || size >= MAX_PATH + 1)
+            throw Error("LAUNCH_BUSY", "Another Guard instance is launching, or the startup lock is unavailable.");
+        const std::filesystem::path path = std::filesystem::path(std::wstring(base, size))
+            / L"codex-proxy-guard-startup.lock";
+        HANDLE result = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE,
                                     0, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (result == INVALID_HANDLE_VALUE)
             throw Error("LAUNCH_BUSY", "Another Guard instance is launching, or the startup lock is unavailable.");
         return result;
     }
-    Handle handle_;
+    UniqueHandle handle_;
 };
 
-bool absolutePath(const QString &path) {
-    // QDir's Windows rooted-path handling also accepts forms like /foo; native
-    // CLI selection requires a drive-absolute or UNC path instead.
-    static const QRegularExpression drive(QStringLiteral("^[A-Za-z]:[/\\\\]"));
-    return !path.contains(QChar::Null) && (drive.match(path).hasMatch()
-           || path.startsWith("\\\\") || path.startsWith("//"));
+bool absolutePath(const std::filesystem::path &path) {
+    // Native CLI selection requires a drive-absolute or UNC path; root-relative
+    // and drive-relative forms are refused.
+    const std::wstring wide = path.wstring();
+    if (wide.empty() || wide.find(L'\0') != std::wstring::npos) return false;
+    const bool drive = wide.size() >= 3
+        && ((wide[0] >= L'A' && wide[0] <= L'Z') || (wide[0] >= L'a' && wide[0] <= L'z'))
+        && wide[1] == L':' && (wide[2] == L'/' || wide[2] == L'\\');
+    return drive || wide.rfind(L"\\\\", 0) == 0 || wide.rfind(L"//", 0) == 0;
 }
 
-QString canonicalExe(const QString &path) {
-    const QFileInfo file(path);
-    if (!absolutePath(path) || !file.isFile() || file.suffix().compare("exe", Qt::CaseInsensitive) != 0)
-        return {};
-    return file.canonicalFilePath();
+std::filesystem::path canonicalExe(const std::filesystem::path &path) {
+    if (!absolutePath(path) || !std::filesystem::is_regular_file(path)) return {};
+    const std::wstring extension = path.extension().wstring();
+    if (extension.size() != 4 || !asciiEqualsFolded(wideToUtf8(extension), ".exe")) return {};
+    const auto canonical = canonicalPathOf(path, false);
+    return canonical.value_or(std::filesystem::path());
 }
 
-QString bypassEntry(const QString &entry) {
-    if (entry.compare("localhost", Qt::CaseInsensitive) == 0) return "localhost";
+std::string bypassEntry(const std::string &entry) {
+    if (asciiEqualsFolded(entry, "localhost")) return "localhost";
+    const std::wstring wide = utf8ToWide(entry);
     IN_ADDR ipv4{};
-    if (InetPtonW(AF_INET, reinterpret_cast<LPCWSTR>(entry.utf16()), &ipv4) == 1
+    if (InetPtonW(AF_INET, wide.c_str(), &ipv4) == 1
         && (ntohl(ipv4.S_un.S_addr) >> 24) == 127) return entry;
     IN6_ADDR ipv6{};
-    if (InetPtonW(AF_INET6, reinterpret_cast<LPCWSTR>(entry.utf16()), &ipv6) == 1
-        && IN6_IS_ADDR_LOOPBACK(&ipv6)) return '[' + entry + ']';
+    if (InetPtonW(AF_INET6, wide.c_str(), &ipv6) == 1
+        && IN6_IS_ADDR_LOOPBACK(&ipv6)) return "[" + entry + "]";
     throw Error("PROXY_BYPASS_UNSUPPORTED", "A no_proxy entry has no exact Chromium bypass equivalent; use only localhost or loopback IP literals.");
 }
 
@@ -101,128 +150,153 @@ void requireStopped(const ProcessState &state) {
 
 bool sameTarget(const Desktop &first, const Desktop &second) {
     return first.registered == second.registered
-        && normalizedWindowsPath(first.executable) == normalizedWindowsPath(second.executable)
+        && normalizedWindowsPath(first.executable.wstring()) == normalizedWindowsPath(second.executable.wstring())
         && first.packageFullName == second.packageFullName
         && first.packageFamilyName == second.packageFamilyName
         && first.aumid == second.aumid && first.applicationId == second.applicationId
         && first.runtimeKind == second.runtimeKind && first.manifestExecutable == second.manifestExecutable;
 }
 
-QJsonValue processElevation(HANDLE process) {
+Json processElevation(HANDLE process) {
     HANDLE raw = nullptr;
-    if (!OpenProcessToken(process, TOKEN_QUERY, &raw)) return QJsonValue::Null;
-    Handle token(raw);
+    if (!OpenProcessToken(process, TOKEN_QUERY, &raw)) return nullptr;
+    UniqueHandle token(raw);
     TOKEN_ELEVATION result{};
     DWORD count = 0;
     if (!GetTokenInformation(token.get(), TokenElevation, &result, sizeof(result), &count))
-        return QJsonValue::Null;
+        return nullptr;
     return result.TokenIsElevated != 0;
 }
 
-QJsonObject nativeLaunch(const Desktop &desktop, const QProcessEnvironment &environment,
-                         const Cancellation &cancel) {
+Json nativeLaunch(const Desktop &desktop, const UnicodeEnvironment &environment,
+                  const Cancellation &cancel) {
     if (desktop.registered)
         throw Error("APPX_METADATA_INCOMPLETE", "Registered applications require application-model activation.");
-    const QString executable = QDir::toNativeSeparators(desktop.executable);
-    if (!absolutePath(executable) || executable.contains('"') || !QFileInfo(executable).isFile())
+    const std::wstring executable = desktop.executable.wstring();
+    if (!absolutePath(desktop.executable) || executable.find(L'"') != std::wstring::npos
+        || !std::filesystem::is_regular_file(desktop.executable))
         throw Error("CODEX_EXECUTABLE_MISSING", "Desktop executable is missing or invalid.");
-    QStringList entries = environment.toStringList();
-    std::sort(entries.begin(), entries.end(), [](const QString &left, const QString &right) {
-        return left.compare(right, Qt::CaseInsensitive) < 0;
-    });
-    std::vector<wchar_t> block;
-    for (const QString &entry : entries) {
-        const std::wstring value = entry.toStdWString();
-        block.insert(block.end(), value.begin(), value.end());
-        block.push_back(L'\0');
-    }
-    block.push_back(L'\0');
-    if (entries.isEmpty()) block.push_back(L'\0');
-    std::wstring command = (QStringLiteral("\"") + executable + '"').toStdWString();
+    const std::vector<wchar_t> &block = environment.block();
+    std::wstring command = L"\"" + executable + L"\"";
     STARTUPINFOW startup{};
     startup.cb = sizeof(startup);
     PROCESS_INFORMATION process{};
     cancel.check();
-    if (!CreateProcessW(reinterpret_cast<LPCWSTR>(executable.utf16()), command.data(), nullptr, nullptr, FALSE,
+    if (!CreateProcessW(executable.c_str(), command.data(), nullptr, nullptr, FALSE,
                         CREATE_UNICODE_ENVIRONMENT | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
-                        block.data(), nullptr, &startup, &process))
+                        const_cast<wchar_t *>(block.data()), nullptr, &startup, &process))
         throw Error("CODEX_LAUNCH_FAILED", "Windows could not create the Desktop process.");
     // These handles are observations only. In particular, cancellation and
     // Guard shutdown must never terminate the newly created Desktop.
-    Handle processHandle(process.hProcess);
-    Handle threadHandle(process.hThread);
-    return {{"pid", static_cast<qint64>(process.dwProcessId)}, {"launch_method", "native_process"},
-            {"activation_state", "not_submitted"}, {"instance", "created"},
-            {"package_identity", "not_applicable"}, {"aumid", "not_applicable"},
-            {"target_elevation", processElevation(processHandle.get())}};
+    UniqueHandle processHandle(process.hProcess);
+    UniqueHandle threadHandle(process.hThread);
+    return Json{{"pid", static_cast<std::uint64_t>(process.dwProcessId)},
+                {"launch_method", "native_process"},
+                {"activation_state", "not_submitted"}, {"instance", "created"},
+                {"package_identity", "not_applicable"}, {"aumid", "not_applicable"},
+                {"target_elevation", processElevation(processHandle.get())}};
 }
+
+const Json &at(const Json &object, const char *key)
+{
+    static const Json nullValue = Json();
+    const auto entry = object.find(key);
+    return entry == object.end() ? nullValue : *entry;
 }
+
+std::string stringAt(const Json &object, const char *key)
+{
+    const Json &value = at(object, key);
+    return value.is_string() ? value.get<std::string>() : std::string();
+}
+
+} // namespace
 
 ProxyPlan proxyPlan(const Config &config) {
     config.validate();
-    QStringList bypass;
-    for (const QString &entry : config.noProxy) bypass.append(bypassEntry(entry));
-    const QString endpoint = config.proxyUrl();
-    const QString list = bypass.join(';');
-    if (endpoint.size() > 2048 || list.size() > 4096)
+    std::string bypass;
+    for (const std::string &entry : config.noProxy) {
+        if (!bypass.empty()) bypass += ';';
+        bypass += bypassEntry(entry);
+    }
+    const std::string endpoint = config.proxyUrl();
+    if (endpoint.size() > 2048 || bypass.size() > 4096)
         throw Error("PROXY_LAUNCH_PLAN_INVALID", "Proxy launch arguments exceed the size limit.");
-    return {endpoint, QStringLiteral("--proxy-server=\"%1\" --proxy-bypass-list=\"%2\"").arg(endpoint, list)};
+    return {endpoint, "--proxy-server=\"" + endpoint + "\" --proxy-bypass-list=\"" + bypass + "\""};
 }
 
-QProcessEnvironment proxyEnvironment(const Config &config) {
+UnicodeEnvironment proxyEnvironment(const Config &config) {
     config.validate();
-    auto environment = QProcessEnvironment::systemEnvironment();
-    for (const QString &key : {QStringLiteral("HTTP_PROXY"), QStringLiteral("HTTPS_PROXY"),
-                               QStringLiteral("http_proxy"), QStringLiteral("https_proxy")})
-        environment.insert(key, config.proxyUrl());
-    environment.insert("NO_PROXY", config.noProxyValue());
-    environment.insert("no_proxy", config.noProxyValue());
-    environment.remove("ALL_PROXY");
-    environment.remove("all_proxy");
+    UnicodeEnvironment environment = UnicodeEnvironment::current();
+    for (const wchar_t *key : {L"HTTP_PROXY", L"HTTPS_PROXY", L"http_proxy", L"https_proxy"})
+        environment.set(key, utf8ToWide(config.proxyUrl()));
+    environment.set(L"NO_PROXY", utf8ToWide(config.noProxyValue()));
+    environment.set(L"no_proxy", utf8ToWide(config.noProxyValue()));
+    environment.remove(L"ALL_PROXY");
+    environment.remove(L"all_proxy");
     return environment;
 }
 
-CodexCli detail::resolveCliFrom(const QString &explicitHome, const QString &userHome,
-                              const QString &path, const QString &overridePath, const QString &cwd) {
-    QString home;
-    if (!explicitHome.isEmpty()) {
-        const QFileInfo directory(absolutePath(explicitHome) ? explicitHome : QDir(cwd).filePath(explicitHome));
-        if (!directory.isDir() || directory.canonicalFilePath().isEmpty())
+CodexCli detail::resolveCliFrom(const std::filesystem::path &explicitHome,
+                                const std::filesystem::path &userHome,
+                                const std::string &path, const std::filesystem::path &overridePath,
+                                const std::filesystem::path &cwd) {
+    std::filesystem::path home;
+    if (!explicitHome.empty()) {
+        const std::filesystem::path resolved = absolutePath(explicitHome)
+            ? explicitHome : cwd / explicitHome;
+        if (!std::filesystem::is_directory(resolved))
             throw Error("CODEX_HOME_INVALID", "Explicit CODEX_HOME must resolve to an existing directory.");
-        home = directory.canonicalFilePath();
+        const auto canonical = canonicalPathOf(resolved, true);
+        if (!canonical) throw Error("CODEX_HOME_INVALID", "Explicit CODEX_HOME must resolve to an existing directory.");
+        home = *canonical;
     } else {
-        if (userHome.isEmpty())
+        if (userHome.empty())
             throw Error("CODEX_HOME_UNRESOLVED", "Cannot determine the user Home for Codex CLI resolution.");
-        const QFileInfo directory(QDir(userHome).filePath(".codex"));
-        if (directory.isDir()) home = directory.canonicalFilePath();
+        const std::filesystem::path candidate = userHome / ".codex";
+        if (std::filesystem::is_directory(candidate)) {
+            const auto canonical = canonicalPathOf(candidate, true);
+            if (canonical) home = *canonical;
+        }
     }
     // Pin every resolved scope, including absolute homes, so subsequent cwd or
     // environment changes cannot redirect this operation to a different Home.
-    if (!overridePath.isEmpty()) {
-        const QString executable = canonicalExe(overridePath);
-        if (executable.isEmpty())
+    if (!overridePath.empty()) {
+        const std::filesystem::path executable = canonicalExe(overridePath);
+        if (executable.empty())
             throw Error("CODEX_CLI_OVERRIDE_INVALID", "Codex CLI override must be an existing absolute native .exe, not a shell shim.");
         return {executable, home};
     }
-    if (!home.isEmpty()) {
-        for (const QString &relative : {QStringLiteral("packages/app-server-daemon/current/bin/codex.exe"),
-                                       QStringLiteral("packages/standalone/current/bin/codex.exe"),
-                                       QStringLiteral("packages/standalone/current/codex.exe")}) {
-            const QString executable = canonicalExe(QDir(home).filePath(relative));
-            if (!executable.isEmpty()) return {executable, home};
+    if (!home.empty()) {
+        for (const wchar_t *relative : {L"packages/app-server-daemon/current/bin/codex.exe",
+                                        L"packages/standalone/current/bin/codex.exe",
+                                        L"packages/standalone/current/codex.exe"}) {
+            const std::filesystem::path executable = canonicalExe(home / relative);
+            if (!executable.empty()) return {executable, home};
         }
     }
-    const QString current = normalizedWindowsPath(QFileInfo(cwd).canonicalFilePath());
-    for (QString entry : path.split(';', Qt::SkipEmptyParts)) {
-        if (entry.startsWith('"') && entry.endsWith('"') && entry.size() > 1)
-            entry = entry.mid(1, entry.size() - 2);
-        if (!absolutePath(entry) || entry.endsWith("/.") || entry.endsWith("\\.")) continue;
-        const QFileInfo directory(entry);
-        if (!directory.isDir()) continue;
-        const QString canonical = directory.canonicalFilePath();
-        if (canonical.isEmpty() || normalizedWindowsPath(canonical) == current) continue;
-        const QString executable = canonicalExe(QDir(canonical).filePath("codex.exe"));
-        if (!executable.isEmpty()) return {executable, home};
+    const auto cwdCanonical = canonicalPathOf(cwd, true);
+    const std::wstring current = cwdCanonical
+        ? normalizedWindowsPath(cwdCanonical->wstring()) : std::wstring();
+    std::size_t offset = 0;
+    while (offset <= path.size()) {
+        const std::size_t separator = path.find(';', offset);
+        const std::size_t stop = separator == std::string::npos ? path.size() : separator;
+        std::string entry = path.substr(offset, stop - offset);
+        offset = separator == std::string::npos ? path.size() + 1 : separator + 1;
+        if (entry.size() > 1 && entry.front() == '"' && entry.back() == '"')
+            entry = entry.substr(1, entry.size() - 2);
+        const std::filesystem::path directoryPath = std::filesystem::path(utf8ToWide(entry));
+        if (!absolutePath(directoryPath)) continue;
+        const std::wstring tail = directoryPath.wstring();
+        if (tail.size() >= 2 && tail.compare(tail.size() - 2, 2, L"\\.") == 0) continue;
+        if (tail.size() >= 2 && tail.compare(tail.size() - 2, 2, L"/.") == 0) continue;
+        if (!std::filesystem::is_directory(directoryPath)) continue;
+        const auto canonical = canonicalPathOf(directoryPath, true);
+        if (!canonical) continue;
+        if (!current.empty() && normalizedWindowsPath(canonical->wstring()) == current) continue;
+        const std::filesystem::path executable = canonicalExe(*canonical / L"codex.exe");
+        if (!executable.empty()) return {executable, home};
     }
     throw Error("CODEX_CLI_UNAVAILABLE", "No native Codex CLI was found in the controlled locations; use normal launch or configure an absolute CLI override.");
 }
@@ -230,63 +304,81 @@ CodexCli detail::resolveCliFrom(const QString &explicitHome, const QString &user
 CodexCli resolveCodexCli(const Config &config) {
     // For registered repair the CLI must operate on the same explicitly
     // authorized Home whose backend block was prepared, never Guard's Home.
-    const QString explicitHome = config.manageBackend ? config.home : qEnvironmentVariable("CODEX_HOME");
-    QString userHome = qEnvironmentVariable("USERPROFILE");
-    if (userHome.isEmpty()) userHome = qEnvironmentVariable("HOME");
-    return detail::resolveCliFrom(explicitHome, userHome, qEnvironmentVariable("PATH"), config.cliOverride, QDir::currentPath());
+    const wchar_t *explicitEnvironment = _wgetenv(L"CODEX_HOME");
+    const std::filesystem::path explicitHome = config.manageBackend
+        ? config.home
+        : (explicitEnvironment ? std::filesystem::path(explicitEnvironment) : std::filesystem::path());
+    const wchar_t *profileEnvironment = _wgetenv(L"USERPROFILE");
+    std::filesystem::path userHome = profileEnvironment ? std::filesystem::path(profileEnvironment)
+                                                        : std::filesystem::path();
+    if (userHome.empty()) {
+        const wchar_t *homeEnvironment = _wgetenv(L"HOME");
+        if (homeEnvironment) userHome = std::filesystem::path(homeEnvironment);
+    }
+    const wchar_t *pathEnvironment = _wgetenv(L"PATH");
+    return detail::resolveCliFrom(explicitHome, userHome,
+                                  pathEnvironment ? wideToUtf8(pathEnvironment) : std::string(),
+                                  config.cliOverride,
+                                  std::filesystem::current_path());
 }
 
-QString detail::daemonStopStatus(const QByteArray &output) {
+std::string detail::daemonStopStatus(const std::string &output) {
     try {
-        const auto object = parseJsonObject(output, daemonOutputLimit, "CODEX_DAEMON_STOP_FAILED");
-        const auto status = object.value("status");
-        if (!status.isString()) return {};
-        if (status.toString() == "stopped") return "stopped";
-        if (status.toString() == "notRunning") return "not_needed";
+        const Json object = parseStrictJsonObject(output, daemonOutputLimit, "CODEX_DAEMON_STOP_FAILED");
+        const Json &status = at(object, "status");
+        if (!status.is_string()) return {};
+        const std::string value = status.get<std::string>();
+        if (value == "stopped") return "stopped";
+        if (value == "notRunning") return "not_needed";
     } catch (const Error &) {}
     return {};
 }
 
-QJsonObject detail::activationReceipt(const QJsonObject &worker) {
-    const auto failed = [&](const QString &field, const QString &code, const QString &message) {
-        if (!worker.value(field).isNull() && !worker.value(field).isUndefined())
-            throw Error(code, message);
+Json detail::activationReceipt(const Json &worker) {
+    const auto failed = [&](const char *name, const char *code, const char *message) {
+        if (!at(worker, name).is_null()) throw Error(code, message);
     };
     failed("failure", "APPX_ACTIVATION_FAILED", "The activation worker reported failure; Desktop may already have been created.");
     failed("activation_hresult", "APPX_ACTIVATION_FAILED", "Windows application activation failed; no fallback was attempted.");
-    if (!worker.value("activation_returned").toBool() || worker.value("pid").toInteger() <= 0)
+    const Json &pid = at(worker, "pid");
+    const bool pidValid = pid.is_number_integer()
+        && pid.get<std::int64_t>() > 0;
+    const Json &returned = at(worker, "activation_returned");
+    const bool returnedValue = returned.is_boolean() && returned.get<bool>();
+    if (!returnedValue || !pidValid)
         throw Error("APPX_ACTIVATION_OUTCOME_UNKNOWN", "Activation produced no confirmed target; refresh Desktop state and do not retry automatically.");
-    for (const QString &field : {QStringLiteral("package_identity"), QStringLiteral("aumid")}) {
-        const QString observation = worker.value(field).toString();
+    for (const char *name : {"package_identity", "aumid"}) {
+        const std::string observation = stringAt(worker, name);
         if (observation != "matched") {
-            const QString prefix = field == "aumid" ? "APPX_AUMID_" : "APPX_IDENTITY_";
-            const QString suffix = observation == "missing" ? "MISSING"
+            const std::string prefix = std::string(name) == "aumid" ? "APPX_AUMID_" : "APPX_IDENTITY_";
+            const std::string suffix = observation == "missing" ? "MISSING"
                 : observation == "mismatch" ? "MISMATCH" : "QUERY_FAILED";
             throw Error(prefix + suffix, "Activated Desktop identity could not be confirmed; the application may already exist.");
         }
     }
     failed("early_exit_code", "APPX_TARGET_EXITED_EARLY", "The activated Desktop exited during observation.");
     failed("observation_failure", "APPX_ACTIVATION_OUTCOME_UNKNOWN", "Activated Desktop observations were incomplete; do not retry automatically.");
-    return {{"pid", worker.value("pid")}, {"launch_method", "appmodel_activation"},
-            {"activation_state", "returned"}, {"instance", worker.value("instance")},
-            {"package_identity", "matched"}, {"aumid", "matched"},
-            {"target_elevation", worker.value("elevation")}};
+    return Json{{"pid", at(worker, "pid")}, {"launch_method", "appmodel_activation"},
+                {"activation_state", "returned"}, {"instance", at(worker, "instance")},
+                {"package_identity", "matched"}, {"aumid", "matched"},
+                {"target_elevation", at(worker, "elevation")}};
 }
 
-QString stopCodexDaemon(const CodexCli &cli, const Cancellation &cancel, int budgetMs) {
+std::string stopCodexDaemon(const CodexCli &cli, const Cancellation &cancel,
+                            std::chrono::milliseconds budget) {
     cancel.check();
-    if (budgetMs <= 0 || canonicalExe(cli.executable).isEmpty())
+    if (budget <= std::chrono::milliseconds::zero() || canonicalExe(cli.executable).empty())
         throw Error("CODEX_DAEMON_STOP_FAILED", "Resolved Codex CLI or operation budget is invalid.");
-    auto environment = QProcessEnvironment::systemEnvironment();
-    if (!cli.home.isEmpty()) environment.insert("CODEX_HOME", cli.home);
+    UnicodeEnvironment environment = UnicodeEnvironment::current();
+    if (!cli.home.empty()) environment.set(L"CODEX_HOME", cli.home.wstring());
     HelperResult result;
     try {
-        result = runHelper(cli.executable, {"app-server", "daemon", "stop"}, {}, cancel,
-                           budgetMs, daemonOutputLimit, environment);
+        result = runHelper(cli.executable, {L"app-server", L"daemon", L"stop"}, {}, cancel,
+                           budget, daemonOutputLimit, environment);
     } catch (const Error &error) {
         if (cancel.cancelled())
             throw Error("LAUNCH_CANCELLED", "Repair cancelled; the shared background server state is unconfirmed.");
-        if (error.code.contains("TIMEOUT"))
+        if (error.code.find("TIMEOUT") != std::string::npos)
             throw Error("CODEX_DAEMON_STOP_TIMEOUT", "Repair exceeded its budget; Desktop was not started and shared service state is unconfirmed.");
         throw Error("CODEX_DAEMON_STOP_FAILED", "The public daemon-stop helper failed; shared service state is unconfirmed.");
     }
@@ -294,19 +386,20 @@ QString stopCodexDaemon(const CodexCli &cli, const Cancellation &cancel, int bud
         || !strictUtf8(result.out) || !strictUtf8(result.err))
         throw Error("CODEX_DAEMON_STOP_FAILED", "Codex CLI output exceeded its limit or was not valid UTF-8.");
     if (result.exitCode != 0) {
-        const QByteArray combined = (result.out + '\n' + result.err).toLower();
-        if (combined.contains("unrecognized subcommand") || combined.contains("unknown command"))
+        const std::string combined = toLower(result.out + '\n' + result.err);
+        if (combined.find("unrecognized subcommand") != std::string::npos
+            || combined.find("unknown command") != std::string::npos)
             throw Error("CODEX_DAEMON_UNSUPPORTED", "This Codex CLI does not support the public daemon lifecycle command; use normal launch.");
         throw Error("CODEX_DAEMON_STOP_FAILED", "The public Codex daemon-stop command failed; Desktop was not started.");
     }
-    const QString status = detail::daemonStopStatus(result.out);
-    if (status.isEmpty())
+    const std::string status = detail::daemonStopStatus(result.out);
+    if (status.empty())
         throw Error("CODEX_DAEMON_STOP_FAILED", "Unexpected daemon lifecycle JSON; shared service state is unconfirmed.");
     return status;
 }
 
-QJsonObject detail::launchWith(const Config &config, LaunchOptions options,
-                               const Cancellation &cancel, const LaunchServices &services) {
+Json detail::launchWith(const Config &config, LaunchOptions options,
+                        const Cancellation &cancel, const LaunchServices &services) {
     if (options.repair && options.activationOnly)
         throw Error("INVALID_LAUNCH_OPTIONS", "Activation-only cannot be combined with daemon repair.");
     config.validate();
@@ -317,14 +410,14 @@ QJsonObject detail::launchWith(const Config &config, LaunchOptions options,
     requireStopped(services.process(desktop));
     if (options.activationOnly && !desktop.registered)
         throw Error("ACTIVATION_ONLY_UNSUPPORTED", "Activation-only requires a registered Desktop application.");
-    if (desktop.registered && (desktop.packageFullName.isEmpty() || desktop.packageFamilyName.isEmpty()
-        || desktop.applicationId.isEmpty() || desktop.manifestExecutable.isEmpty()
+    if (desktop.registered && (desktop.packageFullName.empty() || desktop.packageFamilyName.empty()
+        || desktop.applicationId.empty() || desktop.manifestExecutable.empty()
         || desktop.aumid != desktop.packageFamilyName + '!' + desktop.applicationId
         || desktop.runtimeKind != "full_trust_desktop"))
         throw Error("APPX_METADATA_INCOMPLETE", "Desktop has no verified FullTrust application identity.");
 
     ProxyPlan plan;
-    QString backend = "not_applicable";
+    std::string backend = "not_applicable";
     if (!options.activationOnly) {
         plan = desktop.registered ? proxyPlan(config) : ProxyPlan{config.proxyUrl(), {}};
         if (desktop.registered) {
@@ -339,7 +432,7 @@ QJsonObject detail::launchWith(const Config &config, LaunchOptions options,
             }
         }
     }
-    QString daemon = "skipped";
+    std::string daemon = "skipped";
     CodexCli cli;
     try {
         if (options.repair) {
@@ -361,22 +454,22 @@ QJsonObject detail::launchWith(const Config &config, LaunchOptions options,
         requireStopped(services.process(desktop));
         services.requireElevation();
         cancel.check();
-        QJsonObject receipt;
+        Json receipt;
         services.markSubmitted();
         if (desktop.registered) {
-            receipt = activationReceipt(services.activate(desktop, plan.arguments));
-            receipt.insert("proxy_delivery", options.activationOnly ? "not_established"
-                           : backend == "prepared" ? "activation_arguments_and_home_config" : "activation_arguments");
+            receipt = detail::activationReceipt(services.activate(desktop, plan.arguments));
+            receipt["proxy_delivery"] = options.activationOnly ? "not_established"
+                : backend == "prepared" ? "activation_arguments_and_home_config" : "activation_arguments";
         } else {
-            auto environment = proxyEnvironment(config);
-            if (!cli.home.isEmpty()) environment.insert("CODEX_HOME", cli.home);
+            UnicodeEnvironment environment = proxyEnvironment(config);
+            if (!cli.home.empty()) environment.set(L"CODEX_HOME", cli.home.wstring());
             receipt = services.native(desktop, environment);
-            receipt.insert("proxy_delivery", "process_environment");
+            receipt["proxy_delivery"] = "process_environment";
         }
-        receipt.insert("proxy_endpoint", options.activationOnly ? QJsonValue(QJsonValue::Null) : QJsonValue(plan.endpoint));
-        receipt.insert("backend_proxy_config", backend);
-        receipt.insert("daemon_preparation", daemon);
-        receipt.insert("desktop", desktop.publicJson());
+        receipt["proxy_endpoint"] = options.activationOnly ? Json(nullptr) : Json(plan.endpoint);
+        receipt["backend_proxy_config"] = backend;
+        receipt["daemon_preparation"] = daemon;
+        receipt["desktop"] = desktop.publicJson();
         return receipt;
     } catch (const Error &error) {
         if (daemon == "stopped")
@@ -385,8 +478,8 @@ QJsonObject detail::launchWith(const Config &config, LaunchOptions options,
     }
 }
 
-QJsonObject launchPipeline(const Config &config, const QString &configPath,
-                           LaunchOptions options, const Cancellation &cancel) {
+Json launchPipeline(const Config &config, const std::filesystem::path &configPath,
+                    LaunchOptions options, const Cancellation &cancel) {
     cancel.check();
     ConfigLease lease(configPath, config);
     requireNonElevated();
@@ -398,9 +491,10 @@ QJsonObject launchPipeline(const Config &config, const QString &configPath,
     services.prepare = [&] { prepareProxyEnv(config); };
     services.resolve = [&] { return resolveCodexCli(config); };
     services.stop = [&](const CodexCli &cli) { return stopCodexDaemon(cli, cancel); };
-    services.activate = [&](const Desktop &desktop, const QString &arguments) { return activateDesktop(desktop, arguments, cancel); };
-    services.native = [&](const Desktop &desktop, const QProcessEnvironment &environment) { return nativeLaunch(desktop, environment, cancel); };
+    services.activate = [&](const Desktop &desktop, const std::string &arguments) { return activateDesktop(desktop, arguments, cancel); };
+    services.native = [&](const Desktop &desktop, const UnicodeEnvironment &environment) { return nativeLaunch(desktop, environment, cancel); };
     services.markSubmitted = [&] { startup.markSubmitted(); };
     return detail::launchWith(config, options, cancel, services);
 }
-}
+
+} // namespace cpg

@@ -1,67 +1,87 @@
 #include "startup_mode.h"
 
+#include <cwctype>
+
 namespace cpg {
 namespace {
 
-StartupMode rejected(const QString &message) {
+StartupMode rejected(const std::wstring &message)
+{
     StartupMode mode;
     mode.role = StartupRole::Cli;
     mode.shouldExit = true;
     mode.exitCode = 1;
-    mode.errorMessage = QStringLiteral("CLI_INVALID: ") + message;
+    mode.errorMessage = L"CLI_INVALID: " + message;
     return mode;
 }
 
-QString bounded(const QString &value) {
-    const QString flattened = value.simplified();
-    return flattened.size() > 64 ? flattened.left(64) + QStringLiteral("...") : flattened;
+std::wstring bounded(const std::wstring &value)
+{
+    // Flatten whitespace and cap the echoed token so a hostile argument
+    // cannot flood the diagnostic line.
+    std::wstring flattened;
+    bool pending = false;
+    for (const wchar_t character : value) {
+        if (std::iswspace(character)) { pending = true; continue; }
+        if (pending && !flattened.empty()) flattened.push_back(L' ');
+        pending = false;
+        flattened.push_back(character);
+    }
+    if (flattened.size() > 64) return flattened.substr(0, 64) + L"...";
+    return flattened;
 }
 
-const QStringList &knownCommands() {
-    static const QStringList commands{
-        QStringLiteral("bridge"), QStringLiteral("internal-activate-package"),
-        QStringLiteral("build-info"), QStringLiteral("launch"),
-        QStringLiteral("init-config"), QStringLiteral("config-path"),
-        QStringLiteral("console"), QStringLiteral("licenses")};
+bool equalsW(const std::wstring &left, const wchar_t *right)
+{
+    return left == right;
+}
+
+const std::vector<const wchar_t *> &knownCommands()
+{
+    static const std::vector<const wchar_t *> commands{
+        L"bridge", L"internal-activate-package",
+        L"build-info", L"launch",
+        L"init-config", L"config-path",
+        L"console", L"licenses"};
     return commands;
 }
 
 } // namespace
 
-StartupMode classifyStartup(const QStringList &arguments) {
+StartupMode classifyStartup(const std::vector<std::wstring> &arguments) {
     bool configSeen = false;
     bool configPending = false;
     bool smokeTest = false;
     bool guiWords = false;
     bool cliWords = false;
-    QString configValue;
-    QStringList positional;
+    std::wstring configValue;
+    std::vector<std::wstring> positional;
     bool afterSeparator = false;
-    for (const QString &argument : arguments) {
+    for (const std::wstring &argument : arguments) {
         if (configPending) {
             // A value token is consumed verbatim, even when it starts with '-'.
             configValue = argument;
             configPending = false;
             continue;
         }
-        if (!afterSeparator && argument == QLatin1String("--")) {
+        if (!afterSeparator && equalsW(argument, L"--")) {
             afterSeparator = true;
             continue;
         }
-        if (!afterSeparator && argument.startsWith(QLatin1Char('-')) && argument.size() > 1) {
-            if (argument == QLatin1String("--config")) {
-                if (configSeen) return rejected(QStringLiteral("The configuration option may be given only once."));
+        if (!afterSeparator && argument.size() > 1 && argument[0] == L'-') {
+            if (equalsW(argument, L"--config")) {
+                if (configSeen) return rejected(L"The configuration option may be given only once.");
                 configSeen = true;
                 configPending = true;
                 continue;
             }
-            if (argument.startsWith(QLatin1String("--config="))) {
-                if (configSeen) return rejected(QStringLiteral("The configuration option may be given only once."));
+            if (argument.rfind(L"--config=", 0) == 0) {
+                if (configSeen) return rejected(L"The configuration option may be given only once.");
                 configSeen = true;
-                configValue = argument.mid(QStringLiteral("--config=").size());
+                configValue = argument.substr(9);
                 continue;
             }
-            if (argument == QLatin1String("--smoke-test")) {
+            if (equalsW(argument, L"--smoke-test")) {
                 smokeTest = true;
                 guiWords = true;
                 continue;
@@ -73,19 +93,21 @@ StartupMode classifyStartup(const QStringList &arguments) {
             cliWords = true;
             continue;
         }
-        positional.append(argument);
+        positional.push_back(argument);
     }
-    if (configPending) return rejected(QStringLiteral("The configuration option requires a path value."));
-    if (!positional.isEmpty()) {
-        if (guiWords) return rejected(QStringLiteral("The smoke test cannot be combined with a command."));
-        if (!knownCommands().contains(positional.first()))
-            return rejected(QStringLiteral("Unknown command: ") + bounded(positional.first()));
+    if (configPending) return rejected(L"The configuration option requires a path value.");
+    if (!positional.empty()) {
+        if (guiWords) return rejected(L"The smoke test cannot be combined with a command.");
+        bool known = false;
+        for (const wchar_t *command : knownCommands())
+            if (equalsW(positional.front(), command)) { known = true; break; }
+        if (!known) return rejected(L"Unknown command: " + bounded(positional.front()));
         StartupMode mode;
         mode.role = StartupRole::Cli;
         return mode;
     }
     if (guiWords && cliWords)
-        return rejected(QStringLiteral("The smoke test cannot be combined with command-line options."));
+        return rejected(L"The smoke test cannot be combined with command-line options.");
     StartupMode mode;
     mode.role = cliWords ? StartupRole::Cli : StartupRole::Gui;
     mode.smokeTest = smokeTest;

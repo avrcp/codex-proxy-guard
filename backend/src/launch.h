@@ -1,15 +1,22 @@
 #pragma once
+
 #include "platform.h"
-#include <QProcessEnvironment>
+
+#include <chrono>
+#include <string>
+
 namespace cpg {
+
 struct LaunchOptions { bool repair = false; bool activationOnly = false; };
-struct ProxyPlan { QString endpoint; QString arguments; };
-struct CodexCli { QString executable; QString home; };
+struct ProxyPlan { std::string endpoint; std::string arguments; };
+struct CodexCli { std::filesystem::path executable; std::filesystem::path home; };
 ProxyPlan proxyPlan(const Config &config);
-QProcessEnvironment proxyEnvironment(const Config &config);
+UnicodeEnvironment proxyEnvironment(const Config &config);
 CodexCli resolveCodexCli(const Config &config);
-QString stopCodexDaemon(const CodexCli &cli, const Cancellation &cancel, int budgetMs = 720000);
-// The single authoritative pipeline for bridge, CLI and console frontend.
-QJsonObject launchPipeline(const Config &config, const QString &configPath,
-                           LaunchOptions options, const Cancellation &cancel);
-}
+std::string stopCodexDaemon(const CodexCli &cli, const Cancellation &cancel,
+                            std::chrono::milliseconds budget = std::chrono::milliseconds(720000));
+// The single authoritative pipeline for bridge, CLI, console and TUI frontends.
+Json launchPipeline(const Config &config, const std::filesystem::path &configPath,
+                    LaunchOptions options, const Cancellation &cancel);
+
+} // namespace cpg
