@@ -4,10 +4,6 @@
 #include "cpg/text.h"
 #include "tui_app.h"
 
-#ifdef CPG_ENABLE_QT_GUI
-#include "gui_entry.h"
-#endif
-
 #include <windows.h>
 #include <shellapi.h>
 
@@ -66,13 +62,9 @@ int main(int argc, char *argv[])
     }
     cpg::setInteractiveConsoleEntry(&cpg::tui::runTui);
     if (mode.role == cpg::StartupRole::Gui) {
-#ifdef CPG_ENABLE_QT_GUI
-        return guard::runGui(mode.configPath, mode.smokeTest);
-#else
-        // No-Qt build: no-arg starts the interactive TUI (plain fallback
-        // through runTui when VT output is unavailable).
+        // No-arg starts the interactive TUI (plain fallback through runTui
+        // when VT output or an interactive console is unavailable).
         return cpg::tui::runTui(configPathFrom(mode), false);
-#endif
     }
     return cpg::runCli(arguments);
 }

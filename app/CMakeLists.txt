@@ -5,19 +5,14 @@ if(MSVC)
     target_compile_options(guard_startup PRIVATE /W4 /WX /utf-8 /permissive-)
 endif()
 
-# The single production executable: one file, several process roles selected
-# by structured argument classification before any role is entered. The legacy
-# Qt GUI adapter is linked only while the regression build is enabled; the
-# no-Qt build uses the console subsystem for the interactive console role.
-if(CPG_QT_GUI)
-    add_executable(CodexProxyGuard WIN32 main.cpp "${CMAKE_BINARY_DIR}/backend/generated/licenses.rc")
-    target_link_libraries(CodexProxyGuard PRIVATE guard_startup guard_gui guard_engine guard_tui guard_foundation shell32)
-    target_compile_definitions(CodexProxyGuard PRIVATE CPG_ENABLE_QT_GUI=1)
-else()
-    add_executable(CodexProxyGuard main.cpp "${CMAKE_BINARY_DIR}/backend/generated/licenses.rc")
-    target_link_libraries(CodexProxyGuard PRIVATE guard_startup guard_engine guard_tui guard_foundation shell32)
-endif()
+# The single production executable: one Console-subsystem file, several
+# process roles selected by structured argument classification before any
+# role is entered (TUI, plain console, CLI, activation worker).
+add_executable(CodexProxyGuard main.cpp "${CMAKE_BINARY_DIR}/backend/generated/licenses.rc")
+target_link_libraries(CodexProxyGuard PRIVATE guard_startup guard_engine guard_tui guard_foundation shell32)
 if(MSVC)
-    target_compile_options(CodexProxyGuard PRIVATE /W4 /WX /utf-8 /permissive-)
-    target_link_options(CodexProxyGuard PRIVATE "/MANIFESTUAC:level='asInvoker' uiAccess='false'")
+    target_compile_options(CodexProxyGuard PRIVATE /W4 /WX /utf-8 /permissive- /sdl /guard:cf)
+    target_link_options(CodexProxyGuard PRIVATE
+        "/MANIFESTUAC:level='asInvoker' uiAccess='false'"
+        /DYNAMICBASE /NXCOMPAT /HIGHENTROPYVA /CETCOMPAT /INCREMENTAL:NO)
 endif()

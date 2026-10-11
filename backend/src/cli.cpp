@@ -1,5 +1,7 @@
 #include "cli.h"
-#include "bridge.h"
+#include "core.h"
+#include "platform.h"
+#include "launch.h"
 #include "cpg/build_info.h"
 #include "cpg/json.h"
 #include "cpg/text.h"
@@ -206,7 +208,6 @@ int cpg::runCli(const std::vector<std::wstring> &arguments) {
         const std::filesystem::path configPath = parsed.values.count(L"config")
             ? std::filesystem::path(valueOf(L"config"))
             : Config::defaultPath();
-        if (command == L"bridge") return runBridge(configPath);
         if (command == L"config-path") { print(wideToUtf8(configPath.wstring())); return 0; }
         if (command == L"init-config") {
             Config config;

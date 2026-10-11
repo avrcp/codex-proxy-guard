@@ -39,7 +39,7 @@ bool equalsW(const std::wstring &left, const wchar_t *right)
 const std::vector<const wchar_t *> &knownCommands()
 {
     static const std::vector<const wchar_t *> commands{
-        L"bridge", L"internal-activate-package",
+        L"internal-activate-package",
         L"build-info", L"launch",
         L"init-config", L"config-path",
         L"console", L"licenses"};
@@ -51,8 +51,6 @@ const std::vector<const wchar_t *> &knownCommands()
 StartupMode classifyStartup(const std::vector<std::wstring> &arguments) {
     bool configSeen = false;
     bool configPending = false;
-    bool smokeTest = false;
-    bool guiWords = false;
     bool cliWords = false;
     std::wstring configValue;
     std::vector<std::wstring> positional;
@@ -81,11 +79,6 @@ StartupMode classifyStartup(const std::vector<std::wstring> &arguments) {
                 configValue = argument.substr(9);
                 continue;
             }
-            if (equalsW(argument, L"--smoke-test")) {
-                smokeTest = true;
-                guiWords = true;
-                continue;
-            }
             // Any other option belongs to the headless parser vocabulary
             // (--build-info, --help, --version, --json, --force, ...). The
             // parser itself rejects unknown spellings and command mismatches;
@@ -97,7 +90,6 @@ StartupMode classifyStartup(const std::vector<std::wstring> &arguments) {
     }
     if (configPending) return rejected(L"The configuration option requires a path value.");
     if (!positional.empty()) {
-        if (guiWords) return rejected(L"The smoke test cannot be combined with a command.");
         bool known = false;
         for (const wchar_t *command : knownCommands())
             if (equalsW(positional.front(), command)) { known = true; break; }
@@ -106,11 +98,8 @@ StartupMode classifyStartup(const std::vector<std::wstring> &arguments) {
         mode.role = StartupRole::Cli;
         return mode;
     }
-    if (guiWords && cliWords)
-        return rejected(L"The smoke test cannot be combined with command-line options.");
     StartupMode mode;
     mode.role = cliWords ? StartupRole::Cli : StartupRole::Gui;
-    mode.smokeTest = smokeTest;
     if (mode.role == StartupRole::Gui) mode.configPath = configValue;
     return mode;
 }

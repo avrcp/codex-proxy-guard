@@ -11,7 +11,6 @@ struct StartupMode {
     StartupRole role = StartupRole::Gui;
     // Gui role only: --config value to forward to the interactive frontend.
     std::wstring configPath;
-    bool smokeTest = false;
     // Classification failure: print errorMessage to standard error and exit
     // with exitCode without entering any role.
     bool shouldExit = false;

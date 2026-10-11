@@ -1,6 +1,6 @@
 # doctest engine suites; they spawn the unified production executable, so the
 # app target must already exist (registered from the top-level file).
-foreach(name engine_core engine_platform engine_launch engine_bridge)
+foreach(name engine_core engine_platform engine_launch engine_cli)
     add_executable(${name}_suite ${name}_tests.cpp)
     target_include_directories(${name}_suite PRIVATE
         ${CMAKE_SOURCE_DIR}/tests/third_party/doctest
