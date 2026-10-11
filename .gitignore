@@ -18,9 +18,13 @@ docs/UI_UX_AUDIT_2026-10-03.md
 .workbuddy/
 
 # Windows / OS generated files
-# (All project EXEs live under /target or /dist; do not add binary fixtures without updating this.)
+# (All project EXEs live under /target or /dist; do not add binary fixtures
+# without updating this and the source-ZIP verifier allowlist together.)
 *.pdb
 *.exe
+*.obj
+*.lib
+*.ilk
 *.zip
 *.sha256
 *.cdx.json

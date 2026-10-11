@@ -8,15 +8,21 @@ Expected package layout under dist/releases/<version>-<commit>/:
 - CodexProxyGuard-<version>-windows-x86_64.zip   transport ZIP with only the EXE
 - CodexProxyGuard-<version>-windows-x86_64.zip.sha256
 - CodexProxyGuard-<version>-source.zip            source snapshot
+- CodexProxyGuard-<version>-source.zip.sha256
 - size-report.json           size evidence
 
 The verifier re-reads every artifact from disk; nothing the build script
 wrote is trusted on faith. It executes the packaged EXE to read its embedded
 build-info, checks the console subsystem byte, scans the import table for
-non-system DLLs, and refuses manifests that still claim Qt or PowerShell
-discovery.
+non-system DLLs, refuses manifests that still claim Qt or PowerShell
+discovery, verifies the source ZIP digest against the sidecar, the manifest
+and SHA256SUMS and rejects build products inside it, requires the release
+directory to contain exactly the manifest's artifact set, and independently
+re-validates the Authenticode signature of a signed release through
+WinVerifyTrust.
 """
 import argparse
+import ctypes
 import hashlib
 import json
 import pathlib
@@ -39,6 +45,11 @@ ALLOWED_IMPORT_PREFIXES = (
     'SHELL32.DLL', 'SHLWAPI.DLL', 'SHCORE.DLL', 'USER32.DLL', 'USERENV.DLL',
     'UCRTBASE.DLL', 'VERSION.DLL', 'WIN32U.DLL', 'WS2_32.DLL', 'WTSAPI32.DLL',
 )
+# Build products and secrets must never travel inside a source snapshot.
+FORBIDDEN_SOURCE_SUFFIXES = (
+    '.obj', '.exe', '.dll', '.pdb', '.lib', '.ilk', '.zip', '.7z', '.pfx', '.key',
+)
+FORBIDDEN_SOURCE_SEGMENTS = ('target', 'dist', '.git', '__pycache__')
 
 
 def digest(data: bytes) -> str:
@@ -118,6 +129,82 @@ def run(args: pathlib.Path, *arguments: str) -> str:
     if completed.returncode != 0:
         raise SystemExit(f'{args.name} {" ".join(arguments)} failed: {completed.stderr.strip()}')
     return completed.stdout.strip()
+
+
+def check_source_zip(archive: pathlib.Path, manifest: dict, recorded: dict) -> None:
+    """The source snapshot must be digest-bound everywhere and may not carry
+    build products or repository-local directories."""
+    digest = check_sidecar(archive)
+    if manifest.get('source_zip', {}).get('sha256') != digest:
+        raise SystemExit('Source ZIP digest does not match the manifest')
+    if manifest.get('source_zip', {}).get('path') != archive.name:
+        raise SystemExit('Source ZIP path does not match the manifest')
+    if recorded.get(archive.name) != digest:
+        raise SystemExit('SHA256SUMS.txt source ZIP digest mismatch')
+    with zipfile.ZipFile(archive) as bundle:
+        if bundle.testzip() is not None:
+            raise SystemExit('Source ZIP CRC failed')
+        for entry in bundle.infolist():
+            name = entry.filename.replace('\\', '/')
+            if name.endswith('/'):
+                continue
+            if name.lower().endswith(FORBIDDEN_SOURCE_SUFFIXES):
+                raise SystemExit(f'Source ZIP contains a build product: {name}')
+            segments = [segment.lower() for segment in name.split('/')[:-1]]
+            if any(segment in FORBIDDEN_SOURCE_SEGMENTS for segment in segments):
+                raise SystemExit(f'Source ZIP contains a forbidden directory: {name}')
+
+
+def check_artifact_set(release: pathlib.Path, manifest: dict) -> None:
+    """The release directory must hold exactly the manifest's artifact set -
+    no stale files from earlier runs and no missing sidecar."""
+    expected = manifest.get('artifacts')
+    if not isinstance(expected, list) or not expected:
+        raise SystemExit('Manifest must list its artifacts')
+    actual = sorted(entry.name for entry in release.iterdir() if entry.is_file())
+    if sorted(expected) != actual:
+        raise SystemExit(
+            f'Release artifact set mismatch\n  manifest: {sorted(expected)}\n  actual:   {actual}')
+
+
+def verify_authenticode(path: pathlib.Path) -> None:
+    """Independent Authenticode validation through WinVerifyTrust - the
+    manifest's own 'signed' claim is never trusted on faith."""
+    import ctypes.wintypes as wt
+
+    class GUID(ctypes.Structure):
+        _fields_ = [('Data1', wt.DWORD), ('Data2', wt.WORD), ('Data3', wt.WORD),
+                    ('Data4', ctypes.c_ubyte * 8)]
+
+    class WINTRUST_FILE_INFO(ctypes.Structure):
+        _fields_ = [('cbStruct', wt.DWORD), ('pcwszFilePath', wt.LPCWSTR),
+                    ('hFile', wt.HANDLE), ('pgKnownSubject', ctypes.c_void_p)]
+
+    class WINTRUST_DATA(ctypes.Structure):
+        _fields_ = [('cbStruct', wt.DWORD), ('pPolicyCallbackData', ctypes.c_void_p),
+                    ('pSIPClientData', ctypes.c_void_p), ('dwUIChoice', wt.DWORD),
+                    ('fdwRevocationChecks', wt.DWORD), ('dwUnionChoice', wt.DWORD),
+                    ('pFile', ctypes.POINTER(WINTRUST_FILE_INFO)),
+                    ('dwStateAction', wt.DWORD), ('hWVTStateData', wt.HANDLE),
+                    ('pwszURLReference', wt.LPCWSTR),
+                    ('dwProvFlags', wt.DWORD), ('dwUIContext', wt.DWORD)]
+
+    wintrust = ctypes.WinDLL('wintrust')
+    action = GUID(0x00aac56b, 0xcd44, 0x11d0,
+                  (ctypes.c_ubyte * 8)(0x8c, 0xc2, 0x00, 0xc0, 0x4f, 0xc2, 0x95, 0xee))
+    info = WINTRUST_FILE_INFO(ctypes.sizeof(WINTRUST_FILE_INFO), str(path), None, None)
+    data = WINTRUST_DATA(ctypes.sizeof(WINTRUST_DATA), None, None,
+                         2,  # WTD_UI_NONE
+                         0,  # WTD_REVOKE_NONE
+                         1,  # WTD_CHOICE_FILE
+                         ctypes.byref(info),
+                         1,  # WTD_STATEACTION_VERIFY
+                         None, None, 0, 0)
+    result = wintrust.WinVerifyTrust(None, ctypes.byref(action), ctypes.byref(data))
+    data.dwStateAction = 16  # WTD_STATEACTION_CLOSE
+    wintrust.WinVerifyTrust(None, ctypes.byref(action), ctypes.byref(data))
+    if result != 0:
+        raise SystemExit(f'Authenticode validation failed (WinVerifyTrust 0x{result & 0xffffffff:08x})')
 
 
 def main() -> None:
@@ -205,7 +292,6 @@ def main() -> None:
     source = [path for path in zips if 'source' in path.name]
     if len(source) != 1:
         raise SystemExit('Expected exactly one source ZIP')
-    check_sidecar(source[0])
 
     sums = release / 'SHA256SUMS.txt'
     if not sums.is_file():
@@ -220,8 +306,13 @@ def main() -> None:
     if recorded.get(transport[0].name) != zip_digest:
         raise SystemExit('SHA256SUMS.txt transport ZIP digest mismatch')
 
+    check_source_zip(source[0], manifest, recorded)
+    check_artifact_set(release, manifest)
+
     if manifest['executable'].get('signed') and manifest.get('authenticode_status') != 'Valid':
         raise SystemExit('Signed release must record authenticode_status=Valid')
+    if manifest['executable'].get('signed'):
+        verify_authenticode(executable)
     if not manifest['executable'].get('signed') and not manifest.get('unsigned_dev'):
         raise SystemExit('Unsigned release must be explicitly marked unsigned_dev')
     print(f'verified {release.name}: {exe_digest[:16]}... '

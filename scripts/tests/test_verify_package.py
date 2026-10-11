@@ -88,10 +88,14 @@ class VerifierTests(unittest.TestCase):
                            'signed': False, 'qt': False},
             'transport_zip': {'path': self.transport.name,
                               'sha256': file_sha256(self.transport)},
+            'source_zip': {'path': self.source.name,
+                           'sha256': file_sha256(self.source)},
             'artifacts': ['CodexProxyGuard.exe', self.transport.name,
-                          self.source.name, 'release-manifest.json',
-                          'SHA256SUMS.txt'],
+                          self.transport.name + '.sha256', self.source.name,
+                          self.source.name + '.sha256', 'release-manifest.json',
+                          'SHA256SUMS.txt', 'size-report.json'],
         }
+        (self.release / 'size-report.json').write_text('{}\n', encoding='utf-8')
         self.write_manifest()
         self.write_sums()
 
@@ -187,6 +191,50 @@ class VerifierTests(unittest.TestCase):
         self.write_sums()
         self.source.with_name(self.source.name + '.sha256').unlink()
         self.source.unlink()
+        self.assertNotEqual(self.verify().returncode, 0)
+
+    def test_rejects_source_zip_manifest_digest_mismatch(self):
+        self.write_manifest(source_zip={'path': self.source.name, 'sha256': '0' * 64})
+        self.assertNotEqual(self.verify().returncode, 0)
+
+    def test_rejects_sums_missing_source_entry(self):
+        lines = [f'{file_sha256(self.exe)} CodexProxyGuard.exe',
+                 f'{file_sha256(self.transport)} {self.transport.name}']
+        (self.release / 'SHA256SUMS.txt').write_text('\n'.join(lines) + '\n', encoding='utf-8')
+        self.assertNotEqual(self.verify().returncode, 0)
+
+    def test_rejects_source_zip_with_build_product(self):
+        with zipfile.ZipFile(self.source, 'w') as bundle:
+            bundle.writestr('source/main.cpp', 'int main() {}\n')
+            bundle.writestr('source/tui_probe.obj', 'binary garbage')
+        self.source.with_name(self.source.name + '.sha256').write_text(
+            f'{file_sha256(self.source)} {self.source.name}\n', encoding='utf-8')
+        self.write_manifest(source_zip={'path': self.source.name,
+                                        'sha256': file_sha256(self.source)})
+        self.write_sums()
+        self.assertNotEqual(self.verify().returncode, 0)
+
+    def test_rejects_source_zip_with_target_directory(self):
+        with zipfile.ZipFile(self.source, 'w') as bundle:
+            bundle.writestr('source/main.cpp', 'int main() {}\n')
+            bundle.writestr('target/build.ninja', 'rule cc')
+        self.source.with_name(self.source.name + '.sha256').write_text(
+            f'{file_sha256(self.source)} {self.source.name}\n', encoding='utf-8')
+        self.write_manifest(source_zip={'path': self.source.name,
+                                        'sha256': file_sha256(self.source)})
+        self.write_sums()
+        self.assertNotEqual(self.verify().returncode, 0)
+
+    def test_rejects_extra_stale_file_in_release(self):
+        (self.release / 'stale.exe').write_bytes(b'stale')
+        self.assertNotEqual(self.verify().returncode, 0)
+
+    def test_rejects_artifact_list_missing_sidecar(self):
+        manifest = dict(self.manifest)
+        manifest['artifacts'] = [name for name in manifest['artifacts']
+                                 if name != self.transport.name + '.sha256']
+        (self.release / 'release-manifest.json').write_text(
+            json.dumps(manifest), encoding='utf-8')
         self.assertNotEqual(self.verify().returncode, 0)
 
 

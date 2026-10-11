@@ -29,7 +29,6 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 $Root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $Build = if ([IO.Path]::IsPathRooted($BuildDirectory)) { $BuildDirectory } else { Join-Path $Root $BuildDirectory }
-$Staging = Join-Path $Root 'dist\staging'
 $TransportZipName = "CodexProxyGuard-$Version-windows-x86_64.zip"
 $SourceZipName = "CodexProxyGuard-$Version-source.zip"
 
@@ -54,10 +53,17 @@ function Write-Utf8([string] $Path, [string] $Text) {
     [IO.File]::WriteAllText($Path, $Text + [Environment]::NewLine, (New-Object Text.UTF8Encoding($false)))
 }
 
-# --- 1. Clean tree -----------------------------------------------------------
+# --- 1. Clean tree + immutable release destination ----------------------------
 $Dirty = @(& git -C $Root status --porcelain=v1 --untracked-files=all).Count
 if ($Dirty -ne 0) { throw 'The release build requires a clean working tree.' }
 $Commit = (& git -C $Root rev-parse HEAD | Out-String).Trim()
+# Release directories are immutable: a verified, possibly already distributed
+# build of this version/commit must never be silently overwritten. Checked
+# before anything expensive runs.
+$ReleaseDirectory = Join-Path $Root "dist\releases\$Version-$($Commit.Substring(0, 8))"
+if (Test-Path -LiteralPath $ReleaseDirectory) {
+    throw "Release destination already exists; versions/commits are immutable: $ReleaseDirectory"
+}
 
 # --- 2/3. Toolchain, configure, build ----------------------------------------
 $VsWhere = "${Env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
@@ -130,10 +136,13 @@ if ($Sign) {
 # Nothing may touch the EXE after this point (signing is the last mutation).
 
 # --- 9-13. Package ------------------------------------------------------------
-if (Test-Path $Staging) { Remove-Item -Recurse -Force $Staging }
-$ReleaseDirectory = Join-Path $Root "dist\releases\$Version-$($Commit.Substring(0, 8))"
-if (Test-Path $ReleaseDirectory) { Remove-Item -Recurse -Force $ReleaseDirectory }
+# Unique per-run staging on the same volume as the release directory: two
+# parallel builds can never delete each other's work, and promotion is one
+# atomic Move-Item instead of file-by-file copies.
+$Staging = Join-Path $Root ("target\release-staging\$Version-$($Commit.Substring(0, 8))-$PID-" +`
+    [Guid]::NewGuid().ToString('N').Substring(0, 8))
 New-Item -ItemType Directory -Path $Staging, (Split-Path $ReleaseDirectory -Parent) -Force | Out-Null
+try {
 
 $StagedExe = Join-Path $Staging 'CodexProxyGuard.exe'
 Copy-Item $Exe $StagedExe
@@ -200,8 +209,9 @@ $Manifest = [ordered]@{
     }
     transport_zip = [ordered]@{ path = $TransportZipName; sha256 = $TransportHash }
     source_zip = [ordered]@{ path = $SourceZipName; sha256 = $SourceHash }
-    artifacts = @('CodexProxyGuard.exe', $TransportZipName, $SourceZipName,
-                  'release-manifest.json', 'SHA256SUMS.txt', 'size-report.json')
+    artifacts = @('CodexProxyGuard.exe', $TransportZipName, "$TransportZipName.sha256",
+                  $SourceZipName, "$SourceZipName.sha256", 'release-manifest.json',
+                  'SHA256SUMS.txt', 'size-report.json')
 }
 Write-Utf8 (Join-Path $Staging 'release-manifest.json') ($Manifest | ConvertTo-Json -Depth 5)
 
@@ -209,12 +219,15 @@ Write-Utf8 (Join-Path $Staging 'release-manifest.json') ($Manifest | ConvertTo-J
 Invoke-Checked (Get-Command python).Source @((Join-Path $Root 'scripts\verify-package.py'),
     '--release', $Staging, '--schema', 'static-single')
 
-# --- 15. Promotion -------------------------------------------------------------
-New-Item -ItemType Directory -Path $ReleaseDirectory -Force | Out-Null
-Copy-Item (Join-Path $Staging '*') $ReleaseDirectory
+# --- 15. Promotion: one atomic move on the same volume -------------------------
+Move-Item -LiteralPath $Staging -Destination $ReleaseDirectory
 Invoke-Checked (Get-Command python).Source @((Join-Path $Root 'scripts\verify-package.py'),
     '--release', $ReleaseDirectory, '--schema', 'static-single')
-Remove-Item -Recurse -Force $Staging
+} finally {
+    # The promoted directory is never touched here; only leftover staging of
+    # a failed run is cleaned up.
+    if (Test-Path -LiteralPath $Staging) { Remove-Item -Recurse -Force $Staging }
+}
 
 Write-Host ''
 Write-Host "Release promoted: $ReleaseDirectory"
