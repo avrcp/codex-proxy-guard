@@ -88,8 +88,7 @@ const char *usageText()
            "  config-path              Print the effective configuration path\n"
            "  build-info               Print embedded build provenance\n"
            "  licenses                 Stream the embedded offline notices\n"
-           "  console                  Interactive line console\n"
-           "  bridge                   Engine bridge role (internal)\n"
+           "  console                  Interactive line console (--plain for the plain variant)\n"
            "  internal-activate-package  Activation worker (internal)\n";
 }
 
@@ -189,6 +188,12 @@ int cpg::runCli(const std::vector<std::wstring> &arguments) {
             if (flagSet(flag) && command != L"launch") cliFail("Launch options require launch.");
         for (const wchar_t *flag : {L"force", L"proxy-host", L"proxy-port"})
             if (flagSet(flag) && command != L"init-config") cliFail("Configuration options require init-config.");
+        // --plain selects the plain console variant of the interactive mode;
+        // silently ignoring it on headless commands hides typos.
+        if (flagSet(L"plain") && !command.empty() && command != L"console")
+            cliFail("The plain flag is only valid without a command or with console.");
+        if (parsed.values.count(L"config") && valueOf(L"config").empty())
+            cliFail("The configuration path must not be empty.");
         // The worker and provenance query have no configuration dependency.
         // In particular, a worker must not resolve a user profile before reading
         // the parent's bounded activation request.

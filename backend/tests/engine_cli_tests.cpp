@@ -29,7 +29,14 @@ TEST_CASE("CLI rejects removed and conflicting options")
         {L"launch", L"--auto-stop-daemon"},
         {L"launch", L"--refresh-codex-daemon", L"--activation-only"},
         {L"bridge"},
-        {L"internal-activate-package", L"--config", L"unused"}};
+        {L"internal-activate-package", L"--config", L"unused"},
+        // --plain belongs to the interactive mode only; an empty --config
+        // value must be rejected instead of silently using a null path.
+        {L"launch", L"--plain"},
+        {L"init-config", L"--plain"},
+        {L"licenses", L"--plain"},
+        {L"--config=", L"build-info"},
+        {L"--config", L"", L"config-path"}};
     for (const auto &arguments : argumentSets) {
         ProcessRequest processRequest;
         processRequest.program = enginePath();
@@ -40,7 +47,24 @@ TEST_CASE("CLI rejects removed and conflicting options")
         const ProcessResult result = runOwnedProcess(processRequest, {});
         INFO(result.out << " | " << result.err);
         CHECK(result.exitCode != 0);
+        CHECK(result.err.find("CLI_INVALID") != std::string::npos);
     }
+}
+
+TEST_CASE("usage text matches the real command surface")
+{
+    ProcessRequest processRequest;
+    processRequest.program = enginePath();
+    processRequest.arguments = {L"--help"};
+    processRequest.environment = UnicodeEnvironment::current();
+    processRequest.timeout = std::chrono::milliseconds(5000);
+    processRequest.stdoutLimit = 64 * 1024;
+    const ProcessResult result = runOwnedProcess(processRequest, {});
+    CHECK(result.exitCode == 0);
+    CHECK(result.out.find("launch") != std::string::npos);
+    CHECK(result.out.find("console") != std::string::npos);
+    // The bridge role was removed; usage must not advertise it as available.
+    CHECK(result.out.find("bridge") == std::string::npos);
 }
 
 TEST_CASE("provenance does not load configuration")

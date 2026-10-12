@@ -175,6 +175,7 @@ TuiState::Action TuiState::mainKey(const Key &key)
     }
     switch (key.virtualKey) {
     case VK_RETURN:
+    case 'L': // the virtual key of both L and l — the documented shortcut
         action.kind = Action::Kind::Launch;
         return action;
     case VK_F5:
@@ -183,11 +184,39 @@ TuiState::Action TuiState::mainKey(const Key &key)
     case VK_ESCAPE:
         return {};
     }
+    // Modal openers respect the snapshot's capability flags (the engine's
+    // business rules) instead of letting the user type YES into a modal that
+    // can never be confirmed.
+    const Json &actions = at(snapshot_, "actions");
     switch (std::towlower(key.unicode)) {
     case L'r': action.kind = Action::Kind::Refresh; return action;
-    case L'e': modal_ = Modal::ProxyEditor; action.kind = Action::Kind::OpenEditor; return action;
-    case L'b': modal_ = Modal::Consent; confirmBuffer_.clear(); action.kind = Action::Kind::OpenConsent; return action;
-    case L'd': modal_ = Modal::Repair; confirmBuffer_.clear(); action.kind = Action::Kind::OpenRepair; return action;
+    case L'e':
+        if (actions.value("can_edit_proxy", false)) {
+            modal_ = Modal::ProxyEditor;
+            action.kind = Action::Kind::OpenEditor;
+        } else {
+            setNotice("Proxy editing unavailable - press R to refresh.");
+        }
+        return action;
+    case L'b':
+        if (actions.value("can_authorize_backend_proxy", false)
+            || actions.value("can_revoke_backend_proxy", false)) {
+            modal_ = Modal::Consent;
+            confirmBuffer_.clear();
+            action.kind = Action::Kind::OpenConsent;
+        } else {
+            setNotice("Backend authorization unavailable - press R to refresh.");
+        }
+        return action;
+    case L'd':
+        if (actions.value("can_repair", false)) {
+            modal_ = Modal::Repair;
+            confirmBuffer_.clear();
+            action.kind = Action::Kind::OpenRepair;
+        } else {
+            setNotice("Repair launch unavailable - press R to refresh.");
+        }
+        return action;
     case L'?':
     case 0: // F1 has no unicode
         if (key.virtualKey == VK_F1 || key.unicode == L'?') { modal_ = Modal::Help; }

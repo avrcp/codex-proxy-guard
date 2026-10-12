@@ -263,6 +263,9 @@ TEST_CASE("key mapping follows the primary bindings")
     CHECK(state.key(virtualKey(VK_F5)).kind == TuiState::Action::Kind::Refresh);
     CHECK(state.key(key(L'q')).kind == TuiState::Action::Kind::Quit);
     CHECK(state.key(virtualKey(VK_RETURN)).kind == TuiState::Action::Kind::Launch);
+    // L launches too — the documented "Enter / L" shortcut is really bound.
+    CHECK(state.key(key(L'l')).kind == TuiState::Action::Kind::Launch);
+    CHECK(state.key(key(L'L')).kind == TuiState::Action::Kind::Launch);
     CHECK(state.key(key(L'x')).kind == TuiState::Action::Kind::None);
     CHECK(state.key(virtualKey(VK_UP)).kind == TuiState::Action::Kind::None);
     // Modal openers seed the corresponding modal.
@@ -274,6 +277,27 @@ TEST_CASE("key mapping follows the primary bindings")
     CHECK(state.modal() == Modal::Help);
     state.key(key(L' '));
     CHECK(state.modal() == Modal::None);
+}
+
+TEST_CASE("modal openers respect the snapshot capability flags")
+{
+    TuiState state;
+    Json snapshot = snapshotFixture(false);
+    snapshot["actions"] = Json{{"can_launch", false}, {"can_edit_proxy", false},
+                               {"can_authorize_backend_proxy", false},
+                               {"can_revoke_backend_proxy", false}, {"can_repair", false},
+                               {"can_refresh", true}, {"can_cancel", false}};
+    state.setSnapshot(snapshot);
+    CHECK(state.key(key(L'e')).kind == TuiState::Action::Kind::None);
+    CHECK(state.key(key(L'b')).kind == TuiState::Action::Kind::None);
+    CHECK(state.key(key(L'd')).kind == TuiState::Action::Kind::None);
+    CHECK(state.modal() == Modal::None); // no modal opens without capability
+    Screen screen;
+    screen.resize(80, 24);
+    state.draw(screen);
+    const std::wstring frame = renderFrame(screen);
+    // The status line carries the most recent blocked-opener notice as text.
+    CHECK(frame.find(L"Repair launch unavailable") != std::wstring::npos);
 }
 
 TEST_CASE("the proxy editor edits fields like a bounded line editor")
@@ -385,8 +409,10 @@ TEST_CASE("the TUI renders before the first session snapshot arrives")
     const std::wstring frame = renderFrame(screen);
     CHECK(frame.find(L"CODEX PROXY GUARD") != std::wstring::npos);
     CHECK_FALSE(TuiState::blockedReason(Json::object()).empty());
-    // Keys still work in the pre-snapshot state.
-    CHECK(state.key(key(L'e')).kind == TuiState::Action::Kind::OpenEditor);
+    // Capability-gated keys fail closed before the first snapshot arrives.
+    CHECK(state.key(key(L'e')).kind == TuiState::Action::Kind::None);
+    CHECK(state.key(key(L'b')).kind == TuiState::Action::Kind::None);
+    CHECK(state.key(key(L'd')).kind == TuiState::Action::Kind::None);
 }
 
 TEST_CASE("drawing a frame keeps every glyph inside the buffer")
