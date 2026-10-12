@@ -1,9 +1,49 @@
-# TUI acceptance — 0.7.0-rc.1 (no-Qt)
+# TUI acceptance — 0.7.0-rc.2 (no-Qt)
 
-Execution date: 2026-10-11 (Asia/Shanghai). Platform: Windows 11 x64,
-MSVC x64, static CRT release profile.
+Execution date: 2026-10-11 (rc.1 evidence) and 2026-10-12 (rc.2 hardening
+evidence) (Asia/Shanghai). Platform: Windows 11 x64, MSVC x64, static CRT
+release profile.
 
-## Automated evidence (in-repo suites, all green)
+## 0.7.0-rc.2 hardening evidence (executed 2026-10-12)
+
+The rc.2 hardening pass extended the automated suites; everything below ran
+green in the same session as the change:
+
+- Cluster-safe cell model: emoji written atomically at the right frame edge,
+  an unfittable emoji is not partially written, combining marks attach to
+  their leading glyph (including after wide glyphs), zero-width clusters at
+  the clipped boundary never address out-of-bounds cells, isolated
+  surrogates normalize to U+FFFD, cluster-aware truncation never splits a
+  glyph, and unicode homes render/clip without escaping the frame.
+- Session timeout reaping: with a 20 ms injected `SessionBudgets` budget the
+  session stays busy and refuses a second foreground operation while the
+  timed-out future is reaped, surfaces `SESSION_TIMEOUT` only afterwards,
+  and never overlaps effects (`maxActive == 1`).
+- Owned-process runner: the child inherits only its standard handles
+  (non-inheritable control probe always passes; the strict inheritable-probe
+  assertion runs wherever the host honors the CreateProcess attribute list —
+  this dev host strips it, where the only-inheritable-duplicates
+  construction is the barrier), a child that never reads 16 KiB of stdin
+  still hits `HELPER_TIMEOUT` promptly, a fast-exiting flood is caught by
+  the output limit in 50/50 iterations, and custom environment blocks are
+  ordinal-sorted with duplicates collapsed.
+- Clipboard ownership: checked EmptyClipboard/SetClipboardData semantics
+  with the HGLOBAL freed exactly when ownership does not transfer (fake
+  adapter), plus the transient "Diagnostic copied" notice.
+- CLI contract: `L` is bound as the documented launch shortcut, modal
+  openers respect the snapshot capability flags (fail closed pre-snapshot),
+  `--plain` off the interactive mode and an empty `--config` value are
+  `CLI_INVALID`, and usage no longer advertises the removed bridge role.
+- Verifier: 20 python fixtures including source-ZIP digest/manifest/sums
+  agreement, build products and `target/` members rejected, exact artifact
+  set enforced, and the PE mitigation gate (CFG instrumented with FID table,
+  ASLR, NX, high-entropy VA, CET — including the extended-characteristics
+  debug record spelling newer linkers use).
+- Release chain: promotion is immutable (an existing destination refuses the
+  build), staging is unique per run, promotion is one atomic move, and the
+  manifest carries verifier-derived mitigation facts.
+
+## Automated evidence (rc.1 baseline, in-repo suites, all green)
 
 - All 8 CTest suites on the no-Qt build: foundation, startup classification,
   TUI (display width incl. CJK/surrogates/combining marks, screen clipping,
@@ -68,6 +108,9 @@ fallback under redirected stdio. Still requiring a human-attended session
   signing certificate available to the executor; unsigned artifacts are
   marked accordingly). Vendor false-positive submission is a manual step
   documented in `docs/RELEASE_CHECKLIST.md`.
-- The 0.7.0-rc.1 artifact is an UNSIGNED DEVELOPMENT BUILD until a
+- The 0.7.0-rc.2 artifact is an UNSIGNED DEVELOPMENT BUILD until a
   certificate is provided through
   `scripts\build-portable.cmd -Sign -CertificateSha1 <thumbprint>`.
+- The rc.2 clipboard fix is unit-tested through the injectable adapter; the
+  manual Windows Terminal/conhost paste-into-Notepad check is still part of
+  the interactive matrix below and is NOT RUN yet.

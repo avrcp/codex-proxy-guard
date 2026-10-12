@@ -3,10 +3,13 @@
 The application is pure C++20 over the Windows SDK and the STL: no Qt, no
 Rust, no FFI, no telemetry. The single production executable —
 `CodexProxyGuard.exe` — is a Console-subsystem binary built by the root CMake
-project with MSVC `/W4 /WX`, the static CRT (`/MT`), `/sdl`, `/guard:cf` and
-the DYNAMICBASE/NXCOMPAT/HIGHENTROPYVA/CETCOMPAT link hardening. Runtime
-dependencies are vendored header-only libraries (toml++ 3.4.0,
-nlohmann/json 3.12.0); test binaries additionally use vendored doctest 2.4.12.
+project with MSVC `/W4 /WX`, the static CRT (`/MT`), and the `/sdl` +
+`/guard:cf` hardening applied to **every** compiled object through the shared
+`cpg_build_options` INTERFACE target (library code included, so CFG has no
+partial-coverage hole), plus the /guard:cf/DYNAMICBASE/NXCOMPAT/
+HIGHENTROPYVA/CETCOMPAT link flags. Runtime dependencies are vendored
+header-only libraries (toml++ 3.4.0, nlohmann/json 3.12.0); test binaries
+additionally use vendored doctest 2.4.12.
 
 ## One executable, two process roles
 
@@ -32,9 +35,16 @@ The engine layering is strict:
   through held handles, strict JSON object parsing (duplicate keys at every
   level via an escape-decoded key walker, depth/size limits, no comments or
   trailing data), the Win32-event `Cancellation`, `UniqueHandle` RAII, the
-  `UnicodeEnvironment` block builder and the bounded `runOwnedProcess`
-  runner (separate program/arguments, no shell, concurrent stdout/stderr
-  drain with per-stream limits, post-submission outcome-unknown semantics).
+  `UnicodeEnvironment` block builder (emits the CreateProcessW-required
+  ordinal-sorted, duplicate-collapsed double-NUL block) and the bounded
+  `runOwnedProcess` runner (separate program/arguments, no shell; the three
+  child-side pipe ends are duplicated as the only inheritable handles Guard
+  ever holds and passed through a PROC_THREAD_ATTRIBUTE_HANDLE_LIST; stdin is
+  written by a dedicated cancellable writer thread that closes the write end
+  for EOF; stdout/stderr drain concurrently with per-stream limits, read
+  errors are distinguished from EOF, the verdict is re-checked after all
+  joins so a fast-exiting flood cannot pass as normal, and post-submission
+  failures keep the outcome-unknown semantics).
 - `backend/src/core.*`: strict TOML via toml++ 3.4.0, loopback validation,
   config transactions/read leases, marked `.env` transactions, redaction and
   strict UTF-8/JSON.
@@ -73,8 +83,13 @@ frontend dependency.
 `Action -> candidate validation -> authorization -> commit foreground effect
 -> dispatch -> TaskResult` remains the boundary. A session accepts at most
 one foreground effect; busy state gates every destructive key except
-Ctrl+C and the busy-quit prompt. Completion invalidates stale launch
-observations; refresh issues new confirmations. Consent proposals bind a
+Ctrl+C and the busy-quit prompt. When an operation exceeds its
+`SessionBudgets` budget the session cancels it but stays busy — refusing new
+operations — until the effect's future is reaped; only then does it surface
+`SESSION_TIMEOUT` (or the effect's own `APPX_ACTIVATION_OUTCOME_UNKNOWN` /
+`CODEX_DAEMON_STOP_*` outcome when that is more precise). Nothing is ever
+detached or dropped. Completion invalidates stale launch observations;
+refresh issues new confirmations. Consent proposals bind a
 CSPRNG single-use token to the current config and the exact Home. Mutation
 transactions compare expected config under a held Windows handle. A launch
 holds an incompatible read lease throughout, preventing stale launches from
@@ -117,6 +132,12 @@ PowerShell baseline fixture.
 packaged EXE's build-info, scans imports, (optionally) signs and verifies,
 and re-verifies every artifact through `scripts/verify-package.py --schema
 static-single` before promotion to `dist/releases/<version>-<commit>`.
+Release directories are immutable — the build refuses to overwrite an
+existing version/commit — and the verifier additionally binds the source
+ZIP digest across the sidecar/manifest/SHA256SUMS, rejects build products
+inside it, requires the exact artifact set, re-validates signed releases
+through WinVerifyTrust, and gates the PE on CFG instrumentation (FID table),
+ASLR, NX, high-entropy VA and CET before promotion.
 Rollback to the Qt era is the `qt-gui-v0.6.1-rc.1` tag
 (see `docs/history/QT_GUI_HISTORY.md`).
 

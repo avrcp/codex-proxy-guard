@@ -23,11 +23,23 @@ Every item is a gate; a release ships only when all are checked.
       release-manifest consistency (qt=false, powershell_appx_discovery=false,
       subsystem=console, crt=static), embedded build-info obtained by
       executing the packaged executable, PE subsystem byte and import scan.
-- [ ] Confirm the source ZIP contains the exact commit snapshot
-      (`git ls-files`) and the size report is present.
-- [ ] Confirm Authenticode: signed releases record `authenticode_status=Valid`
+- [ ] Confirm the source ZIP digest agrees across the sidecar,
+      `manifest.source_zip.sha256` and SHA256SUMS.txt, contains no build
+      products (`*.obj`/`*.exe`/`*.dll`/`*.pdb`/`*.lib`/`*.ilk`/`*.zip`/
+      `*.7z`/`*.pfx`/`*.key`) and no `target/`, `dist/` or `.git/` members,
+      and that the size report is present.
+- [ ] Confirm the release directory holds exactly the manifest's artifact
+      set (eight files including both sidecars); no stale extras.
+- [ ] Confirm the PE mitigation gate: CFG instrumented with the FID table
+      present, DYNAMICBASE/HIGHENTROPYVA/NXCOMPAT and CET recorded in the
+      manifest and re-derived from the image by the verifier.
+- [ ] Confirm Authenticode: signed releases record `authenticode_status=Valid`,
+      are independently re-validated through WinVerifyTrust by the verifier,
       and nothing touches the EXE after signing; unsigned releases are
       explicitly marked `UNSIGNED DEVELOPMENT BUILD`.
+- [ ] Confirm the destination `dist/releases/<version>-<commit>` did not
+      exist before the build (promotion is immutable; the build refuses to
+      overwrite) and that promotion was one atomic move from unique staging.
 
 ## Acceptance (recorded in docs/TUI_ACCEPTANCE.md)
 

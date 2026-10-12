@@ -13,10 +13,30 @@ The plain line console is the same contract in line form.
 Guard runs asInvoker. The engine remains the final authority on elevation,
 loopback proxy validation, package identity and repair gates. A
 malformed/mismatched snapshot disables actions; no submitted operation is
-auto-retried. Raw stderr is not displayed. Shutdown cancels cooperatively and
+auto-retried. A foreground operation that exceeds its session budget is
+cancelled but the session stays busy until the effect's future is reaped —
+the one-foreground-operation invariant holds end to end, nothing is detached.
+Raw stderr is not displayed. Shutdown cancels cooperatively and
 never kills Desktop or the shared daemon; only Guard's own short-lived helper
 children (activation worker, repair CLI) are terminated and reaped, through
 held handles, on timeout or cancellation.
+
+## Guard-owned child processes
+
+Every Guard-owned child is spawned by `runOwnedProcess` with separate
+program/arguments (no shell, no cmd.exe, no PowerShell wrapper) and a
+per-request budget. The pipes are created non-inheritable; the three
+child-side ends are duplicated into the only inheritable handles Guard ever
+holds and are additionally passed through a
+`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`, so exactly the standard handles cross
+the process boundary even on hosts whose CreateProcess hook strips the
+attribute list. stdin is delivered by a dedicated cancellable writer thread
+(a child that never reads stdin cannot stall the budget machinery); the
+verdict is re-checked after every worker thread is joined so a fast-exiting
+flood cannot masquerade as a normal result. Custom environment blocks are
+emitted ordinal-sorted by name with duplicates collapsed, exactly as
+CreateProcessW requires. Only this direct child is ever terminated, never a
+process tree and never a process matched by name.
 
 ## 强制边界
 

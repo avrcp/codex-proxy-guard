@@ -17,7 +17,7 @@ in the user or machine store; without -Sign the release must explicitly pass
 -AllowUnsignedDev and is marked UNSIGNED DEVELOPMENT BUILD everywhere.
 #>
 param(
-    [string] $Version = '0.7.0-rc.1',
+    [string] $Version = '0.7.0-rc.2',
     [switch] $Sign,
     [string] $CertificateSha1,
     [string] $TimestampUrl = 'http://timestamp.digicert.com',

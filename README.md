@@ -1,6 +1,6 @@
 # Codex Proxy Guard
 
-Windows 控制台本地代理启动器：纯 C++20 + Win32，无 Qt、无 PowerShell discovery。`0.7.0-rc.1` 是一个 Console 子系统单文件 EXE（静态 CRT `/MT`），默认提供原生 VT TUI，并通过 Windows 应用模型正确激活已注册的 ChatGPT Desktop。
+Windows 控制台本地代理启动器：纯 C++20 + Win32，无 Qt、无 PowerShell discovery。`0.7.0-rc.2` 是一个 Console 子系统单文件 EXE（静态 CRT `/MT`，全对象 CFG/CET 加固），默认提供原生 VT TUI，并通过 Windows 应用模型正确激活已注册的 ChatGPT Desktop。
 
 Guard 将代理参数交给新启动的 ChatGPT Desktop / Codex Desktop，并可在明确授权的 Codex Home 中维护一个代理环境块。它不测量网络连通性，不管理代理服务，不读取认证数据，也不修改 Windows 系统代理或 Codex `config.toml`。
 
@@ -24,7 +24,7 @@ TUI 不是 daemon：关闭 Guard 不会关闭 Desktop；Guard 不管理代理软
 .\CodexProxyGuard.exe licenses             # 离线输出全部内嵌许可与 notices
 ```
 
-TUI 按键：`Enter` 启动、`E` 编辑代理、`B` 授权/撤销 Codex 后端代理块、`D` 修复启动、`R`/`F5` 刷新、`?`/`F1` 帮助、`Ctrl+C` 取消前台操作、`Q` 退出。授权与修复须在模态中键入 `YES`；编辑器支持 Tab 切换、Home/End/方向键/退格/删除。激活 worker 与后台授权/撤销通过共享引擎会话在同一进程内完成——没有 GUI→bridge 自子进程。
+TUI 按键：`Enter`/`L` 启动、`E` 编辑代理、`B` 授权/撤销 Codex 后端代理块、`D` 修复启动、`R`/`F5` 刷新、`?`/`F1` 帮助、`Ctrl+C` 取消前台操作、`Q` 退出。授权与修复须在模态中键入 `YES`；编辑器支持 Tab 切换、Home/End/方向键/退格/删除。激活 worker 与后台授权/撤销通过共享引擎会话在同一进程内完成——没有 GUI→bridge 自子进程。
 
 启动成功后区分实例观测：`created` 表示观察到新进程；`reused` 表示复用了已运行的 Desktop 实例——代理设置是否重新生效未确认，请完全退出 Desktop 后再从 Guard 启动；`unknown` 表示无法确认。这些是引擎观测分类，不是网络验证。
 

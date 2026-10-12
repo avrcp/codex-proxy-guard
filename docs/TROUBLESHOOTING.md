@@ -46,14 +46,24 @@ There is exactly one file and no DLL layout to preserve: copy
 `CodexProxyGuard.exe` anywhere (including Chinese/space paths) and rename it
 freely. `build-info` exposes the version/commit/dirty provenance. If the
 terminal cannot host VT output (or stdin/stdout is redirected and no command
-is given), Guard falls back to the line console; `console --plain` forces it.
+is given), Guard falls back to the line console; `console --plain` forces it
+(`--plain` is rejected on headless commands). If the interactive TUI itself
+fails, one redacted `TUI_FAILED: ...` line is printed on stderr and the
+process exits 1 — no crash file is written anywhere.
+
+A foreground operation that exceeds its budget reports `SESSION_TIMEOUT`
+after its cancellation completed; the UI shows "Cancelling timed-out
+operation" while the old task is being reaped and refuses new operations in
+that window. Refresh after a timeout instead of resubmitting.
 
 A submitted activation can remain unknown (`APPX_ACTIVATION_OUTCOME_UNKNOWN`)
 even after cancellation — refresh instead of retrying. Quitting the TUI
 (`Q`) or closing the window never terminates Desktop. The proxy editor keeps
 your input when a save fails; fix the reported cause and retry, or verify the
 stored settings after a mid-save engine failure instead of resubmitting
-blindly.
+blindly. Copy Diagnostic (`C` in the error modal) needs a working clipboard;
+on failure it shows `CLIPBOARD_FAILED` instead of silently pretending the
+copy succeeded.
 
 Backend proxy block writes require working local NTFS transactions.
 Unsupported filesystems keep consent and refuse modification — there is no

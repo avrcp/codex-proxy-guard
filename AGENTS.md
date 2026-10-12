@@ -14,8 +14,11 @@ stale or unhealthy index.
 - `foundation/`: STL/Win32 primitives shared by everything — strict UTF-8 and
   `publicText` redaction, Windows path normalization/containment/canonicalization,
   strict JSON object parsing (duplicate keys rejected at every level), Win32-event
-  `Cancellation`, `UniqueHandle`, `UnicodeEnvironment` and the bounded
-  `runOwnedProcess` runner (post-submission activation failures report
+  `Cancellation`, `UniqueHandle`, `UnicodeEnvironment` (ordinal-sorted,
+  duplicate-collapsed CreateProcessW blocks) and the bounded
+  `runOwnedProcess` runner (only-inheritable std-handle duplicates plus
+  PROC_THREAD_ATTRIBUTE_HANDLE_LIST, cancellable stdin writer thread,
+  post-join authoritative verdict; post-submission activation failures report
   `APPX_ACTIVATION_OUTCOME_UNKNOWN`).
 - `backend/src/core.*`: strict configuration/domain validation, redaction,
   held config transactions/leases and scoped `.env` operations.
@@ -25,7 +28,9 @@ stale or unhealthy index.
 - `backend/src/launch.*`: proxy plans/environment, startup locking, public daemon
   compatibility and shared launch orchestration.
 - `backend/src/session.*`: the transport-free engine session (snapshot view
-  model, single-use confirmation tokens, one-foreground-effect gate).
+  model, single-use confirmation tokens, one-foreground-effect gate that
+  stays busy until a timed-out effect's future is reaped; injectable
+  `SessionBudgets`).
 - `backend/src/cli.*`: minimal CLI and the `licenses` notice streamer.
 - `tui/`: Win32 VT TUI (terminal session, input, screen renderer, display
   width, modal state machine, plain-console fallback). The TUI never
@@ -36,10 +41,13 @@ stale or unhealthy index.
   EXE's hidden subcommand — the only self-spawned child.
 
 All production code is C++20; no Qt, no Rust/FFI, no PowerShell in the
-product. Preserve the state boundary `Action -> candidate reduce -> authorize
+product. Every production and test object compiles with the shared
+`cpg_build_options` hardening (`/W4 /WX /utf-8 /permissive- /sdl /guard:cf`).
+Preserve the state boundary `Action -> candidate reduce -> authorize
 -> commit -> dispatch -> TaskResult`. Only one foreground operation may be
-active. Guard shutdown must not terminate Desktop. Guard reaps only its own
-children through held process handles — never by executable name.
+active — including while a timed-out operation is being reaped. Guard
+shutdown must not terminate Desktop. Guard reaps only its own children
+through held process handles — never by executable name.
 
 ## Security invariants
 
@@ -129,8 +137,12 @@ git diff --check
 
 Windows portable artifacts must always come from the canonical script, which
 re-verifies every artifact through `scripts/verify-package.py --schema
-static-single` (the verifier executes the packaged EXE) before promotion.
-Completion also requires release build/package smoke, SHA/build-info
-verification, import-table scan, diff review, and documentation
-synchronization. Automated tests must never touch a real Codex Home, start
-the real Desktop or stop a shared daemon.
+static-single` (the verifier executes the packaged EXE, binds the source ZIP
+digest across sidecar/manifest/SHA256SUMS, rejects build products inside it,
+enforces the exact artifact set, re-validates Authenticode via WinVerifyTrust
+and gates the PE on CFG/CET/ASLR/DEP) before promotion. Release directories
+are immutable — the build refuses an existing destination and promotes with
+one atomic move from unique staging. Completion also requires release
+build/package smoke, SHA/build-info verification, import-table scan, diff
+review, and documentation synchronization. Automated tests must never touch
+a real Codex Home, start the real Desktop or stop a shared daemon.
