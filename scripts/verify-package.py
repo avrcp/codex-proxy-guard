@@ -90,37 +90,104 @@ def pe_subsystem(data: bytes) -> int:
     return struct.unpack_from('<H', data, optional_header + 68)[0]
 
 
+def rva_to_offset(data: bytes, rva: int) -> int:
+    pe_offset = pe_header(data)
+    optional_header = pe_offset + 24
+    section_table = optional_header + struct.unpack_from('<H', data, pe_offset + 20)[0]
+    number_sections = struct.unpack_from('<H', data, pe_offset + 6)[0]
+    for index in range(number_sections):
+        entry = section_table + index * 40
+        virtual_size = struct.unpack_from('<I', data, entry + 8)[0]
+        virtual_address = struct.unpack_from('<I', data, entry + 12)[0]
+        raw_size = struct.unpack_from('<I', data, entry + 16)[0]
+        raw_pointer = struct.unpack_from('<I', data, entry + 20)[0]
+        if virtual_address <= rva < virtual_address + max(virtual_size, raw_size):
+            return raw_pointer + (rva - virtual_address)
+    raise SystemExit(f'RVA outside sections: {rva:#x}')
+
+
 def pe_imports(data: bytes) -> list:
     """Import scan of the first import directory (dumpbin-free)."""
     pe_offset = pe_header(data)
     optional_header = pe_offset + 24
     magic = struct.unpack_from('<H', data, optional_header)[0]
-    section_table = optional_header + struct.unpack_from('<H', data, pe_offset + 20)[0]
-    number_sections = struct.unpack_from('<H', data, pe_offset + 6)[0]
     data_directories = optional_header + (112 if magic == 0x20b else 96)
     # The import table is the second data directory (index 1).
     import_rva = struct.unpack_from('<I', data, data_directories + 8)[0]
 
-    def rva_to_offset(rva: int) -> int:
-        for index in range(number_sections):
-            entry = section_table + index * 40
-            virtual_size = struct.unpack_from('<I', data, entry + 8)[0]
-            virtual_address = struct.unpack_from('<I', data, entry + 12)[0]
-            raw_size = struct.unpack_from('<I', data, entry + 16)[0]
-            raw_pointer = struct.unpack_from('<I', data, entry + 20)[0]
-            if virtual_address <= rva < virtual_address + max(virtual_size, raw_size):
-                return raw_pointer + (rva - virtual_address)
-        raise SystemExit(f'Import RVA outside sections: {rva:#x}')
-
     imports = []
-    descriptor = rva_to_offset(import_rva) if import_rva else 0
+    descriptor = rva_to_offset(data, import_rva) if import_rva else 0
     while descriptor and data[descriptor:descriptor + 20] != b'\x00' * 20:
         name_rva = struct.unpack_from('<I', data, descriptor + 12)[0]
-        name_offset = rva_to_offset(name_rva)
+        name_offset = rva_to_offset(data, name_rva)
         end = data.index(b'\x00', name_offset)
         imports.append(data[name_offset:end].decode('ascii', 'replace').upper())
         descriptor += 20
     return imports
+
+
+# DllCharacteristics bits (PE optional header +70) and load-config GuardFlags
+# bits (offset 144 in IMAGE_LOAD_CONFIG_DIRECTORY64).
+DLLCHARACTERISTIC_MITIGATIONS = (
+    ('dynamic_base', 0x0040),
+    ('high_entropy_va', 0x0020),
+    ('nx_compat', 0x0100),
+    ('guard_cf', 0x4000),
+    ('cet_compat_dllchar', 0x1000),
+)
+GUARDFLAG_MITIGATIONS = (
+    ('cf_instrumented', 0x00000100),
+    ('cf_function_table_present', 0x00000400),
+    ('cet_compat_guard', 0x01000000),
+)
+# Newer MSVC linkers record CET in an extended-characteristics debug record
+# (IMAGE_DEBUG_TYPE_EX_DLLCHARACTERISTICS, type 20) instead of the classic
+# DllCharacteristics bit; any of the three spellings counts.
+EX_DLLCHARACTERISTICS_DEBUG_TYPE = 20
+EX_DLLCHARACTERISTICS_CET_COMPAT = 0x00000001
+REQUIRED_MITIGATIONS = (
+    'dynamic_base', 'high_entropy_va', 'nx_compat', 'guard_cf', 'cet_compat',
+    'cf_instrumented', 'cf_function_table_present',
+)
+
+
+def pe_mitigations(data: bytes) -> dict:
+    """Derive the exploit-mitigation facts of a PE32+ image from its headers:
+    DllCharacteristics, the load-config GuardFlags (CFG instrumentation and
+    the FID table) and the extended-characteristics debug record (CET)."""
+    pe_offset = pe_header(data)
+    optional_header = pe_offset + 24
+    magic = struct.unpack_from('<H', data, optional_header)[0]
+    if magic not in (0x10b, 0x20b):
+        raise SystemExit('Unknown PE optional header magic')
+    dll_characteristics = struct.unpack_from('<H', data, optional_header + 70)[0]
+    mitigations = {name: bool(dll_characteristics & mask)
+                   for name, mask in DLLCHARACTERISTIC_MITIGATIONS}
+    data_directories = optional_header + (112 if magic == 0x20b else 96)
+    load_config_rva = struct.unpack_from('<I', data, data_directories + 10 * 8)[0]
+    guard_flags = 0
+    if load_config_rva:
+        config = rva_to_offset(data, load_config_rva)
+        size = struct.unpack_from('<I', data, config)[0]
+        if size >= 148:  # GuardFlags sits at offset 144
+            guard_flags = struct.unpack_from('<I', data, config + 144)[0]
+    for name, mask in GUARDFLAG_MITIGATIONS:
+        mitigations[name] = bool(guard_flags & mask)
+    cet_record = False
+    debug_rva, debug_size = struct.unpack_from('<II', data, data_directories + 6 * 8)
+    for index in range(debug_size // 28) if debug_rva else ():
+        entry = rva_to_offset(data, debug_rva) + index * 28
+        dtype = struct.unpack_from('<I', data, entry + 12)[0]
+        dsize = struct.unpack_from('<I', data, entry + 16)[0]
+        pointer = struct.unpack_from('<I', data, entry + 24)[0]
+        if (dtype == EX_DLLCHARACTERISTICS_DEBUG_TYPE and dsize >= 4 and pointer
+                and struct.unpack_from('<I', data, pointer)[0]
+                & EX_DLLCHARACTERISTICS_CET_COMPAT):
+            cet_record = True
+    cet_dllchar = mitigations.pop('cet_compat_dllchar')
+    cet_guard = mitigations.pop('cet_compat_guard')
+    mitigations['cet_compat'] = cet_dllchar or cet_guard or cet_record
+    return mitigations
 
 
 def run(args: pathlib.Path, *arguments: str) -> str:
@@ -209,12 +276,19 @@ def verify_authenticode(path: pathlib.Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument('--release', required=True, help='release directory to verify')
+    parser.add_argument('--release', help='release directory to verify')
     parser.add_argument('--schema', default='static-single',
                         choices=['static-single'], help='expected package schema')
+    parser.add_argument('--mitigations-of', metavar='EXE',
+                        help='print the PE mitigation facts of an EXE as JSON and exit')
     parser.add_argument('--skip-execution', action='store_true',
                         help='test fixtures only: skip executing the packaged EXE')
     args = parser.parse_args()
+    if args.mitigations_of:
+        print(json.dumps(pe_mitigations(pathlib.Path(args.mitigations_of).read_bytes())))
+        return
+    if not args.release:
+        raise SystemExit('--release is required unless --mitigations-of is given')
     release = pathlib.Path(args.release)
     if not release.is_dir():
         raise SystemExit(f'Release directory missing: {release}')
@@ -256,6 +330,18 @@ def main() -> None:
     for name in imports:
         if name.startswith(('QT6', 'MSVCP140', 'VCRUNTIME140', 'CONCRT140', 'VCRUNTIME140_1')):
             raise SystemExit(f'Forbidden CRT/Qt import: {name}')
+
+    # Mitigation gate: CFG must be instrumented across every production
+    # object (FID table present), and ASLR/DEP/high-entropy/CET must be on.
+    # Derived from the PE bytes independently of what the manifest claims.
+    mitigations = pe_mitigations(exe_bytes)
+    missing = [name for name in REQUIRED_MITIGATIONS if not mitigations.get(name)]
+    if missing:
+        raise SystemExit(f'PE mitigation gate failed, missing: {", ".join(missing)}')
+    if 'mitigations' not in manifest:
+        raise SystemExit('Manifest must record its PE mitigations')
+    if manifest.get('mitigations') != mitigations:
+        raise SystemExit('Manifest mitigations disagree with the PE headers')
 
     # Execute the packaged EXE itself for provenance and licenses (skipped
     # only by the fixture suite, which cannot execute its synthetic payload).

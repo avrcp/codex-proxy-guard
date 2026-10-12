@@ -16,7 +16,4 @@ target_compile_definitions(guard_foundation PUBLIC
     CPG_PRODUCT_VERSION="${CPG_PRODUCT_VERSION}"
     CPG_BUILD_COMMIT="${CPG_BUILD_COMMIT}"
     CPG_BUILD_DIRTY="${CPG_BUILD_DIRTY}")
-target_link_libraries(guard_foundation PUBLIC shell32 ole32)
-if(MSVC)
-    target_compile_options(guard_foundation PRIVATE /W4 /WX /utf-8 /permissive-)
-endif()
+target_link_libraries(guard_foundation PUBLIC shell32 ole32 PRIVATE cpg_build_options)

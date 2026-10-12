@@ -5,8 +5,7 @@ foreach(name engine_core engine_platform engine_launch engine_cli)
     target_include_directories(${name}_suite PRIVATE
         ${CMAKE_SOURCE_DIR}/tests/third_party/doctest
         ${CMAKE_SOURCE_DIR}/tests/support)
-    target_link_libraries(${name}_suite PRIVATE guard_engine)
-    target_compile_options(${name}_suite PRIVATE /W4 /WX /utf-8 /permissive-)
+    target_link_libraries(${name}_suite PRIVATE guard_engine cpg_build_options)
     target_compile_definitions(${name}_suite PRIVATE
         TARGET_ENGINE_PATH="$<TARGET_FILE:CodexProxyGuard>"
         CPG_DISCOVERY_FIXTURE="${CMAKE_SOURCE_DIR}/backend/tests/fixtures/appx_discovery_baseline.json"

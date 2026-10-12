@@ -183,6 +183,11 @@ $SizeReport = Join-Path $Staging 'size-report.json'
 Copy-Item (Join-Path $SizeReportDirectory 'size-report.json') $SizeReport
 
 $BuildDate = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+# PE mitigation facts (CFG/CET/ASLR/DEP) derived by the verifier's own PE
+# parser from the packaged EXE - never hand-maintained here.
+$MitigationsJson = (& (Get-Command python).Source @((Join-Path $Root 'scripts\verify-package.py'),
+    '--mitigations-of', $Exe) | Out-String).Trim()
+$Mitigations = $MitigationsJson | ConvertFrom-Json
 $Manifest = [ordered]@{
     schema = 'static-single'
     schema_version = 1
@@ -194,6 +199,7 @@ $Manifest = [ordered]@{
     powershell_appx_discovery = $false
     subsystem = 'console'
     crt = 'static'
+    mitigations = $Mitigations
     signed = $Signed
     authenticode_status = $AuthenticodeStatus
     publisher = $Publisher

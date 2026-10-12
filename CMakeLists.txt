@@ -12,6 +12,18 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CPG_PRODUCT_VERSION "0.7.0-rc.1" CACHE STRING "Product version")
 set(CPG_BUILD_COMMIT "unknown" CACHE STRING "Source commit")
 set(CPG_BUILD_DIRTY "true" CACHE STRING "Source dirty flag")
+
+# Shared MSVC hardening options for EVERY compiled object, production and
+# tests alike: /sdl and /guard:cf must instrument the static libraries too,
+# not just the final executable translation unit - CFG holes in library code
+# defeat the point of the mitigation. Third-party headers (doctest, nlohmann,
+# toml++) are already isolated with warning push/pop pragmas.
+add_library(cpg_build_options INTERFACE)
+if(MSVC)
+    target_compile_options(cpg_build_options INTERFACE
+        /W4 /WX /utf-8 /permissive- /sdl /guard:cf)
+endif()
+
 include(CTest)
 add_subdirectory(foundation)
 add_subdirectory(backend)
