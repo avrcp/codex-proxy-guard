@@ -11,17 +11,34 @@ is exercised by the canonical build script; these fixtures pass
 import hashlib
 import json
 import pathlib
+import runpy
 import struct
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 import zipfile
 
 REPOSITORY = pathlib.Path(__file__).resolve().parents[2]
 VERIFIER = REPOSITORY / 'scripts' / 'verify-package.py'
 COMMIT = '0123456789abcdef0123456789abcdef01234567'
 VERSION = '9.9.9-test'
+
+
+class ExecutionEncodingTests(unittest.TestCase):
+    def test_utf8_execution_output_with_non_utf8_host_locale(self):
+        run = runpy.run_path(str(VERIFIER))['run']
+        notice = '\u4e2d\u6587 \u2014 \u201cnotice\u201d'
+        output = 'import sys; sys.stdout.buffer.write(' + repr(notice.encode('utf-8')) + ')'
+        failure = 'import sys; sys.stderr.buffer.write(' + repr(notice.encode('utf-8')) + '); sys.exit(1)'
+        # Exercise real subprocess bytes while forcing the default text decoder
+        # to the host code page that broke the canonical package verifier.
+        with mock.patch.object(subprocess, '_text_encoding', return_value='gbk'):
+            self.assertEqual(run(pathlib.Path(sys.executable), '-c', output), notice)
+            with self.assertRaises(SystemExit) as raised:
+                run(pathlib.Path(sys.executable), '-c', failure)
+            self.assertIn(notice, str(raised.exception))
 
 
 def sha256_bytes(data: bytes) -> str:

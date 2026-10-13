@@ -53,7 +53,7 @@ canonical package reruns these suites from its fixed source archive.
 | R06 C03–C04 T01–T02 | `console_control.*`, terminal/input/plain/controller | Private-console Ctrl+C/Break; busy Q defaults to keep; EOF/invalid output/tiny viewport; real WM_CLOSE owner settle and terminal restore before acknowledgement; idle redirected pipe cancellation without EOF; unsupported character devices fail closed | PASS |
 | R07 U05–U07 | `tui_state.*`, `tui_controller.*` | Long Unicode scope scroll, border/input clipping, caret; paired code/message diagnostics; clipboard failure preserves original PID/daemon facts | PASS |
 | R08 D01–D02 L04 | `package_discovery.*`, `platform.cpp`, `launch.cpp` | Secondary optional null; required FullTrust; retries/count/bytes/deadline/cancel; image/elevation failure; conservative instance timestamp | PASS |
-| R09 B01–B05 | `build-portable.ps1`, `test-noqt.ps1`, `test_release_inputs.py` | Outside-root/version/lock/junction guards; fixed git archive, unique build/size/staging; temporary plain config; unsigned path; final package verifier | Source guards PASS; artifact verification recorded in release manifest/final delivery |
+| R09 B01–B05 | `build-portable.ps1`, `test-noqt.ps1`, `test_release_inputs.py` | Outside-root/version/lock/junction guards; fixed git archive, unique intermediates; temporary plain config; unsigned path; 23 verifier fixtures including UTF-8 execution on a GBK host; final package verifier | Source guards PASS; artifact verification recorded in release manifest/final delivery |
 
 The earlier “host strips HANDLE_LIST” explanation is not used by any current
 assertion. New synchronization and fault seams are compiled only into the

@@ -192,7 +192,7 @@ def pe_mitigations(data: bytes) -> dict:
 
 def run(args: pathlib.Path, *arguments: str) -> str:
     completed = subprocess.run([str(args), *arguments], capture_output=True, text=True,
-                               timeout=120)
+                               encoding='utf-8', timeout=120)
     if completed.returncode != 0:
         raise SystemExit(f'{args.name} {" ".join(arguments)} failed: {completed.stderr.strip()}')
     return completed.stdout.strip()
