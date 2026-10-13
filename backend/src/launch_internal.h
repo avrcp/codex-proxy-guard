@@ -27,6 +27,6 @@ struct LaunchServices {
 };
 // The caller owns both launch/configuration leases for the whole call.
 Json launchWith(const Config &config, LaunchOptions options,
-                const Cancellation &cancel, const LaunchServices &services);
+                const Cancellation &cancel, const LaunchServices &services, LaunchFacts *facts = nullptr);
 
 } // namespace cpg::detail

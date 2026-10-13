@@ -64,7 +64,7 @@ std::string asciiTrimmedUtf8(std::string_view value)
     return std::string(value.substr(begin, end - begin));
 }
 
-// Qt QJsonValue::toString() semantics: non-strings read as empty.
+// Optional protocol strings are empty when absent or explicitly null.
 std::string stringValue(const Json &value)
 {
     return value.is_string() ? value.get<std::string>() : std::string();
@@ -108,7 +108,7 @@ bool supported(const std::string &name)
 
 std::string runtime(const Json &app)
 {
-    const std::string entry = stringField(app, "entry_point", discoveryError, true);
+    const std::string entry = stringField(app, "entry_point", discoveryError, true, true);
     if (asciiEquals(entry, "Windows.FullTrustApplication")) return "full_trust_desktop";
     if (asciiTrimmedUtf8(entry).empty()
         && asciiTrimmedUtf8(stringField(app, "runtime_behavior", discoveryError, true, true)).empty()
@@ -142,7 +142,7 @@ void validateRecord(const Json &record)
         for (const auto &value : *applications) {
             if (!value.is_object()) fail(discoveryError, "Application must be an object");
             for (const char *key : {"application_id", "manifest_executable", "entry_point"})
-                (void)stringField(value, key, discoveryError, true);
+                (void)stringField(value, key, discoveryError, true, true);
             for (const char *key : {"runtime_behavior", "trust_level"})
                 (void)stringField(value, key, discoveryError, true, true);
         }
@@ -172,10 +172,10 @@ Desktop registeredDesktop(const Json &record)
     const Json &apps = field(record, "applications");
     if (apps.is_array()) {
         for (const auto &value : apps) {
-            const std::string manifest = stringField(value, "manifest_executable", discoveryError, true);
+            const std::string manifest = stringField(value, "manifest_executable", discoveryError, true, true);
             const std::string relative = toForwardSlashes(manifest);
             const bool trusted = desktop.packageName == "OpenAI.Codex"
-                ? stringField(value, "application_id", discoveryError, true) == "App"
+                ? stringField(value, "application_id", discoveryError, true, true) == "App"
                     && asciiEquals(relative, "app/ChatGPT.exe")
                 : runtime(value) == "full_trust_desktop"
                     && asciiEquals(baseName(relative), "ChatGPT.exe");
@@ -205,6 +205,8 @@ Desktop registeredDesktop(const Json &record)
         fail("APPX_EXECUTABLE_INVALID", "Manifest executable resolves outside the package directory");
     desktop.aumid = desktop.packageFamilyName + '!' + desktop.applicationId;
     desktop.runtimeKind = runtime(app);
+    if (desktop.runtimeKind != "full_trust_desktop")
+        fail("APPX_METADATA_INCOMPLETE", "Selected Desktop has no explicit FullTrust entry point");
     desktop.registered = true;
     desktop.discoverySource = "appx_manifest";
     return desktop;
@@ -323,14 +325,13 @@ Json activateAndObserve(const Json &request)
     observeIdentity(process.get(), receipt, aumid, "aumid", "observed_aumid", true);
     const std::string elevated = tokenElevation(process.get());
     if (elevated != "unknown") receipt["elevation"] = elevated == "elevated";
+    else receipt["observation_failure"] = "APPX_TARGET_ELEVATION_QUERY_FAILED: Cannot query target elevation";
     FILETIME creation{}, exited{}, kernel{}, user{};
     if (GetProcessTimes(process.get(), &creation, &exited, &kernel, &user))
-        receipt["instance"] = ticks(creation) + 250ULL * 10000ULL < ticks(submitted) ? "reused" : "created";
+        receipt["instance"] = detail::classifyInstance(ticks(creation), ticks(submitted));
     else receipt["observation_failure"] = "APPX_TARGET_TIME_QUERY_FAILED: Cannot query process creation time";
     const std::wstring actualPath = imagePath(process.get());
-    if (!actualPath.empty()
-        && normalizedWindowsPath(actualPath) != normalizedWindowsPath(utf8ToWide(request.value("expected_executable", ""))))
-        receipt["observation_failure"] = "APPX_TARGET_IMAGE_MISMATCH: Activated executable differs from selected Desktop";
+    detail::observeImage(receipt, actualPath, utf8ToWide(request.value("expected_executable", "")));
     const DWORD wait = WaitForSingleObject(process.get(), 150);
     if (wait == WAIT_OBJECT_0) {
         DWORD code = 0;
@@ -496,6 +497,18 @@ ProcessState desktopProcessState(const Desktop &desktop)
 }
 
 namespace detail {
+void observeImage(Json &receipt, const std::wstring &actual, const std::wstring &expected)
+{
+    if (actual.empty())
+        receipt["observation_failure"] = "APPX_TARGET_IMAGE_QUERY_FAILED: Cannot query activated executable";
+    else if (normalizedWindowsPath(actual) != normalizedWindowsPath(expected))
+        receipt["observation_failure"] = "APPX_TARGET_IMAGE_MISMATCH: Activated executable differs from selected Desktop";
+}
+std::string classifyInstance(std::uint64_t creation, std::uint64_t submission)
+{
+    if (!creation || !submission || creation == submission) return "unknown";
+    return creation < submission ? "reused" : "created";
+}
 Json activationRequest(const std::string &bytes)
 {
     Json request = parseStrictJsonObject(bytes, requestLimit, activationError);

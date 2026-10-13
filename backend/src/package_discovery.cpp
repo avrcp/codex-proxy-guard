@@ -1,4 +1,5 @@
 #include "package_discovery.h"
+#include "package_discovery_p.h"
 #include "cpg/win_handle.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -87,53 +88,16 @@ struct PackageIdentity {
     UINT32 processorArchitecture = 0xffffffffu;
 };
 
-std::vector<std::wstring> headFullNames(const wchar_t *familyName)
-{
-    UINT32 count = 0;
-    UINT32 length = 0;
-    LONG status = FindPackagesByPackageFamily(familyName, PACKAGE_FILTER_HEAD, &count,
-                                              nullptr, &length, nullptr, nullptr);
-    // An absent family reports success with zero packages, not an error.
-    if (status == ERROR_SUCCESS && count == 0) return {};
-    if (status == APPMODEL_ERROR_NO_PACKAGE) return {};
-    if (status != ERROR_INSUFFICIENT_BUFFER || count == 0 || length == 0)
-        fail("APPX_DISCOVERY_FAILED", "Package family enumeration failed");
-    std::vector<PWSTR> names(count);
-    std::vector<wchar_t> buffer(length);
-    std::vector<UINT32> properties(count);
-    for (;;) {
-        status = FindPackagesByPackageFamily(familyName, PACKAGE_FILTER_HEAD, &count,
-                                             names.data(), &length, buffer.data(),
-                                             properties.data());
-        if (status == ERROR_SUCCESS) break;
-        if (status == ERROR_INSUFFICIENT_BUFFER) {
-            names.resize(count);
-            buffer.resize(length);
-            properties.resize(count);
-            continue;
-        }
-        if (status == APPMODEL_ERROR_NO_PACKAGE) return {};
-        fail("APPX_DISCOVERY_FAILED", "Package family enumeration failed");
-    }
-    std::vector<std::wstring> result;
-    result.reserve(count);
-    for (UINT32 index = 0; index < count && index < names.size(); ++index)
-        if (names[index] && *names[index] != L'\0') result.emplace_back(names[index]);
-    if (result.size() > 16)
-        fail("APPX_DISCOVERY_FAILED", "Too many package records");
-    return result;
-}
-
 std::optional<PackageIdentity> packageIdOf(const std::wstring &fullName)
 {
     UINT32 size = 0;
     LONG status = PackageIdFromFullName(fullName.c_str(), PACKAGE_INFORMATION_FULL,
                                         &size, nullptr);
-    if (status != ERROR_INSUFFICIENT_BUFFER || size < sizeof(PACKAGE_ID)) return std::nullopt;
+    if (status != ERROR_INSUFFICIENT_BUFFER || size < sizeof(PACKAGE_ID) || size > 65536) return std::nullopt;
     std::vector<BYTE> buffer(size);
     status = PackageIdFromFullName(fullName.c_str(), PACKAGE_INFORMATION_FULL,
                                    &size, buffer.data());
-    if (status != ERROR_SUCCESS || size < sizeof(PACKAGE_ID)) return std::nullopt;
+    if (status != ERROR_SUCCESS || size < sizeof(PACKAGE_ID) || size > buffer.size()) return std::nullopt;
     PACKAGE_ID identifier{};
     std::memcpy(&identifier, buffer.data(), sizeof(PACKAGE_ID));
     PackageIdentity identity;
@@ -149,11 +113,11 @@ std::wstring packagePathOf(const std::wstring &fullName)
 {
     UINT32 length = 0;
     LONG status = GetPackagePathByFullName(fullName.c_str(), &length, nullptr);
-    if (status != ERROR_INSUFFICIENT_BUFFER || length == 0) return {};
+    if (status != ERROR_INSUFFICIENT_BUFFER || length == 0 || length > 32768) return {};
     std::wstring path(length, L'\0');
     status = GetPackagePathByFullName(fullName.c_str(), &length, path.data());
-    if (status != ERROR_SUCCESS) return {};
-    path.resize(wcslen(path.c_str()));
+    if (status != ERROR_SUCCESS || length == 0 || length > path.size() || path[length - 1] != L'\0') return {};
+    path.resize(length - 1);
     return path;
 }
 
@@ -165,7 +129,12 @@ std::wstring packagePathOf(const std::wstring &fullName)
 Json manifestString(IAppxManifestApplication *application, const wchar_t *name, bool normalizeSeparators)
 {
     LPWSTR value = nullptr;
-    if (FAILED(application->GetStringValue(name, &value))) return nullptr;
+    const HRESULT status = application->GetStringValue(name, &value);
+    if (FAILED(status)) {
+        if (value) CoTaskMemFree(value);
+        fail(status == E_INVALIDARG ? "APPX_MANIFEST_ATTRIBUTE_UNSUPPORTED" : "APPX_MANIFEST_READ_FAILED",
+             "Cannot read the supported manifest attribute (HRESULT " + std::to_string(static_cast<long>(status)) + ")");
+    }
     std::wstring text(value ? value : L"");
     if (value) CoTaskMemFree(value);
     if (text.empty()) return nullptr;
@@ -175,7 +144,8 @@ Json manifestString(IAppxManifestApplication *application, const wchar_t *name, 
     return wideToUtf8(text);
 }
 
-Json manifestApplications(const std::filesystem::path &manifestPath)
+Json manifestApplications(const std::filesystem::path &manifestPath, const Cancellation &cancel,
+    std::chrono::steady_clock::time_point deadline)
 {
     ComPtr<IStream> stream;
     if (FAILED(SHCreateStreamOnFileEx(manifestPath.c_str(), STGM_READ | STGM_SHARE_DENY_NONE,
@@ -197,14 +167,16 @@ Json manifestApplications(const std::filesystem::path &manifestPath)
         fail("APPX_DISCOVERY_FAILED", "Cannot enumerate manifest applications");
     Json records = Json::array();
     while (hasCurrent) {
+        cancel.check();
+        if (std::chrono::steady_clock::now() >= deadline)
+            fail("APPX_DISCOVERY_TIMEOUT", "Package discovery exceeded its deadline");
         ComPtr<IAppxManifestApplication> application;
         if (FAILED(applications->GetCurrent(application.out())) || !application.value)
             fail("APPX_DISCOVERY_FAILED", "Cannot read a manifest application");
         Json record{{"application_id", manifestString(application.value, L"Id", false)},
                     {"manifest_executable", manifestString(application.value, L"Executable", true)},
                     {"entry_point", manifestString(application.value, L"EntryPoint", false)},
-                    {"runtime_behavior", manifestString(application.value, L"RuntimeBehavior", false)},
-                    {"trust_level", manifestString(application.value, L"TrustLevel", false)}};
+                    {"runtime_behavior", nullptr}, {"trust_level", nullptr}};
         records.push_back(std::move(record));
         if (records.size() > 16)
             fail("APPX_DISCOVERY_FAILED", "Package has too many applications");
@@ -224,15 +196,65 @@ bool versionLess(const PACKAGE_VERSION &a, const PACKAGE_VERSION &b)
 
 } // namespace
 
+std::vector<std::wstring> detail::packageFullNames(const Cancellation &cancel,
+    const PackageFamilyQuery &query, std::chrono::steady_clock::time_point deadline)
+{
+    UINT32 count = 0, length = 0;
+    std::vector<PWSTR> names;
+    std::vector<wchar_t> buffer;
+    std::vector<UINT32> properties;
+    for (int attempt = 0; attempt < 5; ++attempt) {
+        cancel.check();
+        if (std::chrono::steady_clock::now() >= deadline)
+            fail("APPX_DISCOVERY_TIMEOUT", "Package discovery exceeded its deadline");
+        const LONG status = query(&count, names.empty() ? nullptr : names.data(),
+            &length, buffer.empty() ? nullptr : buffer.data(), properties.empty() ? nullptr : properties.data());
+        if (status == APPMODEL_ERROR_NO_PACKAGE || (status == ERROR_SUCCESS && count == 0)) return {};
+        if (count > 16 || length > 65536)
+            fail("APPX_DISCOVERY_LIMIT", "Package enumeration exceeded its capacity limit");
+        if (status == ERROR_INSUFFICIENT_BUFFER) {
+            if (!count || !length) fail("APPX_DISCOVERY_FAILED", "Package enumeration returned invalid capacity");
+            names.resize(count); buffer.resize(length); properties.resize(count);
+            continue;
+        }
+        if (status != ERROR_SUCCESS || count > names.size() || length > buffer.size())
+            fail("APPX_DISCOVERY_FAILED", "Package family enumeration failed");
+        std::vector<std::wstring> result;
+        for (UINT32 index = 0; index < count; ++index) {
+            const auto address = reinterpret_cast<std::uintptr_t>(names[index]);
+            const auto begin = reinterpret_cast<std::uintptr_t>(buffer.data());
+            const auto end = begin + buffer.size() * sizeof(wchar_t);
+            if (address < begin || address >= end || (address - begin) % sizeof(wchar_t))
+                fail("APPX_DISCOVERY_FAILED", "Package enumeration returned an invalid name");
+            const auto offset = (address - begin) / sizeof(wchar_t);
+            const auto first = buffer.begin() + static_cast<std::ptrdiff_t>(offset);
+            const auto last = std::find(first, buffer.end(), L'\0');
+            if (last == buffer.end() || first == last)
+                fail("APPX_DISCOVERY_FAILED", "Package enumeration returned an invalid name");
+            result.emplace_back(first, last);
+        }
+        return result;
+    }
+    fail("APPX_DISCOVERY_UNSTABLE", "Package enumeration did not stabilize within its retry budget");
+}
+
 Json discoverPackagesNative(const Cancellation &cancel)
 {
     cancel.check();
     ComScope com;
+    if (FAILED(com.result))
+        fail("APPX_DISCOVERY_COM_FAILED", "Cannot initialize package discovery COM (HRESULT "
+            + std::to_string(static_cast<long>(com.result)) + ")");
     cancel.check();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     Json records = Json::array();
     for (const SupportedPackage &supported : supportedPackages) {
         cancel.check();
-        const std::vector<std::wstring> fullNames = headFullNames(supported.familyName);
+        const std::vector<std::wstring> fullNames = detail::packageFullNames(cancel,
+            [&](UINT32 *count, PWSTR *names, UINT32 *length, PWSTR buffer, UINT32 *properties) {
+                return FindPackagesByPackageFamily(supported.familyName, PACKAGE_FILTER_HEAD,
+                    count, names, length, buffer, properties);
+            }, deadline);
         if (fullNames.empty()) continue;
         // Highest version wins, mirroring Sort-Object Version -Descending |
         // Select-Object -First 1; ties prefer the native architecture.
@@ -274,7 +296,7 @@ Json discoverPackagesNative(const Cancellation &cancel)
                     {"architecture", architectureName(best->processorArchitecture)},
                     {"install_location", wideToUtf8(installLocation)},
                     {"applications", manifestApplications(std::filesystem::path(installLocation)
-                                                             / L"AppxManifest.xml")}};
+                                                             / L"AppxManifest.xml", cancel, deadline)}};
         records.push_back(std::move(record));
     }
     return Json{{"schema_version", 1}, {"records", records}};

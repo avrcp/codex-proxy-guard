@@ -358,6 +358,11 @@ Json detail::activationReceipt(const Json &worker) {
     }
     failed("early_exit_code", "APPX_TARGET_EXITED_EARLY", "The activated Desktop exited during observation.");
     failed("observation_failure", "APPX_ACTIVATION_OUTCOME_UNKNOWN", "Activated Desktop observations were incomplete; do not retry automatically.");
+    const Json &targetElevation = at(worker, "elevation");
+    if (!targetElevation.is_boolean())
+        throw Error("APPX_TARGET_ELEVATION_QUERY_FAILED", "Activated Desktop elevation could not be verified; do not retry automatically.");
+    if (targetElevation.get<bool>())
+        throw Error("APPX_TARGET_ELEVATED", "Activated Desktop is elevated; normal-user launch could not be verified.");
     return Json{{"pid", at(worker, "pid")}, {"launch_method", "appmodel_activation"},
                 {"activation_state", "returned"}, {"instance", at(worker, "instance")},
                 {"package_identity", "matched"}, {"aumid", "matched"},
@@ -399,7 +404,10 @@ std::string stopCodexDaemon(const CodexCli &cli, const Cancellation &cancel,
 }
 
 Json detail::launchWith(const Config &config, LaunchOptions options,
-                        const Cancellation &cancel, const LaunchServices &services) {
+                        const Cancellation &cancel, const LaunchServices &services, LaunchFacts *facts) {
+    LaunchFacts localFacts;
+    if (!facts) facts = &localFacts;
+    *facts = LaunchFacts{};
     if (options.repair && options.activationOnly)
         throw Error("INVALID_LAUNCH_OPTIONS", "Activation-only cannot be combined with daemon repair.");
     config.validate();
@@ -433,6 +441,7 @@ Json detail::launchWith(const Config &config, LaunchOptions options,
         }
     }
     std::string daemon = "skipped";
+    facts->backendProxyConfig = backend;
     CodexCli cli;
     try {
         if (options.repair) {
@@ -442,7 +451,9 @@ Json detail::launchWith(const Config &config, LaunchOptions options,
             requireStopped(services.process(desktop));
             cli = services.resolve();
             cancel.check();
+            facts->daemonPreparation = "unconfirmed";
             daemon = services.stop(cli); // exactly once, and only after preparation
+            facts->daemonPreparation = daemon;
             if (daemon != "stopped" && daemon != "not_needed")
                 throw Error("CODEX_DAEMON_STOP_FAILED", "Daemon stop did not confirm its final state.");
             cancel.check();
@@ -457,13 +468,19 @@ Json detail::launchWith(const Config &config, LaunchOptions options,
         Json receipt;
         services.markSubmitted();
         if (desktop.registered) {
-            receipt = detail::activationReceipt(services.activate(desktop, plan.arguments));
+            facts->activationState = "unknown";
+            const Json worker = services.activate(desktop, plan.arguments);
+            if (at(worker, "activation_returned").is_boolean()
+                && at(worker, "activation_returned").get<bool>()) facts->activationState = "returned";
+            receipt = detail::activationReceipt(worker);
             receipt["proxy_delivery"] = options.activationOnly ? "not_established"
                 : backend == "prepared" ? "activation_arguments_and_home_config" : "activation_arguments";
         } else {
             UnicodeEnvironment environment = proxyEnvironment(config);
             if (!cli.home.empty()) environment.set(L"CODEX_HOME", cli.home.wstring());
+            facts->activationState = "unknown";
             receipt = services.native(desktop, environment);
+            facts->activationState = "returned";
             receipt["proxy_delivery"] = "process_environment";
         }
         receipt["proxy_endpoint"] = options.activationOnly ? Json(nullptr) : Json(plan.endpoint);
@@ -472,6 +489,8 @@ Json detail::launchWith(const Config &config, LaunchOptions options,
         receipt["desktop"] = desktop.publicJson();
         return receipt;
     } catch (const Error &error) {
+        if (error.code == "LAUNCH_CANCELLED" && facts->activationState == "unknown")
+            facts->activationState = "not_submitted";
         if (daemon == "stopped")
             throw Error(error.code, error.message + "; the shared Codex background server was stopped before this failure.");
         throw;
@@ -479,7 +498,7 @@ Json detail::launchWith(const Config &config, LaunchOptions options,
 }
 
 Json launchPipeline(const Config &config, const std::filesystem::path &configPath,
-                    LaunchOptions options, const Cancellation &cancel) {
+                    LaunchOptions options, const Cancellation &cancel, LaunchFacts *facts) {
     cancel.check();
     ConfigLease lease(configPath, config);
     requireNonElevated();
@@ -494,7 +513,7 @@ Json launchPipeline(const Config &config, const std::filesystem::path &configPat
     services.activate = [&](const Desktop &desktop, const std::string &arguments) { return activateDesktop(desktop, arguments, cancel); };
     services.native = [&](const Desktop &desktop, const UnicodeEnvironment &environment) { return nativeLaunch(desktop, environment, cancel); };
     services.markSubmitted = [&] { startup.markSubmitted(); };
-    return detail::launchWith(config, options, cancel, services);
+    return detail::launchWith(config, options, cancel, services, facts);
 }
 
 } // namespace cpg

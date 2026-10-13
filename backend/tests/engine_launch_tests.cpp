@@ -121,6 +121,32 @@ TEST_CASE("proxy arguments")
     }
 }
 
+TEST_CASE("activation cannot claim verified success with unknown or elevated target")
+{
+    Json worker = cleanWorker();
+    worker["elevation"] = nullptr;
+    CHECK_THROWS_AS(detail::activationReceipt(worker), Error);
+    worker["elevation"] = true;
+    CHECK_THROWS_AS(detail::activationReceipt(worker), Error);
+}
+
+TEST_CASE("launch failure retains completed daemon and backend preparation facts")
+{
+    Fixture fixture;
+    fixture.authorize();
+    fixture.services.activate = [](const Desktop &, const std::string &) -> Json {
+        throw Error("APPX_ACTIVATION_OUTCOME_UNKNOWN", "Fixture activation did not return.");
+    };
+    LaunchFacts facts;
+    CHECK(errorCode([&] {
+        (void)detail::launchWith(fixture.config, {true, false}, fixture.cancel, fixture.services, &facts);
+    }) == "APPX_ACTIVATION_OUTCOME_UNKNOWN");
+    CHECK(facts.backendProxyConfig == "prepared");
+    CHECK(facts.daemonPreparation == "stopped");
+    CHECK(facts.activationState == "unknown");
+    CHECK(fixture.count("stop") == 1);
+}
+
 TEST_CASE("environment contract")
 {
     Config config;

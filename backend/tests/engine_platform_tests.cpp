@@ -9,6 +9,7 @@
 
 #include "platform.h"
 #include "package_discovery.h"
+#include "package_discovery_p.h"
 #include "platform_protocol_p.h"
 #include "../../tests/support/test_support.h"
 
@@ -119,6 +120,60 @@ TEST_CASE("codex is preferred over classic")
     REQUIRE(createDesktop(temporary.path));
     CHECK(parseDiscovery(envelope(Json::array({record(temporary.path, "OpenAI.ChatGPT-Desktop"),
         record(temporary.path)}))).packageName == "OpenAI.Codex");
+}
+
+TEST_CASE("secondary application null fields do not reject a valid primary entry")
+{
+    TemporaryDirectory temporary;
+    REQUIRE(createDesktop(temporary.path));
+    Json data = record(temporary.path);
+    data["applications"].push_back(Json{{"application_id", nullptr},
+        {"manifest_executable", nullptr}, {"entry_point", nullptr},
+        {"runtime_behavior", nullptr}, {"trust_level", nullptr}});
+    CHECK(parseDiscovery(envelope(Json::array({data}))).applicationId == "App");
+}
+
+TEST_CASE("package enumeration growth capacity cancellation and deadline are bounded")
+{
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    int calls = 0;
+    const auto unstable = [&](UINT32 *count, PWSTR *, UINT32 *length, PWSTR, UINT32 *) -> LONG {
+        ++calls; *count = 1; *length = static_cast<UINT32>(calls * 32); return ERROR_INSUFFICIENT_BUFFER;
+    };
+    CHECK(errorCode([&] { (void)detail::packageFullNames({}, unstable, deadline); }) == "APPX_DISCOVERY_UNSTABLE");
+    CHECK(calls <= 5);
+    calls = 0;
+    const auto oversized = [&](UINT32 *count, PWSTR *, UINT32 *length, PWSTR, UINT32 *) -> LONG {
+        ++calls; *count = 100000; *length = 100000000; return ERROR_INSUFFICIENT_BUFFER;
+    };
+    CHECK(errorCode([&] { (void)detail::packageFullNames({}, oversized, deadline); }) == "APPX_DISCOVERY_LIMIT");
+    CHECK(calls == 1);
+    Cancellation cancel; cancel.cancel(); calls = 0;
+    CHECK(errorCode([&] { (void)detail::packageFullNames(cancel, unstable, deadline); }) == "LAUNCH_CANCELLED");
+    CHECK(calls == 0);
+    CHECK(errorCode([&] { (void)detail::packageFullNames({}, unstable, std::chrono::steady_clock::now()); }) == "APPX_DISCOVERY_TIMEOUT");
+    CHECK(calls == 0);
+}
+
+TEST_CASE("instance observation never treats an existing process as newly created")
+{
+    CHECK(detail::classifyInstance(9999, 10000) == "reused");
+    CHECK(detail::classifyInstance(10000, 10000) == "unknown");
+    CHECK(detail::classifyInstance(10001, 10000) == "created");
+    CHECK(detail::classifyInstance(0, 10000) == "unknown");
+}
+
+TEST_CASE("image query failure remains an explicit incomplete observation")
+{
+    auto value = receipt();
+    detail::observeImage(value, L"", L"C:/fixture/Desktop.exe");
+    CHECK(value.at("observation_failure").get<std::string>().find("APPX_TARGET_IMAGE_QUERY_FAILED") == 0);
+    value = receipt();
+    detail::observeImage(value, L"C:/other/Desktop.exe", L"C:/fixture/Desktop.exe");
+    CHECK(value.at("observation_failure").get<std::string>().find("APPX_TARGET_IMAGE_MISMATCH") == 0);
+    value = receipt();
+    detail::observeImage(value, L"C:\\fixture\\Desktop.exe", L"c:/fixture/desktop.exe");
+    CHECK(value.at("observation_failure").is_null());
 }
 
 TEST_CASE("discovery protocol fails closed")
