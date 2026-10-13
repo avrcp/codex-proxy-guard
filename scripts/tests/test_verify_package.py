@@ -8,6 +8,7 @@ production execution gate (running build-info/licenses on the packaged EXE)
 is exercised by the canonical build script; these fixtures pass
 --skip-execution and instead verify every structural and digest gate.
 """
+import ctypes
 import hashlib
 import json
 import pathlib
@@ -311,6 +312,58 @@ class VerifierTests(unittest.TestCase):
         # absent - the PE parse is the authority, not the manifest.
         self.write_manifest(mitigations=mitigation_facts(False))
         self.assertNotEqual(self.verify().returncode, 0)
+
+
+class RC3ReviewReproductions(unittest.TestCase):
+    """Regressions for the two RC3 release-validation defects (R01/R02).
+
+    Committed red against the RC3 verifier on purpose: the WinTrust request
+    could never be constructed (assigning byref() into the typed pFile field
+    raises TypeError), the cleanup action was recorded as 16 while
+    WTD_STATEACTION_CLOSE is 2, and CET compatibility was accepted from the
+    APPCONTAINER DllCharacteristics bit and an unrelated load-config GuardFlags
+    bit instead of the extended-characteristics debug record. The fix commits
+    turn each reproduction green without changing what it asserts.
+    """
+
+    def test_typed_pointer_field_rejects_byref_construction(self):
+        # ctypes semantics the verifier depends on: byref() produces an
+        # external-call argument, not a field value; a typed POINTER field
+        # must be assigned ctypes.pointer(instance).
+        class FileInfo(ctypes.Structure):
+            _fields_ = [('value', ctypes.c_uint32)]
+
+        class TrustData(ctypes.Structure):
+            _fields_ = [('pFile', ctypes.POINTER(FileInfo))]
+
+        info = FileInfo(1)
+        with self.assertRaises(TypeError):
+            TrustData(ctypes.byref(info))
+        self.assertEqual(TrustData(ctypes.pointer(info)).pFile.contents.value, 1)
+
+    def test_wintrust_lifecycle_verifies_then_closes_with_action_2(self):
+        module = runpy.run_path(str(VERIFIER))
+        calls = []
+
+        def fake_api(hwnd, action, data):
+            calls.append(data.contents.dwStateAction)
+            return 0
+
+        module['verify_authenticode'](pathlib.Path('C:/definitely/not/signed.exe'),
+                                      api=fake_api)
+        self.assertEqual(calls, [1, 2])  # WTD_STATEACTION_VERIFY then CLOSE
+
+    def test_appcontainer_bit_alone_is_not_cet_evidence(self):
+        module = runpy.run_path(str(VERIFIER))
+        image = bytearray(minimal_console_pe())
+        pe = struct.unpack_from('<I', image, 0x3c)[0]
+        optional = pe + 24
+        # APPCONTAINER DllCharacteristics, CFG-only GuardFlags, no debug
+        # record carrying the extended CET characteristics.
+        struct.pack_into('<H', image, optional + 70, 0x5160)
+        struct.pack_into('<I', image, 0x400 + 144, 0x500)
+        struct.pack_into('<II', image, optional + 160, 0, 0)
+        self.assertIs(module['pe_mitigations'](bytes(image))['cet_compat'], False)
 
 
 if __name__ == '__main__':
