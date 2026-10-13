@@ -4,9 +4,11 @@ add_library(guard_tui STATIC
     src/clipboard.cpp
     src/display_width.cpp
     src/input.cpp
+    src/plain_input.cpp
     src/screen.cpp
     src/terminal_session.cpp
     src/tui_app.cpp
+    src/tui_controller.cpp
     src/tui_state.cpp)
 target_include_directories(guard_tui PUBLIC src)
 target_link_libraries(guard_tui PUBLIC guard_engine PRIVATE cpg_build_options)

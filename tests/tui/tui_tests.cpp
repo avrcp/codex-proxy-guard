@@ -14,6 +14,15 @@
 #include "screen.h"
 #include "session.h"
 #include "tui_state.h"
+#include "tui_controller.h"
+#include "terminal_session.h"
+#include "plain_input.h"
+#include "interactive_terminal_scope.h"
+#include "cpg/text.h"
+#include "cpg/win_handle.h"
+#include "cpg/console_control.h"
+#include <sstream>
+#include <thread>
 
 #include <atomic>
 #include <cwctype>
@@ -25,27 +34,28 @@ using namespace cpg::tui;
 
 namespace {
 
-Json snapshotFixture(bool canLaunch = true, bool enabled = false)
+SessionView snapshotFixture(bool canLaunch = true, bool enabled = false)
 {
-    return Json{
-        {"config_readiness", "ready"},
-        {"proxy", Json{{"url", "http://127.0.0.1:10808"}, {"host", "127.0.0.1"}, {"port", 10808}}},
-        {"launch", Json{{"method", "appmodel_activation"}}},
-        {"desktop", Json{{"state", "found"}, {"product", "chat_gpt"}, {"display_name", "ChatGPT Desktop"},
-                         {"package_version", "26.1.2.3"}, {"architecture", "X64"},
-                         {"application_id", "App"}, {"runtime_kind", "full_trust_desktop"}}},
-        {"process", Json{{"state", "stopped"}, {"pid", nullptr}}},
-        {"coverage", Json{{"state", enabled ? "current" : "not_authorized"}, {"enabled", enabled},
-                          {"authorized_home", enabled ? Json("C:/fixture/.codex") : Json(nullptr)},
-                          {"candidate_home", "C:/fixture/.codex"}}},
-        {"busy", false}, {"elevation", "not_elevated"}, {"error", nullptr},
-        {"actions", Json{{"can_launch", canLaunch}, {"can_edit_proxy", true},
-                         {"can_authorize_backend_proxy", !enabled}, {"can_revoke_backend_proxy", enabled},
-                         {"can_repair", canLaunch}, {"can_refresh", true}, {"can_cancel", false}}},
-        {"confirmations", Json{
-            {"backend_proxy", Json{{"token", "tok123"}, {"enabled", !enabled}, {"home", "C:/fixture/.codex"}}},
-            {"repair", Json{{"token", "reptok"}}}}},
-    };
+    SessionView view;
+    view.ready = true;
+    view.proxy = {"http://127.0.0.1:10808", "127.0.0.1", 10808};
+    view.launchMethod = "appmodel_activation";
+    view.desktop.state = "found"; view.desktop.product = "chat_gpt";
+    view.desktop.displayName = "ChatGPT Desktop"; view.desktop.packageVersion = "26.1.2.3";
+    view.desktop.architecture = "X64"; view.desktop.applicationId = "App";
+    view.desktop.runtimeKind = "full_trust_desktop";
+    view.process.state = "stopped";
+    view.coverage.state = enabled ? "current" : "not_authorized";
+    view.coverage.enabled = enabled;
+    if (enabled) view.coverage.authorizedHome = L"C:/fixture/.codex";
+    view.coverage.candidateHome = L"C:/fixture/.codex";
+    view.actions.canLaunch = canLaunch; view.actions.canEditProxy = true;
+    view.actions.canAuthorizeBackendProxy = !enabled; view.actions.canRevokeBackendProxy = enabled;
+    view.actions.canRepair = canLaunch; view.actions.canRefresh = true;
+    view.actions.blockedReason = "Desktop unavailable - press R to refresh.";
+    view.consent = ConsentProposal{"tok123", !enabled, L"C:/fixture/.codex", 1};
+    view.repair = RepairProposal{"reptok", 1};
+    return view;
 }
 
 Key key(wchar_t unicode)
@@ -216,8 +226,8 @@ TEST_CASE("cluster-aware truncation never splits a glyph")
 TEST_CASE("the main view renders unicode homes without escaping the frame")
 {
     TuiState state;
-    Json snapshot = snapshotFixture(true, true);
-    snapshot["coverage"]["authorized_home"] = "C:/users/\xf0\x9f\x99\x82\xc3\xa1/.c\xc2\xa1odex";
+    SessionView snapshot = snapshotFixture(true, true);
+    snapshot.coverage.authorizedHome = utf8ToWide("C:/users/\xf0\x9f\x99\x82\xc3\xa1/.c\xc2\xa1odex");
     state.setSnapshot(snapshot);
     for (const int width : {72, 40, 30}) {
         Screen screen;
@@ -275,18 +285,16 @@ TEST_CASE("key mapping follows the primary bindings")
     CHECK(state.modal() == Modal::None);
     state.key(key(L'?'));
     CHECK(state.modal() == Modal::Help);
-    state.key(key(L' '));
+    state.key(virtualKey(VK_ESCAPE));
     CHECK(state.modal() == Modal::None);
 }
 
 TEST_CASE("modal openers respect the snapshot capability flags")
 {
     TuiState state;
-    Json snapshot = snapshotFixture(false);
-    snapshot["actions"] = Json{{"can_launch", false}, {"can_edit_proxy", false},
-                               {"can_authorize_backend_proxy", false},
-                               {"can_revoke_backend_proxy", false}, {"can_repair", false},
-                               {"can_refresh", true}, {"can_cancel", false}};
+    SessionView snapshot = snapshotFixture(false);
+    snapshot.actions = Capabilities{};
+    snapshot.actions.canRefresh = true;
     state.setSnapshot(snapshot);
     CHECK(state.key(key(L'e')).kind == TuiState::Action::Kind::None);
     CHECK(state.key(key(L'b')).kind == TuiState::Action::Kind::None);
@@ -366,18 +374,20 @@ TEST_CASE("busy state gates destructive keys and keeps cancel paths")
     CHECK(state.key(cancel).kind == TuiState::Action::Kind::Cancel);
     state.key(key(L'q'));
     CHECK(state.modal() == Modal::QuitWhileBusy);
-    CHECK(state.key(key(L'y')).kind == TuiState::Action::Kind::Cancel);
+    CHECK(state.key(key(L'y')).kind == TuiState::Action::Kind::CancelAndQuit);
 }
 
 TEST_CASE("the blocked reason is stated in text, not only in color")
 {
-    Json snapshot = snapshotFixture(false);
-    snapshot["process"] = Json{{"state", "running"}, {"pid", 12}};
-    snapshot["error"] = Error("X", "y").json();
+    SessionView snapshot = snapshotFixture(false);
+    snapshot.process = {"running", 12};
+    snapshot.actions.blockedReason = "Desktop is running - fully exit it before launching.";
+    snapshot.error = Error("X", "y");
     const std::wstring reason = TuiState::blockedReason(snapshot);
     CHECK(reason.find(L"running") != std::wstring::npos);
-    Json repair = snapshotFixture(false);
-    repair["error"] = Error("CONFIG_INVALID", "broken").json();
+    SessionView repair = snapshotFixture(false);
+    repair.error = Error("CONFIG_INVALID", "broken");
+    repair.actions.blockedReason = "Proxy configuration needs repair - press E to edit it.";
     CHECK(TuiState::blockedReason(repair).find(L"E") != std::wstring::npos);
 }
 
@@ -408,7 +418,7 @@ TEST_CASE("the TUI renders before the first session snapshot arrives")
     REQUIRE_NOTHROW(state.draw(screen));
     const std::wstring frame = renderFrame(screen);
     CHECK(frame.find(L"CODEX PROXY GUARD") != std::wstring::npos);
-    CHECK_FALSE(TuiState::blockedReason(Json::object()).empty());
+    CHECK_FALSE(TuiState::blockedReason(SessionView{}).empty());
     // Capability-gated keys fail closed before the first snapshot arrives.
     CHECK(state.key(key(L'e')).kind == TuiState::Action::Kind::None);
     CHECK(state.key(key(L'b')).kind == TuiState::Action::Kind::None);
@@ -627,4 +637,668 @@ TEST_CASE("the copy notice is transient feedback on the status line")
     CHECK(frame.find(L"Diagnostic copied") == std::wstring::npos);
 }
 
-CPG_TEST_MAIN
+TEST_CASE("RC3 Enter on Host submits the complete proxy form")
+{
+    TuiState state;
+    state.setSnapshot(snapshotFixture());
+    state.key(key(L'e'));
+    state.setEditorSeed(L"127.0.0.1", L"7890");
+    const auto action = state.key(virtualKey(VK_RETURN));
+    CHECK(action.kind == TuiState::Action::Kind::SaveProxy);
+    CHECK(action.port == 7890);
+}
+
+TEST_CASE("RC3 a pending save retains its editor and draft")
+{
+    TuiState state;
+    state.setSnapshot(snapshotFixture());
+    state.key(key(L'e'));
+    state.setEditorSeed(L"localhost", L"7890");
+    state.setBusy(true, "Saving");
+    CHECK(state.modal() == Modal::ProxyEditor);
+}
+
+TEST_CASE("RC3 nullable unpackaged entry fields render without exceptions")
+{
+    TuiState state;
+    auto snapshot = snapshotFixture();
+    snapshot.desktop.applicationId.reset();
+    snapshot.desktop.runtimeKind.reset();
+    state.setSnapshot(snapshot);
+    Screen screen;
+    screen.resize(80, 24);
+    CHECK_NOTHROW(state.draw(screen));
+}
+
+TEST_CASE("RC3 result refresh works and help ignores unrelated keys")
+{
+    TuiState state;
+    state.setSnapshot(snapshotFixture());
+    state.setOperationOutcome(nullptr);
+    CHECK(state.key(key(L'r')).kind == TuiState::Action::Kind::Refresh);
+    state.clearModal();
+    state.key(key(L'?'));
+    state.key(key(L'x'));
+    CHECK(state.modal() == Modal::Help);
+}
+
+
+namespace {
+void pump(TuiController &controller)
+{
+    for (int count = 0; controller.busy() && count < 5000; ++count) { controller.poll(); Sleep(1); }
+    REQUIRE_FALSE(controller.busy());
+}
+Desktop absentDesktop(const Config &, const Cancellation &) { throw Error("APPX_NOT_FOUND", "No fixture Desktop."); }
+std::string normalUser() { return "not_elevated"; }
+void yes(TuiController &controller)
+{
+    for (const wchar_t ch : std::wstring_view(L"YES")) controller.handleKey(key(ch));
+    controller.handleKey(virtualKey(VK_RETURN));
+}
+struct FakeTerminal : TerminalApi {
+    DWORD inputMode = ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_QUICK_EDIT_MODE | ENABLE_VIRTUAL_TERMINAL_INPUT;
+    DWORD outputMode = 0;
+    CONSOLE_CURSOR_INFO cursor{23, FALSE};
+    int getModeCalls = 0, setModeCalls = 0, cursorWrites = 0, writes = 0;
+    int failGetMode = 0, failSetMode = 0;
+    bool failGetCursor = false, failCursorWrite = false, failAlt = false;
+    HANDLE standardHandle(DWORD id) override { return reinterpret_cast<HANDLE>(static_cast<std::uintptr_t>(id == STD_INPUT_HANDLE ? 1 : 2)); }
+    bool getMode(HANDLE h, DWORD &mode) override {
+        if (++getModeCalls == failGetMode) return false;
+        mode = h == reinterpret_cast<HANDLE>(1) ? inputMode : outputMode; return true;
+    }
+    bool setMode(HANDLE h, DWORD mode) override {
+        if (++setModeCalls == failSetMode) return false;
+        (h == reinterpret_cast<HANDLE>(1) ? inputMode : outputMode) = mode; return true;
+    }
+    bool getCursor(HANDLE, CONSOLE_CURSOR_INFO &value) override { value = cursor; return !failGetCursor; }
+    bool setCursor(HANDLE, const CONSOLE_CURSOR_INFO &value) override {
+        ++cursorWrites; if (failCursorWrite) return false; cursor = value; return true;
+    }
+    bool write(HANDLE, std::wstring_view value) override { ++writes; return !(failAlt && value == L"\x1b[?1049h"); }
+};
+}
+TEST_CASE("RC3 production handler opens first consent with the exact engine proposal")
+{
+    cpgtest::TemporaryDirectory root;
+    Config config; config.home = root.path;
+    const auto path = root.file(L"guard.toml"); initializeConfig(path, config, false);
+    EngineSession session(path, absentDesktop, normalUser);
+    TuiState state; TuiController controller(session, state);
+    controller.refresh(); pump(controller);
+    REQUIRE(session.view().consent.has_value());
+    const auto proposal = *session.view().consent;
+    CHECK_FALSE(session.view().coverage.authorizedHome.has_value());
+    CHECK_NOTHROW(controller.handleKey(key(L'b')));
+    REQUIRE(state.modal() == Modal::Consent);
+    REQUIRE(state.consentProposal().has_value());
+    CHECK(*state.consentProposal() == proposal);
+    Screen screen; screen.resize(86, 28); CHECK_NOTHROW(state.draw(screen));
+    controller.handleKey(virtualKey(VK_ESCAPE));
+    CHECK_FALSE(Config::load(path).manageBackend);
+    controller.handleKey(key(L'b')); yes(controller); pump(controller);
+    CHECK(Config::load(path).manageBackend);
+    CHECK(Config::load(path).home == proposal.home);
+}
+TEST_CASE("RC3 displayed consent is frozen and stale configuration is refused")
+{
+    cpgtest::TemporaryDirectory root;
+    Config config; config.home = root.path;
+    const auto path = root.file(L"guard.toml"); initializeConfig(path, config, false);
+    EngineSession session(path, absentDesktop, normalUser);
+    TuiState state; TuiController controller(session, state);
+    controller.refresh(); pump(controller); controller.handleKey(key(L'b'));
+    const auto proposal = *state.consentProposal();
+    auto newer = session.view(); newer.consent->token = "different"; newer.consent->home = root.file(L"other");
+    state.setSnapshot(newer);
+    CHECK(*state.consentProposal() == proposal);
+    updateProxy(path, config, false, "localhost", 7888);
+    yes(controller); pump(controller);
+    CHECK_FALSE(Config::load(path).manageBackend);
+    CHECK(Config::load(path).port == 7888);
+    CHECK(state.modal() == Modal::ErrorResult);
+    CHECK_FALSE(state.snapshot().consent.has_value());
+    controller.handleKey(key(L'b'));
+    CHECK(state.modal() == Modal::ErrorResult);
+    controller.handleKey(key(L'd'));
+    CHECK(state.modal() == Modal::ErrorResult);
+}
+TEST_CASE("RC3 missing proposal blocks B and real unpackaged session renders")
+{
+    cpgtest::TemporaryDirectory root;
+    Config config; config.home = root.path;
+    const auto path = root.file(L"guard.toml"); initializeConfig(path, config, false);
+    SessionServices services;
+    services.proposalHome = [](const Config &) { return std::filesystem::path{}; };
+    services.process = [](const Desktop &) { ProcessState result; result.state = "stopped"; return result; };
+    EngineSession session(path, [](const Config &, const Cancellation &) { Desktop result; result.displayName = "Fixture Desktop"; return result; }, normalUser, {}, services);
+    TuiState state; TuiController controller(session, state);
+    controller.refresh(); pump(controller);
+    CHECK_FALSE(session.view().desktop.applicationId.has_value());
+    Screen screen; screen.resize(72, 22); CHECK_NOTHROW(state.draw(screen));
+    controller.handleKey(key(L'b')); CHECK(state.modal() == Modal::None);
+    CHECK_FALSE(Config::load(path).manageBackend);
+}
+TEST_CASE("RC3 production save keeps draft on failure and separates committed refresh failure")
+{
+    cpgtest::TemporaryDirectory root;
+    Config config; config.home = root.path;
+    const auto path = root.file(L"guard.toml"); initializeConfig(path, config, false);
+    EngineSession session(path, absentDesktop, normalUser);
+    TuiState state; TuiController controller(session, state);
+    controller.refresh(); pump(controller); controller.handleKey(key(L'e'));
+    state.setEditorSeed(L"localhost", L"7890");
+    const HANDLE lock = CreateFileW(path.c_str(), GENERIC_READ, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    REQUIRE(lock != INVALID_HANDLE_VALUE);
+    controller.handleKey(virtualKey(VK_RETURN));
+    controller.handleKey(virtualKey(VK_RETURN)); // same InputBatch cannot submit twice
+    CHECK(state.modal() == Modal::ProxyEditor);
+    pump(controller); CloseHandle(lock);
+    CHECK(state.editorHost() == L"localhost"); CHECK(state.editorPort() == L"7890");
+    CHECK_FALSE(state.editorError().empty());
+    controller.handleKey(virtualKey(VK_RETURN)); pump(controller);
+    CHECK(Config::load(path).port == 7890);
+    REQUIRE(session.mutationOutcome()); CHECK(session.mutationOutcome()->committed);
+    CHECK(session.mutationOutcome()->refreshError.has_value());
+    CHECK(state.modal() == Modal::None);
+    MutationOutcome late; late.operationId = session.operationId() - 1;
+    late.mutationError = Error("LATE", "Old save failed");
+    state.applyMutationOutcome(late); CHECK(state.modal() == Modal::None);
+}
+TEST_CASE("RC3 production busy quit defaults to keep and exits only after reap")
+{
+    cpgtest::TemporaryDirectory root;
+    Config config; config.home = root.path;
+    const auto path = root.file(L"guard.toml"); initializeConfig(path, config, false);
+    std::atomic_bool entered{false};
+    EngineSession session(path, [&](const Config &, const Cancellation &cancel) -> Desktop {
+        entered = true; while (!cancel.cancelled()) Sleep(1); Sleep(15); cancel.check(); return {};
+    }, normalUser);
+    TuiState state; TuiController controller(session, state); controller.refresh();
+    for (int count = 0; !entered && count < 2000; ++count) Sleep(1);
+    controller.handleKey(key(L'q')); controller.handleKey(virtualKey(VK_RETURN));
+    CHECK_FALSE(controller.exitRequested()); CHECK(controller.busy());
+    controller.handleKey(key(L'q')); controller.handleKey(key(L'y'));
+    CHECK(controller.exitRequested()); CHECK_FALSE(controller.shouldExit());
+    pump(controller); CHECK(controller.shouldExit());
+}
+TEST_CASE("RC3 launch result persists across one automatic refresh and warns on reuse")
+{
+    cpgtest::TemporaryDirectory root;
+    Config config; config.home = root.path;
+    const auto path = root.file(L"guard.toml"); initializeConfig(path, config, false);
+    std::atomic_int discoveries{0}, launches{0};
+    SessionServices services;
+    services.process = [&](const Desktop &) { ProcessState result; result.state = launches ? "running" : "stopped"; return result; };
+    services.launch = [&](const Config &, const std::filesystem::path &, LaunchOptions, const Cancellation &, LaunchFacts *facts) {
+        ++launches; facts->activationState = "returned"; facts->backendProxyConfig = "prepared";
+        return Json{{"pid", 42}, {"instance", "reused"}, {"proxy_delivery", "unconfirmed"},
+            {"activation_state", "returned"}, {"backend_proxy_config", "prepared"}, {"daemon_preparation", "skipped"}};
+    };
+    EngineSession session(path, [&](const Config &, const Cancellation &) { ++discoveries; Desktop result; result.displayName = "Fixture"; return result; }, normalUser, {}, services);
+    TuiState state; TuiController controller(session, state); controller.refresh(); pump(controller);
+    controller.handleKey(virtualKey(VK_RETURN)); controller.handleKey(key(L'e'));
+    pump(controller); CHECK(launches == 1); CHECK(discoveries == 2);
+    for (int count = 0; count < 10; ++count) controller.poll();
+    CHECK(discoveries == 2); CHECK(state.modal() == Modal::LaunchResult);
+    CHECK(state.diagnosticText().find("reused") != std::string::npos);
+    CHECK(state.diagnosticText().find("unconfirmed") != std::string::npos);
+    controller.handleKey(key(L'r')); pump(controller); CHECK(discoveries == 3);
+    CHECK(state.diagnosticText().find("PID: 42") != std::string::npos);
+}
+TEST_CASE("RC3 modal borders survive long scope and confirmation remains inside")
+{
+    TuiState state; auto view = snapshotFixture();
+    view.consent->home = L"C:/" + std::wstring(250, L'中') + L"/unique-tail";
+    state.setSnapshot(view); state.key(key(L'b'));
+    for (const wchar_t ch : std::wstring_view(L"YES")) state.key(key(ch));
+    Screen screen; screen.resize(72, 22); state.draw(screen);
+    // 68x17 centered => x=2, y=2; bottom border y=18.
+    CHECK(screen.cell(2, 18).glyph == L"╰");
+    CHECK(screen.cell(69, 18).glyph == L"╯");
+    for (int x = 3; x < 69; ++x) CHECK(screen.cell(x, 18).glyph == L"─");
+    for (int count = 0; count < 30; ++count) state.key(virtualKey(VK_DOWN));
+    state.draw(screen);
+    const auto frame = renderFrame(screen);
+    // A full path may wrap in the middle of its final component. Read the
+    // modal's visible interior cells rather than searching the VT/border stream.
+    std::wstring visibleScope;
+    for (int y = 3; y < 14; ++y)
+        for (int x = 4; x < 68; ++x)
+            if (!screen.cell(x, y).continuation && screen.cell(x, y).glyph != L" ")
+                visibleScope += screen.cell(x, y).glyph;
+    CHECK(visibleScope.find(L"unique-tail") != std::wstring::npos);
+    CHECK(frame.find(L"YES_") != std::wstring::npos);
+    state.clearModal(); state.key(key(L'e')); state.setEditorSeed(std::wstring(255, L'a'), L"7890");
+    state.draw(screen); CHECK(renderFrame(screen).find(L"^") != std::wstring::npos);
+}
+TEST_CASE("RC3 terminal acquisition restores only acquired changed resources")
+{
+    for (int failure = 1; failure <= 2; ++failure) {
+        FakeTerminal api; api.failGetMode = failure;
+        { TerminalSession terminal(api); CHECK_FALSE(terminal.enable()); }
+        CHECK(api.setModeCalls == 0); CHECK(api.cursorWrites == 0); CHECK(api.writes == 0);
+    }
+    FakeTerminal api; const auto originalInput = api.inputMode;
+    { TerminalSession terminal(api); REQUIRE(terminal.enable());
+      CHECK((api.inputMode & ENABLE_PROCESSED_INPUT) != 0);
+      CHECK((api.inputMode & (ENABLE_QUICK_EDIT_MODE | ENABLE_VIRTUAL_TERMINAL_INPUT | ENABLE_ECHO_INPUT)) == 0);
+      REQUIRE(terminal.enterAlternateScreen()); }
+    CHECK(api.inputMode == originalInput); CHECK(api.outputMode == 0);
+    CHECK(api.cursor.dwSize == 23); CHECK_FALSE(api.cursor.bVisible); CHECK(api.writes == 2);
+    FakeTerminal failed; const auto failedInput = failed.inputMode; failed.failAlt = true;
+    { TerminalSession terminal(failed); REQUIRE(terminal.enable()); CHECK_FALSE(terminal.enterAlternateScreen());
+      CHECK(failed.inputMode == failedInput); CHECK(failed.outputMode == 0); }
+    CHECK(failed.writes == 2);
+    FakeTerminal partial; const auto originalPartial = partial.inputMode; partial.failSetMode = 2;
+    { TerminalSession terminal(partial); CHECK_FALSE(terminal.enable()); }
+    CHECK(partial.inputMode == originalPartial); CHECK(partial.outputMode == 0); CHECK(partial.cursorWrites == 0);
+}
+TEST_CASE("RC3 plain EOF is clean and R refresh D repair use the engine gate")
+{
+    cpgtest::TemporaryDirectory root;
+    Config config; config.home = root.path;
+    const auto path = root.file(L"guard.toml"); initializeConfig(path, config, false);
+    int discoveries = 0;
+    EngineSession session(path, [&](const Config &, const Cancellation &) -> Desktop { ++discoveries; throw Error("APPX_NOT_FOUND", "Fixture"); }, normalUser);
+    std::istringstream input("r\nd\n"); std::ostringstream output;
+    CHECK(runPlainConsoleSession(session, input, output) == 0);
+    CHECK(discoveries == 2);
+    CHECK(output.str().find("[D] Repair launch") != std::string::npos);
+    CHECK(output.str().find("\x1b") == std::string::npos);
+    CHECK_FALSE(Config::load(path).manageBackend);
+}
+
+
+TEST_CASE("RC3 diagnostics include bounded redacted error and retained receipt facts")
+{
+    TuiState state; state.setSnapshot(snapshotFixture());
+    LaunchOutcome outcome; outcome.error = Error("ACTIVATION_FAILED", "Failed after daemon stopped");
+    outcome.activationState = "outcome_unknown"; outcome.daemonPreparation = "stopped";
+    outcome.backendProxyConfig = "prepared"; outcome.exceededBudget = true;
+    state.setLaunchOutcome(outcome);
+    const auto diagnostic = state.diagnosticText();
+    CHECK(diagnostic.find("ACTIVATION_FAILED") != std::string::npos);
+    CHECK(diagnostic.find("Failed after daemon stopped") != std::string::npos);
+    CHECK(diagnostic.find("Daemon: stopped") != std::string::npos);
+    CHECK(diagnostic.find("outcome_unknown") != std::string::npos);
+    CHECK(diagnostic.find("\n") != std::string::npos);
+    auto newer = snapshotFixture(); newer.error = Error("REFRESH_FAILED", "Discovery failed");
+    state.setSnapshot(newer);
+    CHECK(state.diagnosticText().find("ACTIVATION_FAILED") != std::string::npos);
+    state.clearModal(); state.key(key(L'e')); state.setEditorSeed(L"localhost", L"7890"); state.beginSave(30);
+    MutationOutcome late; late.operationId = 29; late.mutationError = Error("OLD", "Old request");
+    state.applyMutationOutcome(late); CHECK(state.saving()); CHECK(state.editorError().empty());
+}
+TEST_CASE("RC3 plain failed output stops and invalid port does not mutate configuration")
+{
+    cpgtest::TemporaryDirectory root; Config config; config.home = root.path;
+    const auto path = root.file(L"guard.toml"); initializeConfig(path, config, false);
+    EngineSession session(path, absentDesktop, normalUser);
+    std::istringstream empty; std::ostringstream failed; failed.setstate(std::ios::badbit);
+    CHECK_THROWS_AS(runPlainConsoleSession(session, empty, failed), Error);
+    std::istringstream input("e\nlocalhost\n7890abc\ne\n\n7890\nq\n"); std::ostringstream output;
+    CHECK(runPlainConsoleSession(session, input, output) == 0);
+    CHECK(Config::load(path).port == 7890);
+    CHECK(output.str().find("Port must be a number") != std::string::npos);
+    CHECK(output.str().find("host [localhost]") != std::string::npos);
+    CHECK(output.str().find("Saved. Status refresh failed") != std::string::npos);
+}
+
+
+TEST_CASE("RC3 engine host error focuses Host after submission from Port")
+{
+    cpgtest::TemporaryDirectory root; Config config; config.home = root.path;
+    const auto path = root.file(L"guard.toml"); initializeConfig(path, config, false);
+    EngineSession session(path, absentDesktop, normalUser);
+    TuiState state; TuiController controller(session, state); controller.refresh(); pump(controller);
+    controller.handleKey(key(L'e')); state.setEditorSeed(L"remote.example", L"7890");
+    controller.handleKey(virtualKey(VK_TAB)); REQUIRE(state.editorField() == 1);
+    controller.handleKey(virtualKey(VK_RETURN)); pump(controller);
+    CHECK(state.modal() == Modal::ProxyEditor); CHECK(state.editorField() == 0);
+    CHECK(state.editorHost() == L"remote.example"); CHECK(Config::load(path).port == config.port);
+}
+
+
+TEST_CASE("RC3 production copy keeps launch receipt and pairs a failed automatic refresh error")
+{
+    cpgtest::TemporaryDirectory root; Config config; config.home = root.path;
+    const auto path = root.file(L"guard.toml"); initializeConfig(path, config, false);
+    std::atomic_int discoveries{0};
+    SessionServices services;
+    services.process = [](const Desktop &) { ProcessState result; result.state = "stopped"; return result; };
+    services.launch = [](const Config &, const std::filesystem::path &, LaunchOptions, const Cancellation &, LaunchFacts *facts) {
+        facts->activationState = "returned"; facts->backendProxyConfig = "prepared";
+        return Json{{"pid", 51}, {"instance", "created"}, {"proxy_delivery", "activation_arguments"},
+            {"activation_state", "returned"}, {"backend_proxy_config", "prepared"}, {"daemon_preparation", "skipped"}};
+    };
+    EngineSession session(path, [&](const Config &, const Cancellation &) {
+        if (++discoveries > 1) throw Error("DISCOVERY_REFRESH_FAILED", "Read-only discovery fixture unavailable");
+        Desktop result; result.displayName = "Fixture"; return result;
+    }, normalUser, {}, services);
+    std::wstring copied;
+    bool copySucceeds = true;
+    TuiState state; TuiController controller(session, state, [&](const std::wstring &text) { copied = text; return copySucceeds; });
+    controller.refresh(); pump(controller); controller.handleKey(virtualKey(VK_RETURN)); pump(controller);
+    REQUIRE(state.modal() == Modal::LaunchResult); CHECK(discoveries == 2);
+    controller.handleKey(key(L'c'));
+    CHECK(copied.find(L"PID: 51") != std::wstring::npos);
+    CHECK(copied.find(L"Desktop activation returned a new instance") != std::wstring::npos);
+    CHECK(copied.find(L"status.error.code: DISCOVERY_REFRESH_FAILED") != std::wstring::npos);
+    CHECK(copied.find(L"status.error.message: Read-only discovery fixture unavailable") != std::wstring::npos);
+    CHECK(copied.find(L"operation.error.code: DISCOVERY_REFRESH_FAILED") == std::wstring::npos);
+    copySucceeds = false;
+    controller.handleKey(key(L'c'));
+    CHECK(state.modal() == Modal::LaunchResult);
+    CHECK(state.notice().find("CLIPBOARD_FAILED") != std::string::npos);
+    CHECK(state.diagnosticText().find("PID: 51") != std::string::npos);
+    CHECK(state.diagnosticText().find("Daemon: skipped") != std::string::npos);
+}
+
+
+TEST_CASE("RC3 synchronous consent read failure clears controller proposal before another B")
+{
+    cpgtest::TemporaryDirectory root; Config config; config.home = root.path;
+    const auto path = root.file(L"guard.toml"); initializeConfig(path, config, false);
+    EngineSession session(path, absentDesktop, normalUser);
+    TuiState state; TuiController controller(session, state); controller.refresh(); pump(controller);
+    controller.handleKey(key(L'b')); REQUIRE(state.consentProposal());
+    const HANDLE lock = CreateFileW(path.c_str(), GENERIC_READ, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    REQUIRE(lock != INVALID_HANDLE_VALUE);
+    yes(controller); CloseHandle(lock);
+    CHECK_FALSE(state.snapshot().consent.has_value());
+    controller.handleKey(key(L'b')); CHECK(state.modal() == Modal::ErrorResult);
+    CHECK_FALSE(Config::load(path).manageBackend);
+}
+
+
+namespace {
+struct FakePlainInput : PlainConsoleInput {
+    DWORD mode = ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_QUICK_EDIT_MODE | ENABLE_VIRTUAL_TERMINAL_INPUT;
+    int modeWrites = 0, nextCalls = 0, newlines = 0;
+    bool failGet = false, failSet = false, failNext = false, failEcho = false;
+    std::vector<PlainInputEvent> events;
+    std::wstring echoed;
+    bool getMode(DWORD &value) override { value = mode; return !failGet; }
+    bool setMode(DWORD value) override { ++modeWrites; if (failSet) return false; mode = value; return true; }
+    PlainInputEvent next() override {
+        if (failNext) throw Error("CONSOLE_INPUT_FAILED", "Fixture wait failed");
+        if (static_cast<std::size_t>(nextCalls) >= events.size()) throw Error("TEST_FAILED", "Input consumed after close/Enter");
+        return events[static_cast<std::size_t>(nextCalls++)];
+    }
+    void echo(std::wstring_view, std::wstring_view value) override {
+        if (failEcho) throw Error("CONSOLE_OUTPUT_FAILED", "Fixture echo failed");
+        echoed = value;
+    }
+    void newline() override { ++newlines; }
+};
+PlainInputEvent inputKey(Key value) { return {PlainInputEvent::Kind::Key, value}; }
+}
+TEST_CASE("RC3 plain key reader handles Unicode backspace cancel and EOF and restores input mode")
+{
+    FakePlainInput input; const auto original = input.mode;
+    input.events = {inputKey(key(L'e')), {PlainInputEvent::Kind::Cancel, {}},
+        inputKey(key(L'中')), inputKey(key(0xd83d)), inputKey(key(0xde42)),
+        inputKey(virtualKey(VK_BACK)), inputKey(key(L'x')), inputKey(virtualKey(VK_RETURN)), inputKey(key(L'z'))};
+    const auto line = readPlainConsoleLine(input);
+    REQUIRE(line); CHECK(*line == L"中x"); CHECK(input.echoed == L"中x");
+    CHECK(input.nextCalls == 8); CHECK(input.mode == original); CHECK(input.modeWrites == 2);
+    FakePlainInput closed; const auto closedMode = closed.mode;
+    closed.events = {{PlainInputEvent::Kind::Close, {}}, inputKey(key(L'e'))};
+    CHECK_FALSE(readPlainConsoleLine(closed)); CHECK(closed.nextCalls == 1); CHECK(closed.mode == closedMode);
+    FakePlainInput eof; Key end; end.control = true; end.virtualKey = 'Z'; end.unicode = 0x1a;
+    eof.events = {inputKey(end)}; CHECK_FALSE(readPlainConsoleLine(eof)); CHECK(eof.newlines == 1);
+}
+TEST_CASE("RC3 plain line reader mode acquisition and read or echo failures are bounded")
+{
+    FakePlainInput getFailed; getFailed.failGet = true;
+    CHECK_THROWS_AS(readPlainConsoleLine(getFailed), Error); CHECK(getFailed.modeWrites == 0);
+    FakePlainInput setFailed; const auto original = setFailed.mode; setFailed.failSet = true;
+    CHECK_THROWS_AS(readPlainConsoleLine(setFailed), Error); CHECK(setFailed.modeWrites == 1); CHECK(setFailed.mode == original);
+    FakePlainInput readFailed; readFailed.failNext = true;
+    CHECK_THROWS_AS(readPlainConsoleLine(readFailed), Error); CHECK(readFailed.modeWrites == 2); CHECK(readFailed.mode == original);
+    FakePlainInput echoFailed; echoFailed.failEcho = true; echoFailed.events = {inputKey(key(L'x'))};
+    CHECK_THROWS_AS(readPlainConsoleLine(echoFailed), Error); CHECK(echoFailed.modeWrites == 2); CHECK(echoFailed.mode == original);
+    PlainLineEditor editor;
+    for (int count = 0; count < 4096; ++count) editor.handle(key(L'x'));
+    CHECK_THROWS_AS(editor.handle(key(L'x')), Error);
+    CHECK(editor.value().size() == 4096);
+    editor.clear(); editor.handle(key(0xd83d)); editor.handle(virtualKey(VK_RETURN));
+    CHECK(editor.value() == L"\xfffd");
+}
+TEST_CASE("RC3 plain exceptional exit reaps an externally owned session before control release")
+{
+    cpgtest::TemporaryDirectory root; Config config; config.home = root.path;
+    const auto path = root.file(L"guard.toml"); initializeConfig(path, config, false);
+    std::atomic_bool entered{false}, settled{false};
+    EngineSession session(path, [&](const Config &, const Cancellation &cancel) -> Desktop {
+        entered = true;
+        while (!cancel.cancelled()) Sleep(1);
+        Sleep(15); settled = true; cancel.check(); return {};
+    }, normalUser);
+    session.requestRefresh();
+    for (int count = 0; count < 2000 && !entered; ++count) Sleep(1);
+    REQUIRE(entered);
+    std::istringstream input; std::ostringstream failed; failed.setstate(std::ios::badbit);
+    CHECK_THROWS_AS(runPlainConsoleSession(session, input, failed), Error);
+    CHECK(settled); CHECK_FALSE(session.busy());
+}
+TEST_CASE("RC3 native plain input wakes on real Ctrl C without a pending Enter")
+{
+    wchar_t executable[32768]{}; REQUIRE(GetModuleFileNameW(nullptr, executable, 32768) > 0);
+    std::wstring command = L"\"" + std::wstring(executable) + L"\" --plain-control-test";
+    STARTUPINFOW startup{}; startup.cb = sizeof startup;
+    startup.dwFlags = STARTF_USESHOWWINDOW; startup.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION child{};
+    REQUIRE(CreateProcessW(executable, command.data(), nullptr, nullptr, FALSE,
+        CREATE_NEW_CONSOLE, nullptr, nullptr, &startup, &child));
+    UniqueHandle process(child.hProcess), thread(child.hThread);
+    const DWORD wait = WaitForSingleObject(process.get(), 10000);
+    if (wait != WAIT_OBJECT_0) {
+        CHECK(TerminateProcess(process.get(), 99));
+        CHECK(WaitForSingleObject(process.get(), 5000) == WAIT_OBJECT_0);
+    }
+    REQUIRE(wait == WAIT_OBJECT_0); DWORD exitCode = 99;
+    REQUIRE(GetExitCodeProcess(process.get(), &exitCode)); CHECK(exitCode == 0);
+}
+
+TEST_CASE("RC3 native plain close wakes idle input and restores mode before close acknowledgement")
+{
+    SECURITY_ATTRIBUTES attributes{sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE};
+    UniqueHandle completed(CreateEventW(&attributes, TRUE, FALSE, nullptr)); REQUIRE(completed);
+    wchar_t executable[32768]{}; REQUIRE(GetModuleFileNameW(nullptr, executable, 32768) > 0);
+    std::wstring command = L"\"" + std::wstring(executable) + L"\" --plain-close-test "
+        + std::to_wstring(reinterpret_cast<std::uintptr_t>(completed.get()));
+    STARTUPINFOW startup{}; startup.cb = sizeof startup;
+    startup.dwFlags = STARTF_USESHOWWINDOW; startup.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION child{};
+    REQUIRE(CreateProcessW(executable, command.data(), nullptr, nullptr, TRUE,
+        CREATE_NEW_CONSOLE, nullptr, nullptr, &startup, &child));
+    UniqueHandle process(child.hProcess), thread(child.hThread);
+    const DWORD wait = WaitForSingleObject(process.get(), 10000);
+    if (wait != WAIT_OBJECT_0) {
+        CHECK(TerminateProcess(process.get(), 99));
+        CHECK(WaitForSingleObject(process.get(), 5000) == WAIT_OBJECT_0);
+    }
+    REQUIRE(wait == WAIT_OBJECT_0);
+    CHECK(WaitForSingleObject(completed.get(), 0) == WAIT_OBJECT_0);
+}
+
+TEST_CASE("RC3 production VT scope restores terminal before acknowledging real close")
+{
+    SECURITY_ATTRIBUTES attributes{sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE};
+    UniqueHandle completed(CreateEventW(&attributes, TRUE, FALSE, nullptr)); REQUIRE(completed);
+    wchar_t executable[32768]{}; REQUIRE(GetModuleFileNameW(nullptr, executable, 32768) > 0);
+    std::wstring command = L"\"" + std::wstring(executable) + L"\" --vt-scope-close-test "
+        + std::to_wstring(reinterpret_cast<std::uintptr_t>(completed.get()));
+    STARTUPINFOW startup{}; startup.cb = sizeof startup;
+    startup.dwFlags = STARTF_USESHOWWINDOW; startup.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION child{};
+    REQUIRE(CreateProcessW(executable, command.data(), nullptr, nullptr, TRUE,
+        CREATE_NEW_CONSOLE, nullptr, nullptr, &startup, &child));
+    UniqueHandle process(child.hProcess), thread(child.hThread);
+    const DWORD wait = WaitForSingleObject(process.get(), 10000);
+    if (wait != WAIT_OBJECT_0) {
+        CHECK(TerminateProcess(process.get(), 99)); CHECK(WaitForSingleObject(process.get(), 5000) == WAIT_OBJECT_0);
+    }
+    REQUIRE(wait == WAIT_OBJECT_0);
+    CHECK(WaitForSingleObject(completed.get(), 0) == WAIT_OBJECT_0);
+}
+TEST_CASE("RC3 redirected live pipe cancels partial lines and closes without waiting for EOF")
+{
+    wchar_t executable[32768]{}; REQUIRE(GetModuleFileNameW(nullptr, executable, 32768) > 0);
+    for (const auto *mode : {L"cancel", L"close"}) {
+        SECURITY_ATTRIBUTES attributes{sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE};
+        UniqueHandle completed(CreateEventW(&attributes, TRUE, FALSE, nullptr)); REQUIRE(completed);
+        std::wstring command = L"\"" + std::wstring(executable) + L"\" --plain-pipe-control-test " + mode + L" "
+            + std::to_wstring(reinterpret_cast<std::uintptr_t>(completed.get()));
+        STARTUPINFOW startup{}; startup.cb = sizeof startup;
+        startup.dwFlags = STARTF_USESHOWWINDOW; startup.wShowWindow = SW_HIDE;
+        PROCESS_INFORMATION child{};
+        REQUIRE(CreateProcessW(executable, command.data(), nullptr, nullptr, TRUE,
+            CREATE_NEW_CONSOLE, nullptr, nullptr, &startup, &child));
+        UniqueHandle process(child.hProcess), thread(child.hThread);
+        const DWORD wait = WaitForSingleObject(process.get(), 10000);
+        if (wait != WAIT_OBJECT_0) {
+            CHECK(TerminateProcess(process.get(), 99)); CHECK(WaitForSingleObject(process.get(), 5000) == WAIT_OBJECT_0);
+        }
+        REQUIRE(wait == WAIT_OBJECT_0);
+        CHECK(WaitForSingleObject(completed.get(), 0) == WAIT_OBJECT_0);
+    }
+}
+TEST_CASE("RC3 redirected input rejects invalid and non-console character handles")
+{
+    ConsoleControlScope controls;
+    const auto rejected = [&](HANDLE handle) {
+        try {
+            (void)cpg::tui::detail::readRedirectedPlainLine(handle, controls);
+        } catch (const Error &error) {
+            CHECK(error.code == "CONSOLE_INPUT_FAILED");
+            return;
+        }
+        FAIL("unsupported redirected input was accepted");
+    };
+    rejected(INVALID_HANDLE_VALUE);
+    rejected(nullptr);
+    UniqueHandle nul(CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
+    REQUIRE(nul);
+    REQUIRE(GetFileType(nul.get()) == FILE_TYPE_CHAR);
+    DWORD mode = 0;
+    REQUIRE_FALSE(GetConsoleMode(nul.get(), &mode));
+    rejected(nul.get());
+}
+int main(int argc, char **argv)
+{
+    if (argc == 3 && std::string(argv[1]) == "--vt-scope-close-test") {
+        try {
+            struct RestoreReceiptTerminal : FakeTerminal {
+                HANDLE completion = nullptr;
+                DWORD originalInput = inputMode;
+                bool setMode(HANDLE handle, DWORD mode) override {
+                    const bool ok = FakeTerminal::setMode(handle, mode);
+                    if (ok && setModeCalls == 4 && inputMode == originalInput && outputMode == 0
+                        && cursorWrites == 2 && writes == 2 && cursor.bVisible == FALSE)
+                        SetEvent(completion);
+                    return ok;
+                }
+            } terminal;
+            terminal.completion = reinterpret_cast<HANDLE>(static_cast<std::uintptr_t>(std::stoull(argv[2])));
+            cpg::tui::detail::InteractiveTerminalScope scope(terminal);
+            if (!scope.terminal.enable() || !scope.terminal.enterAlternateScreen()) return 31;
+            std::thread closer([] { Sleep(200); PostMessageW(GetConsoleWindow(), WM_CLOSE, 0, 0); });
+            const DWORD wait = WaitForSingleObject(scope.controls.signalEvent(), 5000);
+            closer.join();
+            if (wait != WAIT_OBJECT_0 || !scope.controls.takeClose()) return 32;
+            return 0; // the production scope destructor writes the restoration receipt
+        } catch (...) { return 33; }
+    }
+    if (argc == 4 && std::string(argv[1]) == "--plain-pipe-control-test") {
+        try {
+            const bool closing = std::string(argv[2]) == "close";
+            const HANDLE completed = reinterpret_cast<HANDLE>(static_cast<std::uintptr_t>(std::stoull(argv[3])));
+            HANDLE read = nullptr, write = nullptr;
+            if (!CreatePipe(&read, &write, nullptr, 4096)) return 41;
+            UniqueHandle pipeRead(read), pipeWrite(write); // write remains open throughout the read
+            if (!SetStdHandle(STD_INPUT_HANDLE, pipeRead.get())) return 42;
+            if (closing) {
+                ConsoleControlScope controls;
+                std::thread closer([] { Sleep(200); PostMessageW(GetConsoleWindow(), WM_CLOSE, 0, 0); });
+                std::optional<std::string> value;
+                try { value = cpg::tui::detail::readRedirectedPlainLine(pipeRead.get(), controls); }
+                catch (...) { closer.join(); return 43; }
+                closer.join();
+                if (value || !SetEvent(completed)) return 44;
+                return 0;
+            }
+            cpgtest::TemporaryDirectory root; Config config; config.home = root.path;
+            const auto path = root.file(L"guard.toml"); initializeConfig(path, config, false);
+            EngineSession session(path, absentDesktop, normalUser);
+            std::atomic_bool returned{false}, signaled{true};
+            std::thread writer([&] {
+                Sleep(200); DWORD written = 0;
+                if (!WriteFile(pipeWrite.get(), "e", 1, &written, nullptr) || written != 1) signaled = false;
+                Sleep(100);
+                if (!GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0)) signaled = false;
+                Sleep(100);
+                if (returned) signaled = false; // idle cancellation must keep the input loop alive
+                if (!WriteFile(pipeWrite.get(), "q\n", 2, &written, nullptr) || written != 2) signaled = false;
+            });
+            int result = 45;
+            try { result = runPlainConsoleSession(session, std::cin, std::cout); returned = true; }
+            catch (...) { returned = true; writer.join(); return 46; }
+            writer.join();
+            if (result != 0 || !signaled || session.busy() || Config::load(path).manageBackend) return 47;
+            return SetEvent(completed) ? 0 : 48;
+        } catch (...) { return 49; }
+    }
+
+    if (argc == 3 && std::string(argv[1]) == "--plain-close-test") {
+        try {
+            const HANDLE completed = reinterpret_cast<HANDLE>(static_cast<std::uintptr_t>(std::stoull(argv[2])));
+            ConsoleControlScope controls;
+            DWORD originalMode = 0; if (!GetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), &originalMode)) return 21;
+            std::thread closer([] { Sleep(200); PostMessageW(GetConsoleWindow(), WM_CLOSE, 0, 0); });
+            std::optional<std::wstring> value;
+            try { value = readNativePlainConsoleLine(controls); }
+            catch (...) { closer.join(); return 22; }
+            closer.join();
+            DWORD restored = 0;
+            if (value || !GetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), &restored) || restored != originalMode) return 23;
+            if (!SetEvent(completed)) return 24;
+            return 0; // acknowledgement occurs after the above restoration proof
+        } catch (...) { return 25; }
+    }
+
+    if (argc == 2 && std::string(argv[1]) == "--plain-control-test") {
+        try {
+            cpgtest::TemporaryDirectory root; Config config; config.home = root.path;
+            const auto path = root.file(L"guard.toml"); initializeConfig(path, config, false);
+            EngineSession session(path, absentDesktop, normalUser);
+            DWORD originalMode = 0; if (!GetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), &originalMode)) return 11;
+            std::atomic_bool signaled{true};
+            std::thread writer([&] {
+                Sleep(200);
+                const auto send = [&](wchar_t ch, WORD vk) {
+                    INPUT_RECORD record{}; record.EventType = KEY_EVENT;
+                    record.Event.KeyEvent.bKeyDown = TRUE; record.Event.KeyEvent.wRepeatCount = 1;
+                    record.Event.KeyEvent.uChar.UnicodeChar = ch; record.Event.KeyEvent.wVirtualKeyCode = vk;
+                    DWORD count = 0;
+                    if (!WriteConsoleInputW(GetStdHandle(STD_INPUT_HANDLE), &record, 1, &count) || count != 1) signaled = false;
+                };
+                send(L'e', 'E'); Sleep(100);
+                if (!GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0)) signaled = false;
+                Sleep(100); send(L'q', 'Q'); send(L'\r', VK_RETURN);
+            });
+            int result = 12;
+            try { result = runPlainConsoleSession(session, std::cin, std::cout); }
+            catch (...) { writer.join(); return 13; }
+            writer.join();
+            DWORD restored = 0;
+            if (!GetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), &restored) || restored != originalMode) return 14;
+            return result == 0 && signaled && !session.busy() && !Config::load(path).manageBackend ? 0 : 15;
+        } catch (...) { return 16; }
+    }
+    return cpgtest::runDoctestMain(argc, argv);
+}

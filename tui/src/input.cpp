@@ -1,4 +1,5 @@
 #include "input.h"
+#include "cpg/error.h"
 
 namespace cpg::tui {
 
@@ -27,11 +28,13 @@ InputBatch normalizeRecords(const INPUT_RECORD *records, DWORD count)
 
 bool readInputBatch(HANDLE input, InputBatch &out, DWORD waitMilliseconds)
 {
-    if (WaitForSingleObject(input, waitMilliseconds) != WAIT_OBJECT_0) return false;
+    const DWORD wait = WaitForSingleObject(input, waitMilliseconds);
+    if (wait == WAIT_TIMEOUT) return false;
+    if (wait != WAIT_OBJECT_0) throw Error("CONSOLE_INPUT_FAILED", "Console input wait failed.");
     INPUT_RECORD records[64];
     DWORD count = 0;
     if (!ReadConsoleInputW(input, records, static_cast<DWORD>(std::size(records)), &count))
-        return false;
+        throw Error("CONSOLE_INPUT_FAILED", "Console input read failed.");
     out = normalizeRecords(records, count);
     return true;
 }
