@@ -64,6 +64,33 @@ ProcessRequest selfRequest(std::vector<std::wstring> arguments)
     return request;
 }
 
+std::wstring sentinelName()
+{
+    GUID id{};
+    if (FAILED(CoCreateGuid(&id))) throw std::runtime_error("Cannot create sentinel identity");
+    wchar_t text[39]{};
+    if (StringFromGUID2(id, text, static_cast<int>(std::size(text))) == 0)
+        throw std::runtime_error("Cannot format sentinel identity");
+    return std::wstring(L"Local\\CPG-handle-sentinel-") + text;
+}
+
+int probeSentinel(HANDLE raw, const std::wstring &name)
+{
+    // Handle numbers are process-local slots. Snapshot the current object
+    // BEFORE OpenEvent: opening the reference may itself reuse an empty slot.
+    HANDLE duplicate = nullptr;
+    if (!DuplicateHandle(GetCurrentProcess(), raw, GetCurrentProcess(), &duplicate,
+                         0, FALSE, DUPLICATE_SAME_ACCESS)
+        && GetLastError() != ERROR_INVALID_HANDLE) return 17;
+    UniqueHandle candidate(duplicate);
+    UniqueHandle expected(OpenEventW(SYNCHRONIZE | EVENT_MODIFY_STATE, FALSE, name.c_str()));
+    if (!expected) return 18;
+    if (!candidate || !CompareObjectHandles(candidate.get(), expected.get())) return 0;
+    // A real inheritance leak must fail AND be visible through the parent's
+    // independent sentinel observation. Never waive a matching kernel object.
+    return SetEvent(candidate.get()) ? 7 : 19;
+}
+
 } // namespace
 
 TEST_CASE("build info is embedded")
@@ -305,12 +332,13 @@ TEST_CASE("the owned child inherits only its standard handles")
     request.timeout = std::chrono::milliseconds(5000);
 
     // Control: a non-inheritable handle never crosses, on any system.
+    const auto controlName = sentinelName();
     SECURITY_ATTRIBUTES private_{sizeof(SECURITY_ATTRIBUTES), nullptr, FALSE};
-    HANDLE control = CreateEventW(&private_, TRUE, FALSE, nullptr);
+    HANDLE control = CreateEventW(&private_, TRUE, FALSE, controlName.c_str());
     REQUIRE(control != nullptr);
     UniqueHandle controlGuard(control);
     request.arguments = {L"--foundation-probe-handle",
-                         std::to_wstring(reinterpret_cast<std::uintptr_t>(control))};
+                         std::to_wstring(reinterpret_cast<std::uintptr_t>(control)), controlName};
     ProcessResult result = runOwnedProcess(request, {});
     CHECK(result.normalExit);
     CHECK(result.exitCode == 0);
@@ -318,16 +346,55 @@ TEST_CASE("the owned child inherits only its standard handles")
 
     // Every inheritable handle outside the explicit std-handle list must be
     // excluded. A leak is a product failure, never an environmental waiver.
+    const auto eventName = sentinelName();
     SECURITY_ATTRIBUTES inheritable{sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE};
-    HANDLE event = CreateEventW(&inheritable, TRUE, FALSE, nullptr);
+    HANDLE event = CreateEventW(&inheritable, TRUE, FALSE, eventName.c_str());
     REQUIRE(event != nullptr);
     UniqueHandle probe(event);
+
+    // Positive control reproduces the original missing HANDLE_LIST barrier.
+    // The SAME helper must identify the inherited object and signal it.
+    std::wstring command = L"\"" + request.program.wstring() + L"\" --foundation-probe-handle "
+        + std::to_wstring(reinterpret_cast<std::uintptr_t>(event)) + L" " + eventName;
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION info{};
+    REQUIRE(CreateProcessW(request.program.c_str(), command.data(), nullptr, nullptr, TRUE,
+                           CREATE_NO_WINDOW, nullptr, nullptr, &startup, &info));
+    UniqueHandle leakyChild(info.hProcess), leakyThread(info.hThread);
+    const DWORD childWait = WaitForSingleObject(leakyChild.get(), 5000);
+    if (childWait != WAIT_OBJECT_0) {
+        CHECK(TerminateProcess(leakyChild.get(), 99));
+        CHECK(WaitForSingleObject(leakyChild.get(), 5000) == WAIT_OBJECT_0);
+    }
+    REQUIRE(childWait == WAIT_OBJECT_0);
+    DWORD leakedExit = 0;
+    REQUIRE(GetExitCodeProcess(leakyChild.get(), &leakedExit));
+    CHECK(leakedExit == 7);
+    CHECK(WaitForSingleObject(event, 0) == WAIT_OBJECT_0);
+    REQUIRE(ResetEvent(event));
+
     request.arguments = {L"--foundation-probe-handle",
-                         std::to_wstring(reinterpret_cast<std::uintptr_t>(event))};
+                         std::to_wstring(reinterpret_cast<std::uintptr_t>(event)), eventName};
     result = runOwnedProcess(request, {});
     CHECK(result.normalExit);
     CHECK(WaitForSingleObject(event, 0) == WAIT_TIMEOUT);
     CHECK(result.exitCode == 0);
+}
+
+TEST_CASE("handle probes distinguish unrelated local objects from the sentinel")
+{
+    const auto name = sentinelName();
+    UniqueHandle sentinel(CreateEventW(nullptr, TRUE, FALSE, name.c_str()));
+    REQUIRE(sentinel);
+    for (const auto *kind : {L"pipe", L"event"}) {
+        ProcessRequest request = selfRequest({L"--foundation-probe-local-object", kind, name});
+        request.timeout = std::chrono::seconds(5);
+        const auto result = runOwnedProcess(request, {});
+        CHECK(result.normalExit);
+        CHECK(result.exitCode == 0);
+        CHECK(WaitForSingleObject(sentinel.get(), 0) == WAIT_TIMEOUT);
+    }
 }
 
 TEST_CASE("a child that never reads stdin still honors the budget")
@@ -670,15 +737,28 @@ int main(int argc, char **argv)
                                               ? STD_OUTPUT_HANDLE : STD_ERROR_HANDLE), output.data(),
                              static_cast<DWORD>(output.size()), &written, nullptr) ? 0 : 9;
         }
-        if (argument == "--foundation-probe-handle" && index + 1 < argc) {
-            // Exit codes: 0 = the probed handle value is not valid here (not
-            // inherited), 2 = valid but not a signalable event, 7 = fully
-            // usable event (an inheritance leak, which must never happen).
+        if (argument == "--foundation-probe-local-object" && index + 2 < argc) {
+            const std::string kind = argv[index + 1];
+            UniqueHandle localEvent;
+            HANDLE candidate = GetStdHandle(STD_OUTPUT_HANDLE);
+            if (kind == "event") {
+                localEvent.reset(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+                if (!localEvent || !SetEvent(localEvent.get())) return 20;
+                candidate = localEvent.get();
+            } else if (GetFileType(candidate) != FILE_TYPE_PIPE) return 21;
+            DWORD flags = 0;
+            if (!GetHandleInformation(candidate, &flags)) return 22;
+            // The old numeric-only probe reports 2 for the valid local pipe,
+            // or 7 for an unrelated event. Neither refers to the sentinel.
+            if (kind == "pipe" && SetEvent(candidate)) return 23;
+            return probeSentinel(candidate, utf8ToWide(argv[index + 2]));
+        }
+        if (argument == "--foundation-probe-handle" && index + 2 < argc) {
+            // 0 = no matching object; 7 = exact sentinel leaked; other codes
+            // are probe/setup errors and remain strict test failures.
             const long long value = _atoi64(argv[index + 1]);
             const HANDLE probed = reinterpret_cast<HANDLE>(static_cast<LONG_PTR>(value));
-            DWORD flags = 0;
-            if (!GetHandleInformation(probed, &flags)) return 0;
-            return SetEvent(probed) ? 7 : 2;
+            return probeSentinel(probed, utf8ToWide(argv[index + 2]));
         }
     }
     return doctest::Context(argc, argv).run();

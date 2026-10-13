@@ -63,4 +63,5 @@ executed. Their absence does not imply PASS or a public distribution guarantee.
 - [Console handler lifetime and shutdown deadlines](https://learn.microsoft.com/en-us/windows/console/handlerroutine)
 - [Console control registration and signal delivery](https://learn.microsoft.com/en-us/windows/console/setconsolectrlhandler)
 - [Synchronous I/O cancellation requires completion settlement](https://learn.microsoft.com/en-us/windows/win32/api/ioapiset/nf-ioapiset-cancelsynchronousio)
+- [Kernel object identity is distinct from a numerical handle value](https://learn.microsoft.com/en-us/windows/win32/api/handleapi/nf-handleapi-compareobjecthandles)
 - [Manifest string attributes and absent values](https://learn.microsoft.com/en-us/windows/win32/api/appxpackaging/nf-appxpackaging-iappxmanifestapplication-getstringvalue)

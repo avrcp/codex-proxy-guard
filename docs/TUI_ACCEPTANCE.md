@@ -15,6 +15,12 @@ attribute list, removes the waiver, and tests that the sentinel cannot be used.
 Both that test and deterministic post-child-exit reader verdict tests failed
 on the old implementation before repair. No host skip is counted as PASS.
 
+The final main gate also exposed a probe false positive: the child reused the
+parent's numerical handle value for a different object (exit 2), while the
+parent sentinel remained unsignalled. The probe now compares kernel object
+identity, with a deliberate broad-inheritance positive control and an explicit
+different-object case. A real sentinel leak still fails unconditionally.
+
 The rc.2 CLI empty-config statement covered the CLI path, not the default
 interactive classifier. The old component tests did not execute the failing
 first-B production handler. RC3 replaces the classifier and JSON UI boundary
