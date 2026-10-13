@@ -259,57 +259,108 @@ ProcessResult runOwnedProcess(const ProcessRequest &request, const Cancellation 
         UniqueHandle primaryThread;
         std::atomic_bool &stopping;
         std::array<std::jthread *, 3> threads;
+#ifdef CPG_PROCESS_TESTING
+        testing::ProcessHooks *hooks;
+#endif
         bool settled = false;
         bool cleanupFailed = false;
         bool terminationRequested = false;
+        const char *cleanupStage = "none";
+        DWORD cleanupError = ERROR_SUCCESS;
+        const char *cleanupAction = "none";
+        DWORD cleanupActionError = ERROR_SUCCESS;
+        std::chrono::milliseconds cleanupElapsed{0};
+
+        void recordFailure(const char *stage, DWORD error) noexcept
+        {
+            if (!cleanupFailed) { cleanupStage = stage; cleanupError = error; }
+            cleanupFailed = true;
+        }
+
+        void recordActionError(const char *stage, DWORD error) noexcept
+        {
+            if (cleanupActionError == ERROR_SUCCESS) {
+                cleanupAction = stage;
+                cleanupActionError = error;
+            }
+        }
 
         void settle(bool abort) noexcept
         {
             if (settled) return;
             if (abort) stopping.store(true);
-            const auto cleanupDeadline = Clock::now() + std::chrono::seconds(3);
+            const auto cleanupStarted = Clock::now();
+            const auto cleanupDeadline = cleanupStarted
+#ifdef CPG_PROCESS_TESTING
+                + (hooks ? hooks->cleanupBudget : std::chrono::milliseconds(3000));
+#else
+                + std::chrono::seconds(3);
+#endif
             bool terminateAttempted = false;
             for (;;) {
-                const DWORD processWait = WaitForSingleObject(process.get(), 0);
+                const DWORD processWait =
+#ifdef CPG_PROCESS_TESTING
+                    hooks && hooks->cleanupProcessWait ? hooks->cleanupProcessWait(process.get()) :
+#endif
+                    WaitForSingleObject(process.get(), 0);
                 bool complete = processWait == WAIT_OBJECT_0;
-                if (processWait == WAIT_FAILED) cleanupFailed = true;
+                if (processWait == WAIT_FAILED) recordFailure("process_wait", GetLastError());
                 if (abort && !complete && !terminateAttempted) {
                     terminateAttempted = true;
                     terminationRequested = true;
-                    if (!TerminateProcess(process.get(), EXIT_FAILURE)
-                        && WaitForSingleObject(process.get(), 0) != WAIT_OBJECT_0)
-                        cleanupFailed = true;
+                    const BOOL terminated =
+#ifdef CPG_PROCESS_TESTING
+                        hooks && hooks->terminate ? hooks->terminate(process.get(), EXIT_FAILURE) :
+#endif
+                        TerminateProcess(process.get(), EXIT_FAILURE);
+                    if (!terminated) {
+                        // The child can already be exiting while its handle
+                        // is not signaled yet. Completion below, not this
+                        // racing request's result, decides whether it settled.
+                        recordActionError("terminate", GetLastError());
+                    }
                 }
                 for (std::jthread *thread : threads) {
                     if (!thread->joinable()) continue;
                     const DWORD wait = WaitForSingleObject(thread->native_handle(), 0);
                     if (wait == WAIT_OBJECT_0) continue;
                     complete = false;
-                    if (wait == WAIT_FAILED) cleanupFailed = true;
+                    if (wait == WAIT_FAILED) recordFailure("thread_wait", GetLastError());
                     // A cancellation request is not completion. Repeat it to
                     // cover a thread entering I/O just after its stop check.
-                    if (abort && !CancelSynchronousIo(thread->native_handle())
-                        && GetLastError() != ERROR_NOT_FOUND)
-                        cleanupFailed = true;
+                    const BOOL cancelled = !abort ? TRUE :
+#ifdef CPG_PROCESS_TESTING
+                        hooks && hooks->cancelIo ? hooks->cancelIo(thread->native_handle()) :
+#endif
+                        CancelSynchronousIo(thread->native_handle());
+                    if (!cancelled) {
+                        const DWORD error = GetLastError();
+                        if (error != ERROR_NOT_FOUND) recordActionError("cancel_io", error);
+                    }
                 }
-                if (complete) break;
                 if (Clock::now() >= cleanupDeadline) {
-                    cleanupFailed = true;
+                    recordFailure("settle_budget", ERROR_TIMEOUT);
                     stopping.store(true);
                     abort = true;
                     // An unresponsive kernel/driver cannot be made hard-real-
                     // time. Retain ownership and caller busy until it settles;
                     // never detach or manufacture an idle/success result.
                 }
+                if (complete) break;
                 Sleep(5);
             }
             for (std::jthread *thread : threads)
                 if (thread->joinable()) thread->join();
+            cleanupElapsed = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - cleanupStarted);
             settled = true;
         }
         ~OwnedScope() { settle(true); }
     } owned{UniqueHandle(info.hProcess), UniqueHandle(info.hThread), stopping,
-            {&stdoutThread, &stderrThread, &writerThread}};
+            {&stdoutThread, &stderrThread, &writerThread}
+#ifdef CPG_PROCESS_TESTING
+            , hooks
+#endif
+    };
 
     enum class Failure { None, Setup, Io, Output, Cancelled, Timeout, Drain };
     Failure failure = Failure::None;
@@ -478,7 +529,14 @@ ProcessResult runOwnedProcess(const ProcessRequest &request, const Cancellation 
                             + message);
         throw Error(code, message);
     };
-    if (owned.cleanupFailed) fail("HELPER_CLEANUP_FAILED", "Owned helper cleanup exceeded its budget or failed");
+    if (owned.cleanupFailed) {
+        const std::string message = std::string("Owned helper cleanup failed: stage=")
+            + owned.cleanupStage + "; native_error=" + std::to_string(owned.cleanupError)
+            + "; action=" + owned.cleanupAction
+            + "; action_error=" + std::to_string(owned.cleanupActionError)
+            + "; elapsed_ms=" + std::to_string(owned.cleanupElapsed.count());
+        fail("HELPER_CLEANUP_FAILED", message.c_str());
+    }
     if (stdoutReader.overLimit.load() || stderrReader.overLimit.load())
         fail("HELPER_OUTPUT_LIMIT", "Owned helper exceeded its output budget");
     if (writeError.load() || stdoutReader.error.load() || stderrReader.error.load())

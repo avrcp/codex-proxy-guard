@@ -2,6 +2,7 @@
 
 #include <windows.h>
 #include <functional>
+#include <chrono>
 
 // Compiled only into foundation_tests' private copy of process.cpp. No
 // production configuration, command, or environment variable enables these.
@@ -15,6 +16,10 @@ struct ProcessHooks {
     std::function<void()> afterWrite;
     std::function<void()> beforeJoin;
     std::function<void()> beforeVerdict;
+    std::function<BOOL(HANDLE, DWORD)> terminate;
+    std::function<BOOL(HANDLE)> cancelIo;
+    std::function<DWORD(HANDLE)> cleanupProcessWait;
+    std::chrono::milliseconds cleanupBudget{3000};
 };
 extern thread_local ProcessHooks *processHooks;
 struct ProcessHookScope {

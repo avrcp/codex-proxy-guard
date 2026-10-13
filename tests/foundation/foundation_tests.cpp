@@ -588,7 +588,87 @@ TEST_CASE("stderr-only output is independently bounded")
     ProcessRequest request = selfRequest({L"--foundation-stderr-output"});
     request.timeout = std::chrono::seconds(5);
     request.stderrLimit = 1024;
-    CHECK(errorCode([&] { (void)runOwnedProcess(request, {}); }) == "HELPER_OUTPUT_LIMIT");
+    try {
+        (void)runOwnedProcess(request, {});
+        FAIL_CHECK("stderr overflow must fail");
+    } catch (const Error &error) {
+        INFO(error.message);
+        CHECK(error.code == "HELPER_OUTPUT_LIMIT");
+    }
+}
+
+TEST_CASE("cleanup verdict follows settled handles rather than racing action errors")
+{
+    for (int scenario = 0; scenario < 4; ++scenario) {
+        INFO("scenario " << scenario);
+        const auto exitName = sentinelName();
+        UniqueHandle childMayExit(CreateEventW(nullptr, TRUE, FALSE, exitName.c_str()));
+        UniqueHandle readerEntered(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+        UniqueHandle readerMayExit(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+        REQUIRE(childMayExit);
+        REQUIRE(readerEntered);
+        REQUIRE(readerMayExit);
+        bool injected = false;
+        unsigned processChecks = 0;
+        std::jthread releaseThread;
+        testing::ProcessHooks hooks;
+        hooks.afterRead = [&](bool out, HANDLE, DWORD &error) {
+            if (out) {
+                SetEvent(readerEntered.get());
+                if (WaitForSingleObject(readerMayExit.get(), 5000) != WAIT_OBJECT_0) error = ERROR_TIMEOUT;
+            } else if (WaitForSingleObject(readerEntered.get(), 5000) != WAIT_OBJECT_0) error = ERROR_TIMEOUT;
+        };
+        if (scenario == 0) {
+            hooks.beforeJoin = [&] { SetEvent(readerMayExit.get()); };
+            hooks.terminate = [&](HANDLE, DWORD) {
+                injected = true;
+                SetLastError(ERROR_ACCESS_DENIED);
+                return FALSE;
+            };
+            hooks.cleanupProcessWait = [&](HANDLE process) {
+                // The first termination attempt must fail before the child is
+                // allowed to finish, precisely reproducing the exit race.
+                if (++processChecks >= 2) SetEvent(childMayExit.get());
+                return WaitForSingleObject(process, 0);
+            };
+        } else if (scenario == 1) {
+            hooks.cancelIo = [&](HANDLE) {
+                injected = true;
+                SetEvent(readerMayExit.get());
+                SetLastError(ERROR_INVALID_HANDLE);
+                return FALSE;
+            };
+        } else if (scenario == 2) {
+            hooks.cleanupBudget = std::chrono::milliseconds(20);
+            hooks.beforeJoin = [&] {
+                releaseThread = std::jthread([&] { Sleep(80); SetEvent(readerMayExit.get()); });
+            };
+        } else {
+            hooks.cleanupProcessWait = [&](HANDLE process) -> DWORD {
+                if (!injected) {
+                    injected = true;
+                    SetEvent(readerMayExit.get());
+                    SetLastError(ERROR_INVALID_HANDLE);
+                    return WAIT_FAILED;
+                }
+                return WaitForSingleObject(process, 0);
+            };
+        }
+        testing::ProcessHookScope scope(hooks);
+        ProcessRequest request = selfRequest({L"--foundation-cleanup-race", exitName});
+        request.timeout = std::chrono::seconds(5);
+        request.stderrLimit = 1024;
+        try {
+            (void)runOwnedProcess(request, {});
+            FAIL_CHECK("output overflow must fail");
+        } catch (const Error &error) {
+            INFO(error.message);
+            CHECK(error.code == (scenario < 2 ? "HELPER_OUTPUT_LIMIT" : "HELPER_CLEANUP_FAILED"));
+            if (scenario == 2) CHECK(error.message.find("stage=settle_budget") != std::string::npos);
+            if (scenario == 3) CHECK(error.message.find("stage=process_wait") != std::string::npos);
+        }
+        if (scenario != 2) CHECK(injected);
+    }
 }
 
 TEST_CASE("a descendant retaining output is not terminated and drain is bounded")
@@ -730,6 +810,15 @@ int main(int argc, char **argv)
             return 0;
         }
         if (argument == "--foundation-never-read-stdin") { Sleep(10000); return 0; }
+        if (argument == "--foundation-cleanup-race" && index + 1 < argc) {
+            const std::string overflow(2048, 'x');
+            DWORD written = 0;
+            if (!WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), "x", 1, &written, nullptr)
+                || !WriteFile(GetStdHandle(STD_ERROR_HANDLE), overflow.data(),
+                              static_cast<DWORD>(overflow.size()), &written, nullptr)) return 24;
+            UniqueHandle gate(OpenEventW(SYNCHRONIZE, FALSE, utf8ToWide(argv[index + 1]).c_str()));
+            return gate && WaitForSingleObject(gate.get(), 5000) == WAIT_OBJECT_0 ? 0 : 25;
+        }
         if (argument == "--foundation-small-output" || argument == "--foundation-stderr-output") {
             const std::string output(2048, 'x');
             DWORD written = 0;
