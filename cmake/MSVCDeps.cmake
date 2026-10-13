@@ -1,6 +1,14 @@
 # Preserve the compiler's actual /showIncludes bytes. CMake's AUTO decoding
 # can double-decode UTF-8 output on a host with a different ANSI code page,
-# leaving Ninja unable to recognize header dependencies.
+# leaving Ninja unable to recognize header dependencies. The VS 18 toolchain
+# ignores VSLANG and always emits the localized (e.g. GBK Chinese) prefix, so
+# the captured value is intentionally raw non-ASCII bytes.
+#
+# The prefix MUST be stored as a cache variable: CMake 4.3's Ninja generator
+# silently skips writing CMakeFiles/rules.ninja entirely when the same
+# bytes are assigned as a plain directory-scope variable, leaving build.ninja
+# pointing at a file that does not exist. The cache path also survives the
+# re-runs of this probe with an unchanged value.
 if(MSVC AND CMAKE_GENERATOR MATCHES "Ninja")
     set(_cpg_probe "${CMAKE_BINARY_DIR}/CMakeFiles/CpgIncludes")
     file(MAKE_DIRECTORY "${_cpg_probe}")
@@ -13,6 +21,8 @@ if(MSVC AND CMAKE_GENERATOR MATCHES "Ninja")
     if(NOT _cpg_result EQUAL 0 OR NOT "${_cpg_output}" MATCHES "(^|\n)([^\r\n]+:[ \t]+)([A-Za-z]:[/\\])")
         message(FATAL_ERROR "Cannot determine the MSVC header dependency prefix: ${_cpg_error}")
     endif()
-    set(CMAKE_CL_SHOWINCLUDES_PREFIX "${CMAKE_MATCH_2}")
-    set(CMAKE_CXX_CL_SHOWINCLUDES_PREFIX "${CMAKE_MATCH_2}")
+    set(CMAKE_CL_SHOWINCLUDES_PREFIX "${CMAKE_MATCH_2}"
+        CACHE STRING "Exact /showIncludes prefix bytes emitted by this cl.exe" FORCE)
+    set(CMAKE_CXX_CL_SHOWINCLUDES_PREFIX "${CMAKE_MATCH_2}"
+        CACHE STRING "Exact /showIncludes prefix bytes emitted by this cl.exe" FORCE)
 endif()
