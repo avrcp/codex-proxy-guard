@@ -3,9 +3,9 @@
 
 namespace cpg {
 
-Error::Error(std::string errorCode, std::string text)
+Error::Error(std::string errorCode, std::string text, std::string errorField)
     : std::runtime_error(errorCode), code(std::move(errorCode)),
-      message(publicText(text, 1024))
+      message(publicText(text, 4096)), field(std::move(errorField))
 {
 }
 

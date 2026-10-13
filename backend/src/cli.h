@@ -3,13 +3,15 @@
 #include <filesystem>
 #include <string>
 #include <vector>
+#include <functional>
+#include "cpg/cancellation.h"
+#include "cpg/json.h"
 
 namespace cpg {
 
-// Execute the headless CLI/console/bridge/worker roles. The caller has already
-// classified the process into this role; runCli owns argument parsing and all
-// business entry points over the Unicode command line (excluding argv[0]).
+// Parse the Unicode arguments once and dispatch the selected command.
 int runCli(const std::vector<std::wstring> &arguments);
+Json runConsoleOperation(const std::function<Json(const Cancellation &)> &operation);
 
 // The interactive frontend (TUI with plain fallback) lives above the engine;
 // the app entry point injects it so the engine never links the TUI layer.

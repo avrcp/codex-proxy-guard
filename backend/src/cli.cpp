@@ -1,4 +1,7 @@
 #include "cli.h"
+#include "command_line.h"
+#include "cpg/console_control.h"
+#include <future>
 #include "core.h"
 #include "platform.h"
 #include "launch.h"
@@ -35,7 +38,7 @@ void print(const std::string &text) { std::cout << text << std::endl; }
 void printJson(const cpg::Json &object) { print(jsonDump(object)); }
 
 // Stream one embedded license resource to stdout. License text can exceed the
-// bridge frame budget, so it never goes through the NDJSON protocol writer.
+// worker frame budget, so it is written directly to stdout.
 bool writeResource(int identifier, HANDLE output) {
     const HRSRC resource = FindResourceW(nullptr, MAKEINTRESOURCEW(identifier), L"NOTICES");
     if (!resource) return false;
@@ -74,7 +77,6 @@ const char *usageText()
            "  -h, -?, --help      Displays help on commandline options.\n"
            "  -v, --version       Displays version information.\n"
            "  --config <path>     Guard configuration file.\n"
-           "  --build-info        Print embedded build provenance and exit.\n"
            "\n"
            "Commands:\n"
            "  launch                   Launch Desktop\n"
@@ -88,22 +90,8 @@ const char *usageText()
            "  config-path              Print the effective configuration path\n"
            "  build-info               Print embedded build provenance\n"
            "  licenses                 Stream the embedded offline notices\n"
-           "  console                  Interactive line console (--plain for the plain variant)\n"
+           "  console                  Interactive console (--plain for line mode)\n"
            "  internal-activate-package  Activation worker (internal)\n";
-}
-
-struct ParsedCli {
-    std::wstring command;
-    std::map<std::wstring, std::wstring> values;
-    std::set<std::wstring> flags;
-};
-
-const wchar_t *wideValueOptions[] = {L"config", L"proxy-host", L"proxy-port"};
-const wchar_t *flagOptions[] = {L"build-info", L"json", L"refresh-codex-daemon", L"activation-only", L"force", L"plain"};
-
-[[noreturn]] void cliFail(const std::string &message)
-{
-    throw cpg::Error("CLI_INVALID", message);
 }
 
 } // namespace
@@ -113,141 +101,71 @@ void cpg::setInteractiveConsoleEntry(int (*entry)(const std::filesystem::path &,
     interactiveEntry = entry;
 }
 
+// The owner thread translates console signals to cancellation; the operation
+// and any owned helpers settle before this scope releases its handler.
+cpg::Json cpg::runConsoleOperation(const std::function<Json(const Cancellation &)> &operation)
+{
+    ConsoleControlScope control;
+    Cancellation cancel;
+    auto task = std::async(std::launch::async, [&] { return operation(cancel); });
+    while (task.wait_for(std::chrono::milliseconds(10)) != std::future_status::ready) {
+        if (control.takeCancel() || control.takeClose()) cancel.cancel();
+    }
+    return task.get();
+}
+
 int cpg::runCli(const std::vector<std::wstring> &arguments) {
-    ParsedCli parsed;
-    std::optional<std::wstring> pending;
-    bool afterSeparator = false;
+    bool jsonOutput = false;
     try {
-        for (const std::wstring &argument : arguments) {
-            if (pending) {
-                parsed.values[*pending] = argument;
-                pending.reset();
-                continue;
-            }
-            if (!afterSeparator && argument == L"--") { afterSeparator = true; continue; }
-            if (!afterSeparator && argument.size() > 1 && argument[0] == L'-') {
-                if (argument == L"-h" || argument == L"-?") {
-                    std::cout << usageText();
-                    return 0;
-                }
-                if (argument == L"-v") {
-                    std::cout << "codex-proxy-guard " << productVersion() << std::endl;
-                    return 0;
-                }
-                if (argument.size() > 1 && argument[0] == L'-' && argument[1] != L'-')
-                    cliFail("Unknown option.");
-                std::wstring name = argument.substr(2);
-                std::optional<std::wstring> inlineValue;
-                const std::size_t equal = name.find(L'=');
-                if (equal != std::wstring::npos) {
-                    inlineValue = name.substr(equal + 1);
-                    name = name.substr(0, equal);
-                }
-                if (name == L"help") {
-                    std::cout << usageText();
-                    return 0;
-                }
-                if (name == L"version") {
-                    std::cout << "codex-proxy-guard " << productVersion() << std::endl;
-                    return 0;
-                }
-                bool matched = false;
-                for (const wchar_t *candidate : wideValueOptions) {
-                    if (name != candidate) continue;
-                    if (inlineValue) parsed.values[name] = *inlineValue;
-                    else pending = name;
-                    matched = true;
-                    break;
-                }
-                if (!matched) {
-                    for (const wchar_t *candidate : flagOptions) {
-                        if (name != candidate) continue;
-                        if (inlineValue)
-                            cliFail("Option '" + wideToUtf8(name) + "' does not take a value.");
-                        parsed.flags.insert(name);
-                        matched = true;
-                        break;
-                    }
-                }
-                if (!matched) cliFail("Unknown option.");
-                continue;
-            }
-            if (!parsed.command.empty()) cliFail("Expected a single command.");
-            parsed.command = argument;
-        }
-        if (pending) cliFail("The configuration option requires a path value.");
-        const std::wstring &command = parsed.command;
-        const auto flagSet = [&](const wchar_t *name) {
-            return parsed.flags.count(name) > 0 || parsed.values.count(name) > 0;
-        };
-        const auto valueOf = [&](const wchar_t *name) -> std::wstring {
-            const auto entry = parsed.values.find(name);
-            return entry == parsed.values.end() ? std::wstring() : entry->second;
-        };
-        for (const wchar_t *flag : {L"json", L"refresh-codex-daemon", L"activation-only"})
-            if (flagSet(flag) && command != L"launch") cliFail("Launch options require launch.");
-        for (const wchar_t *flag : {L"force", L"proxy-host", L"proxy-port"})
-            if (flagSet(flag) && command != L"init-config") cliFail("Configuration options require init-config.");
-        // --plain selects the plain console variant of the interactive mode;
-        // silently ignoring it on headless commands hides typos.
-        if (flagSet(L"plain") && !command.empty() && command != L"console")
-            cliFail("The plain flag is only valid without a command or with console.");
-        if (parsed.values.count(L"config") && valueOf(L"config").empty())
-            cliFail("The configuration path must not be empty.");
-        // The worker and provenance query have no configuration dependency.
-        // In particular, a worker must not resolve a user profile before reading
-        // the parent's bounded activation request.
-        if (command == L"internal-activate-package") {
-            if (parsed.values.count(L"config")) cliFail("The activation worker does not accept configuration.");
-            return activationWorker();
-        }
-        if (command == L"build-info" || flagSet(L"build-info")) {
+        const ParsedCommand command = parseCommandLine(arguments);
+        jsonOutput = command.json;
+        switch (command.kind) {
+        case CommandKind::Help: std::cout << usageText(); return 0;
+        case CommandKind::Version: print(std::string("codex-proxy-guard ") + productVersion()); return 0;
+        case CommandKind::InternalActivatePackage: return activationWorker();
+        case CommandKind::BuildInfo:
             printJson(Json{{"version", productVersion()}, {"commit", buildCommit()},
-                           {"dirty", buildDirty()}, {"language", "C++20"}, {"protocol_version", 1},
-                           // Compatibility spellings for the former GUI --build-info output.
-                           {"product_version", productVersion()}, {"git_commit", buildCommit()},
-                           {"git_dirty", buildDirty()}});
+                           {"dirty", buildDirty()}, {"language", "C++20"}});
             return 0;
+        case CommandKind::Licenses: return licenses();
+        default: break;
         }
-        if (command == L"licenses") return licenses();
-        const std::filesystem::path configPath = parsed.values.count(L"config")
-            ? std::filesystem::path(valueOf(L"config"))
-            : Config::defaultPath();
-        if (command == L"config-path") { print(wideToUtf8(configPath.wstring())); return 0; }
-        if (command == L"init-config") {
+        const auto configPath = resolveConfigPath(command, &Config::defaultPath);
+        if (command.kind == CommandKind::ConfigPath) { print(wideToUtf8(configPath.wstring())); return 0; }
+        if (command.kind == CommandKind::InitConfig) {
             Config config;
-            if (parsed.values.count(L"proxy-host")) config.host = wideToUtf8(valueOf(L"proxy-host"));
-            if (parsed.values.count(L"proxy-port")) {
-                int port = 0;
-                try { port = std::stoi(wideToUtf8(valueOf(L"proxy-port"))); }
-                catch (const std::exception &) { throw Error("CONFIG_INVALID", "Invalid proxy port."); }
-                config.port = port;
-            }
-            initializeConfig(configPath, config, parsed.flags.count(L"force") > 0);
+            if (command.proxyHost) config.host = *command.proxyHost;
+            if (command.proxyPort) config.port = *command.proxyPort;
+            initializeConfig(configPath, config, command.force);
             print("Configuration saved.");
             return 0;
         }
-        if (command == L"launch") {
-            if (flagSet(L"refresh-codex-daemon") && flagSet(L"activation-only"))
-                cliFail("Repair and activation-only cannot be combined.");
+        if (command.kind == CommandKind::Launch) {
             const auto config = Config::loadOrCreate(configPath);
-            printJson(launchPipeline(config, configPath,
-                                     {flagSet(L"refresh-codex-daemon"), flagSet(L"activation-only")},
-                                     Cancellation{}));
+            const Json receipt = runConsoleOperation([&](const Cancellation &cancel) {
+                return launchPipeline(config, configPath, {command.repair, command.activationOnly}, cancel);
+            });
+            // A valid settled receipt remains true even if Ctrl+C arrived late.
+            if (jsonOutput) printJson(receipt);
+            else {
+                print("Desktop activation: PID " + std::to_string(receipt.value("pid", std::uint64_t{0}))
+                    + "; instance=" + receipt.value("instance", "unknown")
+                    + "; proxy=" + receipt.value("proxy_delivery", "unknown")
+                    + "; backend config=" + receipt.value("backend_proxy_config", "unknown")
+                    + "; daemon=" + receipt.value("daemon_preparation", "skipped"));
+            }
             return 0;
         }
-        if (command.empty() || command == L"console") {
-            if (!interactiveEntry)
-                throw Error("CLI_INVALID", "The interactive console is unavailable in this build.");
-            const bool plain = parsed.flags.count(L"plain") > 0;
-            return interactiveEntry(configPath, plain);
-        }
-        cliFail("Unknown command.");
-    } catch (const Error &e) {
-        std::cerr << e.code << ": " << e.message << std::endl;
+        if (!interactiveEntry) throw Error("CLI_INVALID", "The interactive console is unavailable in this build.");
+        return interactiveEntry(configPath, command.plain);
+    } catch (const Error &error) {
+        if (jsonOutput) printJson(Json{{"error", error.json()}});
+        else std::cerr << error.code << ": " << error.message << std::endl;
         return 1;
     } catch (...) {
-        std::cerr << "ENGINE_TASK_FAILED: The operation failed." << std::endl;
+        const Error error("ENGINE_TASK_FAILED", "The operation failed.");
+        if (jsonOutput) printJson(Json{{"error", error.json()}});
+        else std::cerr << error.code << ": " << error.message << std::endl;
         return 1;
     }
 }

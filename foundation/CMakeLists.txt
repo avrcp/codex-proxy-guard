@@ -2,6 +2,7 @@
 add_library(guard_foundation STATIC
     src/build_info.cpp
     src/cancellation.cpp
+    src/console_control.cpp
     src/error.cpp
     src/json.cpp
     src/path.cpp

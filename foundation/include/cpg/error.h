@@ -14,9 +14,14 @@ namespace cpg {
 struct Error final : std::runtime_error {
     std::string code;
     std::string message;
+    std::string field;
 
-    Error(std::string errorCode, std::string text);
-    Json json() const { return Json{{"code", code}, {"message", message}}; }
+    Error(std::string errorCode, std::string text, std::string errorField = {});
+    Json json() const {
+        Json value{{"code", code}, {"message", message}};
+        if (!field.empty()) value["field"] = field;
+        return value;
+    }
 };
 
 } // namespace cpg

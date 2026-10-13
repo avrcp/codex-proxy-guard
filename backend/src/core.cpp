@@ -1,5 +1,6 @@
 #include "core.h"
 #include "cpg/path.h"
+#include "cpg/port.h"
 #include "cpg/win_handle.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -480,8 +481,10 @@ void validateManagedValues(const EnvFile &env)
         fail("BACKEND_PROXY_BLOCK_INVALID", "The managed block proxy endpoint was edited.");
     Config generated;
     generated.host = host;
-    generated.port = std::stoi(http.substr(digitsStart, offset - digitsStart));
-    try { generated.validate(); }
+    try {
+        generated.port = parsePortStrict(http.substr(digitsStart, offset - digitsStart));
+        generated.validate();
+    }
     catch (const Error &) { fail("BACKEND_PROXY_BLOCK_INVALID", "The managed block proxy endpoint is not a valid loopback proxy."); }
     if (generated.proxyUrl() != http)
         fail("BACKEND_PROXY_BLOCK_INVALID", "The managed block proxy endpoint was edited.");
@@ -628,9 +631,9 @@ void Config::validate() const
 {
     if (version != 2) fail("CONFIG_INVALID", "Unsupported configuration version; expected version 2.");
     if (!asciiEqualsFolded(scheme, "http")) fail("CONFIG_INVALID", "Proxy scheme must be http.");
-    if (port < 1 || port > 65535) fail("CONFIG_INVALID", "Proxy port must be between 1 and 65535.");
+    if (port < 1 || port > 65535) throw Error("CONFIG_INVALID", "Proxy port must be between 1 and 65535.", "proxy.port");
     if (host.empty() || asciiTrimmed(host) != host || host.find('\0') != std::string::npos)
-        fail("CONFIG_INVALID", "Invalid proxy host.");
+        throw Error("CONFIG_INVALID", "Invalid proxy host.", "proxy.host");
     IN_ADDR ipv4{};
     IN6_ADDR ipv6{};
     bool loopback = asciiEqualsFolded(host, "localhost");
@@ -641,7 +644,7 @@ void Config::validate() const
         const auto *bytes = reinterpret_cast<const unsigned char *>(&ipv6);
         loopback = std::all_of(bytes, bytes + 15, [](unsigned char c) { return c == 0; }) && bytes[15] == 1;
     }
-    if (!loopback) fail("CONFIG_INVALID", "Proxy host must be localhost or a loopback IP address.");
+    if (!loopback) throw Error("CONFIG_INVALID", "Proxy host must be localhost or a loopback IP address.", "proxy.host");
     if (noProxy.empty() || noProxy.size() > 32 || noProxyValue().size() > 4096)
         fail("CONFIG_INVALID", "Proxy exclusions must contain 1 to 32 bounded entries.");
     for (const auto &entry : noProxy) {

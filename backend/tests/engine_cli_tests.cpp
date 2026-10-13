@@ -24,6 +24,7 @@ std::filesystem::path enginePath() { return std::filesystem::path(utf8ToWide(TAR
 
 TEST_CASE("CLI rejects removed and conflicting options")
 {
+    TemporaryDirectory temporary;
     const std::vector<std::vector<std::wstring>> argumentSets = {
         {L"daemon-stop"},
         {L"launch", L"--auto-stop-daemon"},
@@ -36,11 +37,21 @@ TEST_CASE("CLI rejects removed and conflicting options")
         {L"init-config", L"--plain"},
         {L"licenses", L"--plain"},
         {L"--config=", L"build-info"},
+        {L"--config="},
+        {L"--config", L"--plain"},
+        {L"--config", L"one", L"--config", L"two", L"config-path"},
+        {L"init-config", L"--proxy-port", L"7890abc"},
+        {L"init-config", L"--proxy-port", L"1.5"},
+        {L"init-config", L"--proxy-port", L"7890", L"--proxy-port", L"7891"},
         {L"--config", L"", L"config-path"}};
     for (const auto &arguments : argumentSets) {
         ProcessRequest processRequest;
         processRequest.program = enginePath();
         processRequest.arguments = arguments;
+        if (!arguments.empty() && arguments.front() == L"init-config") {
+            processRequest.arguments.insert(processRequest.arguments.end(),
+                {L"--config", (temporary.path / L"invalid.toml").wstring()});
+        }
         processRequest.environment = UnicodeEnvironment::current();
         processRequest.timeout = std::chrono::milliseconds(5000);
         processRequest.stdoutLimit = 4096;
@@ -104,6 +115,48 @@ TEST_CASE("licenses command streams the embedded notices")
     const std::string suffix = "\n-----\n\n";
     REQUIRE(result.out.size() >= suffix.size());
     CHECK(result.out.compare(result.out.size() - suffix.size(), suffix.size(), suffix) == 0);
+}
+
+TEST_CASE("launch output contracts reject invalid config without activation")
+{
+    TemporaryDirectory dir;
+    const auto config = dir.file(L"invalid.toml");
+    writeBytes(config, "invalid = [\n");
+    for (const bool json : {false, true}) {
+        ProcessRequest request;
+        request.program = enginePath();
+        request.arguments = {L"launch", L"--config", config.wstring()};
+        request.timeout = std::chrono::seconds(5);
+        if (json) request.arguments.push_back(L"--json");
+        request.environment = UnicodeEnvironment::current();
+        const auto result = runOwnedProcess(request, {});
+        CHECK(result.exitCode != 0);
+        if (json) {
+            CHECK(result.err.empty());
+            const auto document = parseStrictJsonObject(result.out, 65536, "TEST");
+            CHECK(document.at("error").at("code") == "CONFIG_INVALID");
+        } else {
+            CHECK(result.out.empty());
+            CHECK(result.err.find("CONFIG_INVALID") != std::string::npos);
+        }
+        CHECK(result.out.find('\x1b') == std::string::npos);
+    }
+}
+
+TEST_CASE("plain redirected EOF ends without reading a real config")
+{
+    TemporaryDirectory dir;
+    const auto config = dir.file(L"invalid.toml");
+    writeBytes(config, "invalid = [\n");
+    ProcessRequest request;
+    request.program = enginePath();
+    request.arguments = {L"console", L"--plain", L"--config", config.wstring()};
+    request.environment = UnicodeEnvironment::current();
+    request.timeout = std::chrono::seconds(5);
+    const auto result = runOwnedProcess(request, {});
+    CHECK(result.exitCode == 0);
+    CHECK(result.out.find('\x1b') == std::string::npos);
+    CHECK(readBytes(config) == "invalid = [\n");
 }
 
 TEST_CASE("renamed executable in unicode directory stays headless")
