@@ -1,6 +1,6 @@
 # Codex Proxy Guard
 
-Windows 控制台本地代理启动器：纯 C++20 + Win32，无 Qt、无 PowerShell discovery。`0.7.0-rc.3` 是一个 Console 子系统单文件 EXE（静态 CRT `/MT`，全对象 CFG/CET 加固），默认提供原生 VT TUI，并通过 Windows 应用模型正确激活已注册的 ChatGPT Desktop。
+Windows 控制台本地代理启动器：纯 C++20 + Win32，无 Qt、无 PowerShell discovery。`0.7.0-rc.4` 是一个 Console 子系统单文件 EXE（静态 CRT `/MT`；全部对象以 `/guard:cf` 编译，最终映像链接 ASLR/DEP/高熵 VA/CET 加固——CET 以扩展 DLL 特征记录为准），默认提供原生 VT TUI，并通过 Windows 应用模型正确激活已注册的 ChatGPT Desktop。
 
 Guard 将代理参数交给新启动的 ChatGPT Desktop / Codex Desktop，并可在明确授权的 Codex Home 中维护一个代理环境块。它不测量网络连通性，不管理代理服务，不读取认证数据，也不修改 Windows 系统代理或 Codex `config.toml`。
 
@@ -72,6 +72,6 @@ Guard 的块由 `# BEGIN CODEX PROXY GUARD: proxy-v1` 和对应 END 标记界定
 
 发布流水线（clean tree → 固定 commit 的 git archive → 独立源码/构建目录 → 构建 → 全部测试 → 打包 EXE smoke → 导入表扫描 → 可选 Authenticode 签名与验签 → SHA-256 → transport ZIP + source ZIP + size report → release-manifest.json）由 `scripts/verify-package.py --schema static-single` 独立重验后提升到 `dist/releases/<version>-<commit>/`。未签名产物处处标注 `UNSIGNED DEVELOPMENT BUILD`；公开分发要求有效 Authenticode。
 
-详见[架构](docs/ARCHITECTURE.md)、[安全边界](docs/SECURITY.md)、[TUI 验收](docs/TUI_ACCEPTANCE.md)、[迁移记录](docs/CPP_TUI_MIGRATION_PLAN.md)与[第三方许可](THIRD_PARTY_NOTICES.md)。
+详见[架构](docs/ARCHITECTURE.md)、[安全边界](docs/SECURITY.md)、[TUI 验收](docs/TUI_ACCEPTANCE.md)、[发布就绪状态](docs/RELEASE_READINESS.md)、[迁移记录](docs/CPP_TUI_MIGRATION_PLAN.md)与[第三方许可](THIRD_PARTY_NOTICES.md)。
 
 `.env` 写入与撤销要求本地 NTFS 事务可用；不支持时保留授权并拒绝修改，无非事务回退。

@@ -33,13 +33,26 @@ explicitly recorded as NOT RUN; they must not be presented as release guarantees
       fixed commit, including tracked dotfiles, and build inputs came from that archive.
 - [ ] Confirm the release directory holds exactly the manifest's artifact
       set (eight files including both sidecars); no stale extras.
-- [ ] Confirm the PE mitigation gate: CFG instrumented with the FID table
-      present, DYNAMICBASE/HIGHENTROPYVA/NXCOMPAT and CET recorded in the
-      manifest and re-derived from the image by the verifier.
+- [ ] Confirm the PE mitigation gate: the image records CFG instrumentation
+      with a non-empty FID table (GuardFlags agreeing with
+      GuardCFFunctionTable/Count), DYNAMICBASE/HIGHENTROPYVA/NXCOMPAT, and
+      CET only from the `IMAGE_DEBUG_TYPE_EX_DLLCHARACTERISTICS` (type 20)
+      debug record — re-derived from the image by the verifier and pinned by
+      a `/CETCOMPAT` vs `/CETCOMPAT:NO` toolchain fixture pair. The PE flags
+      prove image facts; object-level CFG coverage comes from the shared
+      build options, not from the image.
 - [ ] Confirm Authenticode: signed releases record `authenticode_status=Valid`,
-      are independently re-validated through WinVerifyTrust by the verifier,
-      and nothing touches the EXE after signing; unsigned releases are
-      explicitly marked `UNSIGNED DEVELOPMENT BUILD`.
+      a non-empty `publisher`, the `signer_thumbprint` (matching the
+      requested certificate), the `timestamp_present` fact and the
+      verification policy — all taken from the signature object, never from
+      localized signtool text — and are independently re-validated through
+      WinVerifyTrust by the verifier (VERIFY→CLOSE lifecycle, only status 0
+      is valid). Nothing touches the EXE after signing; unsigned releases
+      are explicitly marked `UNSIGNED DEVELOPMENT BUILD`.
+- [ ] Record the current candidate's readiness level in
+      [release readiness](RELEASE_READINESS.md); automated isolated tests,
+      an unsigned development package and a public release are three
+      different levels and must not be conflated.
 - [ ] Confirm the destination `dist/releases/<version>-<commit>` did not
       exist before the build (promotion is immutable; the build refuses to
       overwrite) and that promotion was one atomic move from unique staging.

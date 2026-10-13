@@ -1,5 +1,20 @@
 # Security Model
 
+## 发布校验边界（release verification）
+
+发布门禁只声明它亲自验证过的事实：EXE 在签名后不再被改动，摘要与
+manifest/transport ZIP/SHA256SUMS 逐字节绑定，导入表只含 Windows 系统 DLL，
+PE 只按 x64/PE32+ 解析且越界即失败。CET 兼容仅以
+`IMAGE_DEBUG_TYPE_EX_DLLCHARACTERISTICS`（type 20）扩展记录为准——普通头的
+0x1000 位是 APPCONTAINER，GuardFlags 的 0x01000000 位属于其他命名空间，
+二者都不是 CET 证据；记录截断按解析失败处理，不取猜测值。`cet_compat=true`
+只表示映像标记，不表示运行时硬件 shadow stack 已启用；PE 的 CFG 标志证明
+映像级事实，不证明每个对象文件都以 `/guard:cf` 编译——对象级覆盖来自共享
+构建选项。签名事实（publisher、签名者指纹、时间戳、验证策略）来自签名对象
+与独立 `WinVerifyTrust`（VERIFY→CLOSE 配对，仅状态 0 视为有效；清理失败不会
+被当成 Valid），本地化 signtool 文本永不解析。签名不能保证杀软永不拦截，
+SmartScreen 对新签名文件仍可能出现信誉提示。
+
 ## Interactive frontend boundary
 
 The TUI runs the engine in-process through the shared EngineSession: it

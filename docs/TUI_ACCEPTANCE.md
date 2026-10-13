@@ -1,8 +1,60 @@
-# TUI acceptance — 0.7.0-rc.3 (no Qt)
+# TUI acceptance — 0.7.0-rc.4 (no Qt)
 
-Execution dates: 2026-10-13 (rc.3), 2026-10-12 (historical rc.2) and
-2026-10-11 (historical rc.1), Asia/Shanghai. Platform: Windows 11 x64,
-MSVC x64, static CRT release profile.
+Execution dates: 2026-10-13 (rc.4 verifier-fix pass and rc.3), 2026-10-12
+(historical rc.2) and 2026-10-11 (historical rc.1), Asia/Shanghai. Platform:
+Windows 11 x64, MSVC x64, static CRT release profile.
+
+## RC4 release-validation corrections
+
+The RC3 review found the release verifier itself defective, and rc.4 fixes
+it before any further acceptance is claimed:
+
+- The independent Authenticode gate could never execute: `byref()` was
+  assigned into the typed `WINTRUST_DATA.pFile` field (TypeError before
+  `WinVerifyTrust` was ever called) and the cleanup pass used state action
+  16 while `WTD_STATEACTION_CLOSE` is 2. rc.4 carries a SDK-shaped x64
+  structure set, a typed file pointer, a VERIFY→CLOSE lifecycle in
+  `finally` where only status 0 is valid and cleanup failures never mask
+  the primary result — with a fake-API lifecycle matrix plus real
+  WinVerifyTrust controls (unsigned fixture rejected, embedded MS-signed
+  vswhere.exe accepted). Publisher identity now comes from the signature
+  object, not from parsing localized signtool text.
+- The mitigation gate accepted the APPCONTAINER DllCharacteristics bit and
+  an unrelated GuardFlags bit as CET evidence. The rc.2 statement below
+  about "the extended-characteristics debug record spelling newer linkers
+  use" described one of *three accepted spellings* — that claim is
+  **withdrawn**: the type-20 extended record is the only evidence rc.4
+  accepts, per the C01–C09 negative matrix and a real
+  `/CETCOMPAT` vs `/CETCOMPAT:NO` toolchain fixture pair. PE parsing is
+  strict x64/PE32+ with bounds checks; truncated records fail closed.
+- `cet_compat=true` states the image is marked CET-compatible; it does not
+  claim hardware shadow stacks were active at run time. The PE CFG flags
+  prove the image's table, not that every object was compiled with
+  `/guard:cf` — object-level coverage comes from the shared build options.
+- A build-host change (VS 18 cl no longer honors `VSLANG`; CMake 4.3
+  silently drops `rules.ninja` for a plain-variable non-ASCII
+  `/showIncludes` prefix) had broken every Ninja configure; the prefix is
+  now stored via the cache-variable path and header-dependency tracking
+  was re-verified.
+
+## RC4 automated acceptance
+
+Execution: 2026-10-13, Windows x64, MSVC 19.51 (toolchain 14.51), CMake
+4.3.1, static CRT. Full CTest: 11/11 suites passed, 0 skipped — the ten
+rc.3 suites plus the new CET toolchain fixture pair, with the
+verifier-fixture suite extended to 54 cases (WinTrust lifecycle matrix,
+real WinVerifyTrust controls, manifest signature-fact rejections) and the
+release-input suite to 14 cases (signature-metadata extraction with a
+shadowed cmdlet). Console-event tests only pass in a process tree without
+the inherited Ctrl+C-disabled state: agent harness sessions carry that
+state into every descendant, which silently suppresses CTRL_C_EVENT
+handler delivery (reproduced minimally and cleared with
+`SetConsoleCtrlHandler(NULL, FALSE)`). The rc.3-era binary behaves
+identically under such a tree, so a red run there is an execution-context
+artifact, not a regression; run the gate from a normal interactive
+console or a scheduled task outside the harness tree.
+
+Current readiness is recorded in [release readiness](RELEASE_READINESS.md).
 
 ## RC3 correction to the inherited evidence
 
