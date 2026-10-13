@@ -51,11 +51,32 @@ def file_sha256(path: pathlib.Path) -> str:
     return sha256_bytes(path.read_bytes())
 
 
-def minimal_console_pe(mitigations: bool = True) -> bytes:
-    """A tiny but structurally valid PE32+ console image importing
-    KERNEL32.DLL – enough for the verifier's own PE parser. With
-    mitigations=True it also carries the DllCharacteristics bits and a load
-    config with CFG/CET GuardFlags the mitigation gate requires."""
+def minimal_console_pe(*, mitigations=True, dll_characteristics=None,
+                       guard_flags=None, cf_table=None, cf_count=None,
+                       cet=None, machine=0x8664, magic=0x20b,
+                       rva_count=16):
+    """A tiny but structurally valid PE32+ x64 console image importing
+    KERNEL32.DLL - enough for the verifier's own PE parser. The mitigation
+    facts are modeled exactly where the PE format defines them:
+    DllCharacteristics bits in the optional header, the CFG block in the
+    load-config directory, and CET in an IMAGE_DEBUG_TYPE_EX_DLLCHARACTERISTICS
+    (type 20) debug record - never in the plain header or GuardFlags.
+
+    cet: 'valid' (record with the CET bit set), 'clear' (record, bit clear),
+    'absent' (no debug directory), 'truncated' (payload runs past the file),
+    'no-pointer' (record without a file pointer).
+    """
+    mitigated = mitigations
+    if dll_characteristics is None:
+        dll_characteristics = 0x4160 if mitigated else 0  # DY|HE|NX|GUARD_CF
+    if guard_flags is None:
+        guard_flags = 0x500 if mitigated else 0  # CF instrumented | FID table
+    if cf_table is None:
+        cf_table = 0x2400 if mitigated else 0
+    if cf_count is None:
+        cf_count = 2 if mitigated else 0
+    if cet is None:
+        cet = 'valid' if mitigated else 'absent'
     headers = bytearray(0x200)
     struct.pack_into('<H', headers, 0, 0x5A4D)              # MZ
     struct.pack_into('<I', headers, 0x3c, 0x40)             # e_lfanew
@@ -63,19 +84,28 @@ def minimal_console_pe(mitigations: bool = True) -> bytes:
     headers[offset:offset + 4] = b'PE' + bytes(2)
     offset += 4
     struct.pack_into('<HHIIIHH', headers, offset,
-                     0x8664, 2, 0, 0, 0, 240, 0x22)        # COFF header
+                     machine, 2, 0, 0, 0, 240, 0x22)        # COFF header
     offset += 20
     optional = offset
-    struct.pack_into('<H', headers, optional, 0x20b)       # PE32+ magic
-    struct.pack_into('<H', headers, optional + 68, 3)      # CUI subsystem
-    struct.pack_into('<I', headers, optional + 108, 16)    # data directory count
-    struct.pack_into('<I', headers, optional + 120, 0x1000)  # import directory RVA
-    if mitigations:
-        # DYNAMICBASE | HIGHENTROPYVA | NX_COMPAT | GUARD_CF | CET_COMPAT
-        struct.pack_into('<H', headers, optional + 70, 0x5160)
-        # Load config directory (index 10) points into .rdata below. PE32+
-        # data directories start at optional+112, so index 10 is +192.
-        struct.pack_into('<I', headers, optional + 192, 0x2000)
+    struct.pack_into('<H', headers, optional, magic)        # PE32+ magic
+    struct.pack_into('<H', headers, optional + 68, 3)       # CUI subsystem
+    struct.pack_into('<H', headers, optional + 70, dll_characteristics)
+    struct.pack_into('<I', headers, optional + 108, rva_count)
+    struct.pack_into('<II', headers, optional + 120, 0x1000, 0x28)  # imports
+    # .rdata virtual size exceeds its raw size, so the fixture also models a
+    # zero-filled virtual tail the parser must refuse to read.
+    rdata_raw = 0x400
+    rdata_virtual = 0x600
+    rdata_length = 0x400
+    load_config_file = rdata_raw                              # 0x400 / VA 0x2000
+    debug_entries_file = rdata_raw + 0x100                    # 0x500 / VA 0x2100
+    cet_payload_file = rdata_raw + 0x200                      # 0x600 / VA 0x2200
+    rdata_base_va = 0x2000
+    if cet != 'absent':
+        struct.pack_into('<II', headers, optional + 160,
+                         rdata_base_va + 0x100, 28)           # debug directory
+    struct.pack_into('<II', headers, optional + 192,
+                     rdata_base_va, 0xC8)                     # load config
     offset += 240
     section = offset
     headers[section:section + 8] = b'.idata' + bytes(2)
@@ -85,17 +115,35 @@ def minimal_console_pe(mitigations: bool = True) -> bytes:
     struct.pack_into('<I', headers, section + 20, 0x200)   # raw pointer
     rdata = section + 40
     headers[rdata:rdata + 8] = b'.rdata' + bytes(2)
-    struct.pack_into('<I', headers, rdata + 8, 0x400)      # virtual size
-    struct.pack_into('<I', headers, rdata + 12, 0x2000)    # virtual address
-    struct.pack_into('<I', headers, rdata + 16, 0x400)     # raw size
-    struct.pack_into('<I', headers, rdata + 20, 0x400)     # raw pointer
+    struct.pack_into('<I', headers, rdata + 8, rdata_virtual)
+    struct.pack_into('<I', headers, rdata + 12, rdata_base_va)
+    struct.pack_into('<I', headers, rdata + 16, rdata_length)
+    struct.pack_into('<I', headers, rdata + 20, rdata_raw)
     idata = bytearray(0x200)
     struct.pack_into('<I', idata, 12, 0x1100)              # import name RVA
     idata[0x100:0x100 + 13] = b'KERNEL32.DLL' + bytes(1)
-    rconfig = bytearray(0x400)
+    rconfig = bytearray(rdata_length)
     struct.pack_into('<I', rconfig, 0, 0xC8)               # load config size
-    struct.pack_into('<I', rconfig, 144,                   # GuardFlags
-                     0x01000500 if mitigations else 0)     # CFG | FID | CET
+    struct.pack_into('<Q', rconfig, 128, cf_table)         # GuardCFFunctionTable
+    struct.pack_into('<Q', rconfig, 136, cf_count)         # GuardCFFunctionCount
+    struct.pack_into('<I', rconfig, 144, guard_flags)      # GuardFlags
+    if cet != 'absent':
+        entry = debug_entries_file - rdata_raw
+        # Characteristics/TimeDateStamp/Major/Minor, then Type(20),
+        # SizeOfData, AddressOfRawData, PointerToRawData.
+        struct.pack_into('<I', rconfig, entry + 12, 20)
+        pointer = cet_payload_file
+        payload_size = 4
+        if cet == 'truncated':
+            pointer = rdata_raw + rdata_length - 2          # payload runs past EOF
+            payload_size = 8
+        elif cet == 'no-pointer':
+            pointer = 0
+        struct.pack_into('<I', rconfig, entry + 16, payload_size)
+        struct.pack_into('<I', rconfig, entry + 24, pointer)
+        payload = cet_payload_file - rdata_raw
+        struct.pack_into('<I', rconfig, payload,
+                         0x0001 if cet == 'valid' else 0x0000)
     return bytes(headers) + bytes(idata) + bytes(rconfig)
 
 
@@ -361,6 +409,18 @@ class VerifierTests(unittest.TestCase):
         self.write_sums()
         self.assertNotEqual(self.verify().returncode, 0)
 
+    def test_rejects_exe_whose_cet_comes_only_from_wrong_bits(self):
+        # APPCONTAINER in DllCharacteristics and the 0x01000000 GuardFlags
+        # bit, but no type-20 record: the gate must refuse the release.
+        self.exe.write_bytes(minimal_console_pe(
+            cet='absent', dll_characteristics=0x5160, guard_flags=0x01000500))
+        self.write_manifest(executable=dict(self.manifest['executable'],
+                                             sha256=file_sha256(self.exe),
+                                             size=self.exe.stat().st_size))
+        self.write_transport()
+        self.write_sums()
+        self.assertNotEqual(self.verify().returncode, 0)
+
     def test_rejects_manifest_mitigation_lie(self):
         # The EXE carries the mitigations but the manifest claims they are
         # absent - the PE parse is the authority, not the manifest.
@@ -410,15 +470,75 @@ class RC3ReviewReproductions(unittest.TestCase):
 
     def test_appcontainer_bit_alone_is_not_cet_evidence(self):
         module = runpy.run_path(str(VERIFIER))
-        image = bytearray(minimal_console_pe())
-        pe = struct.unpack_from('<I', image, 0x3c)[0]
-        optional = pe + 24
-        # APPCONTAINER DllCharacteristics, CFG-only GuardFlags, no debug
-        # record carrying the extended CET characteristics.
-        struct.pack_into('<H', image, optional + 70, 0x5160)
-        struct.pack_into('<I', image, 0x400 + 144, 0x500)
-        struct.pack_into('<II', image, optional + 160, 0, 0)
-        self.assertIs(module['pe_mitigations'](bytes(image))['cet_compat'], False)
+        image = minimal_console_pe(cet='absent', dll_characteristics=0x5160,
+                                   guard_flags=0x500)
+        self.assertIs(module['pe_mitigations'](image)['cet_compat'], False)
+
+
+class PEMitigationEvidenceTests(unittest.TestCase):
+    """The C01..C09 matrix: CET compatibility is accepted only from the
+    extended-characteristics debug record, and the CFG facts only when the
+    load-config flags agree with the function table they describe."""
+
+    def setUp(self):
+        self.module = runpy.run_path(str(VERIFIER))
+
+    def mitigations(self, **kwargs):
+        return self.module['pe_mitigations'](minimal_console_pe(**kwargs))
+
+    def test_c01_valid_extended_record_reports_cet(self):
+        facts = self.mitigations(cet='valid')
+        self.assertIs(facts['cet_compat'], True)
+        for name in self.module['REQUIRED_MITIGATIONS']:
+            self.assertIs(facts[name], True, name)
+
+    def test_c02_absent_record_reports_no_cet(self):
+        self.assertIs(self.mitigations(cet='absent')['cet_compat'], False)
+
+    def test_c03_appcontainer_bit_is_not_cet(self):
+        facts = self.mitigations(cet='absent', dll_characteristics=0x1000)
+        self.assertIs(facts['cet_compat'], False)
+
+    def test_c04_unrelated_guardflag_bit_is_not_cet(self):
+        facts = self.mitigations(cet='absent', guard_flags=0x01000000)
+        self.assertIs(facts['cet_compat'], False)
+
+    def test_c05_record_with_clear_bit_reports_no_cet(self):
+        self.assertIs(self.mitigations(cet='clear')['cet_compat'], False)
+
+    def test_c06_truncated_record_is_a_parse_failure(self):
+        with self.assertRaises(SystemExit):
+            self.mitigations(cet='truncated')
+
+    def test_c06b_record_without_file_pointer_is_a_parse_failure(self):
+        with self.assertRaises(SystemExit):
+            self.mitigations(cet='no-pointer')
+
+    def test_c07_insufficient_data_directory_count_is_refused(self):
+        with self.assertRaises(SystemExit):
+            self.mitigations(rva_count=15)
+
+    def test_c08a_non_amd64_machine_is_refused(self):
+        with self.assertRaises(SystemExit):
+            self.mitigations(machine=0x014c)
+
+    def test_c08b_pe32_magic_is_refused(self):
+        with self.assertRaises(SystemExit):
+            self.mitigations(magic=0x10b)
+
+    def test_c09_cfg_flag_without_function_table_is_not_table_evidence(self):
+        facts = self.mitigations(cf_table=0, cf_count=0)
+        self.assertIs(facts['cf_instrumented'], True)
+        self.assertIs(facts['cf_function_table_present'], False)
+        facts = self.mitigations(cf_count=0)
+        self.assertIs(facts['cf_function_table_present'], False)
+
+    def test_zero_filled_virtual_tail_has_no_raw_bytes(self):
+        layout = self.module['pe_layout'](minimal_console_pe())
+        # 0x2400 lies inside .rdata's virtual size (0x600) but past its raw
+        # size (0x400): memory-zero-filled, not file content.
+        with self.assertRaises(SystemExit):
+            self.module['rva_to_offset'](bytes(minimal_console_pe()), layout, 0x2400)
 
 
 class WinTrustLifecycleTests(unittest.TestCase):

@@ -35,6 +35,7 @@ if(BUILD_TESTING)
     add_subdirectory(tests/foundation)
     add_subdirectory(tests/app)
     add_subdirectory(tests/tui)
+    add_subdirectory(tests/pe_fixtures)
     # Engine integration tests spawn the unified production executable, so they
     # are registered only after the app target exists (no CMake cycles).
     add_subdirectory(backend/tests)
@@ -44,4 +45,12 @@ if(BUILD_TESTING)
     add_test(NAME release_input_guards
         COMMAND Python3::Interpreter "${CMAKE_SOURCE_DIR}/scripts/tests/test_release_inputs.py")
     set_tests_properties(release_input_guards PROPERTIES TIMEOUT 120)
+    # CET evidence cross-check against the real toolchain (only files are
+    # analyzed; the fixture executables are never run).
+    add_test(NAME pe_cet_toolchain_fixtures
+        COMMAND Python3::Interpreter "${CMAKE_SOURCE_DIR}/scripts/tests/test_pe_cet_fixtures.py"
+            --cet $<TARGET_FILE:cpg_pe_fixture_cet>
+            --no-cet $<TARGET_FILE:cpg_pe_fixture_nocet>
+            --production $<TARGET_FILE:CodexProxyGuard>)
+    set_tests_properties(pe_cet_toolchain_fixtures PROPERTIES TIMEOUT 120)
 endif()

@@ -72,121 +72,193 @@ def check_sidecar(archive: pathlib.Path) -> str:
     return actual
 
 
-def pe_header(data: bytes):
+# --- Strict PE parsing (x64 / PE32+ / console only) ----------------------------
+# The product ships exactly one image shape; anything else is rejected
+# instead of parsed with guesses. Every read is bounds-checked and fails
+# closed instead of reaching past the file.
+IMAGE_FILE_MACHINE_AMD64 = 0x8664
+PE32_PLUS_MAGIC = 0x20b
+SUBSYSTEM_CUI = 3
+
+
+def read_struct(data: bytes, offset: int, fmt: str, what: str):
+    """Bounds-checked struct.unpack_from: malformed headers are a parse
+    failure, never a struct.error traceback or an out-of-file read."""
+    end = offset + struct.calcsize(fmt)
+    if offset < 0 or end > len(data):
+        raise SystemExit(f'PE parse failed: {what} at {offset:#x} exceeds the image')
+    return struct.unpack_from(fmt, data, offset)
+
+
+def pe_layout(data: bytes):
+    """Validated header layout of the only supported target: AMD64, PE32+,
+    with the full 16-entry data directory inside SizeOfOptionalHeader and a
+    section table that fits the file."""
     if data[:2] != b'MZ':
         raise SystemExit('EXE has no MZ signature')
-    pe_offset = struct.unpack_from('<I', data, 0x3c)[0]
-    if data[pe_offset:pe_offset + 4] != b'PE\x00\x00':
+    pe_offset = read_struct(data, 0x3c, '<I', 'e_lfanew')[0]
+    signature = read_struct(data, pe_offset, '<4s', 'PE signature')[0]
+    if signature != b'PE\x00\x00':
         raise SystemExit('EXE has no PE signature')
-    return pe_offset
+    machine, number_sections = read_struct(data, pe_offset + 4, '<HH', 'COFF header')
+    if machine != IMAGE_FILE_MACHINE_AMD64:
+        raise SystemExit(f'EXE is not an AMD64 x64 image (machine {machine:#06x})')
+    size_of_optional = read_struct(data, pe_offset + 20, '<H', 'SizeOfOptionalHeader')[0]
+    optional = pe_offset + 24
+    magic = read_struct(data, optional, '<H', 'optional header magic')[0]
+    if magic != PE32_PLUS_MAGIC:
+        raise SystemExit(f'EXE is not a PE32+ image (magic {magic:#06x})')
+    number_rva = read_struct(data, optional + 108, '<I', 'NumberOfRvaAndSizes')[0]
+    data_directories = optional + 112
+    if number_rva < 16:
+        raise SystemExit(
+            f'PE data directory count {number_rva} is below the required 16')
+    if data_directories + number_rva * 8 > optional + size_of_optional:
+        raise SystemExit('PE data directories exceed SizeOfOptionalHeader')
+    section_table = optional + size_of_optional
+    if section_table + number_sections * 40 > len(data):
+        raise SystemExit('PE section table exceeds the image')
+    return pe_offset, optional, data_directories, section_table, number_sections
 
 
 def pe_subsystem(data: bytes) -> int:
-    pe_offset = pe_header(data)
-    optional_header = pe_offset + 24
-    magic = struct.unpack_from('<H', data, optional_header)[0]
-    if magic not in (0x10b, 0x20b):
-        raise SystemExit('Unknown PE optional header magic')
-    return struct.unpack_from('<H', data, optional_header + 68)[0]
+    _, optional, _, _, _ = pe_layout(data)
+    return read_struct(data, optional + 68, '<H', 'subsystem')[0]
 
 
-def rva_to_offset(data: bytes, rva: int) -> int:
-    pe_offset = pe_header(data)
-    optional_header = pe_offset + 24
-    section_table = optional_header + struct.unpack_from('<H', data, pe_offset + 20)[0]
-    number_sections = struct.unpack_from('<H', data, pe_offset + 6)[0]
+def rva_to_offset(data: bytes, layout, rva: int, needed: int = 1) -> int:
+    """Map an RVA into raw file bytes. An address that only exists in a
+    section's zero-filled virtual tail - or past the end of the file - has no
+    raw bytes and is refused instead of silently reading zeros."""
+    _, _, _, section_table, number_sections = layout
     for index in range(number_sections):
         entry = section_table + index * 40
-        virtual_size = struct.unpack_from('<I', data, entry + 8)[0]
-        virtual_address = struct.unpack_from('<I', data, entry + 12)[0]
-        raw_size = struct.unpack_from('<I', data, entry + 16)[0]
-        raw_pointer = struct.unpack_from('<I', data, entry + 20)[0]
+        virtual_size, virtual_address, raw_size, raw_pointer = read_struct(
+            data, entry + 8, '<IIII', f'section {index} header')
         if virtual_address <= rva < virtual_address + max(virtual_size, raw_size):
-            return raw_pointer + (rva - virtual_address)
+            delta = rva - virtual_address
+            if delta >= raw_size:
+                raise SystemExit(
+                    f'RVA {rva:#x} lies in a section zero-filled virtual tail '
+                    'with no raw file bytes')
+            offset = raw_pointer + delta
+            if offset + needed > len(data):
+                raise SystemExit(f'RVA {rva:#x} maps past the end of the image')
+            return offset
     raise SystemExit(f'RVA outside sections: {rva:#x}')
 
 
 def pe_imports(data: bytes) -> list:
     """Import scan of the first import directory (dumpbin-free)."""
-    pe_offset = pe_header(data)
-    optional_header = pe_offset + 24
-    magic = struct.unpack_from('<H', data, optional_header)[0]
-    data_directories = optional_header + (112 if magic == 0x20b else 96)
-    # The import table is the second data directory (index 1).
-    import_rva = struct.unpack_from('<I', data, data_directories + 8)[0]
-
+    layout = pe_layout(data)
+    import_rva, import_size = read_struct(
+        data, layout[2] + 8, '<II', 'import directory')[0:2]
     imports = []
-    descriptor = rva_to_offset(data, import_rva) if import_rva else 0
-    while descriptor and data[descriptor:descriptor + 20] != b'\x00' * 20:
-        name_rva = struct.unpack_from('<I', data, descriptor + 12)[0]
-        name_offset = rva_to_offset(data, name_rva)
-        end = data.index(b'\x00', name_offset)
+    if not import_rva:
+        return imports
+    descriptor = rva_to_offset(data, layout, import_rva, 20)
+    for _ in range(import_size // 20):
+        entry = read_struct(data, descriptor, '<20s', 'import descriptor')[0]
+        if entry == b'\x00' * 20:
+            break
+        name_rva = struct.unpack_from('<I', entry, 12)[0]
+        if not name_rva:
+            raise SystemExit('PE parse failed: import descriptor has no name RVA')
+        name_offset = rva_to_offset(data, layout, name_rva)
+        end = data.find(b'\x00', name_offset)
+        if end < 0:
+            raise SystemExit('PE parse failed: unterminated import DLL name')
         imports.append(data[name_offset:end].decode('ascii', 'replace').upper())
         descriptor += 20
     return imports
 
 
-# DllCharacteristics bits (PE optional header +70) and load-config GuardFlags
-# bits (offset 144 in IMAGE_LOAD_CONFIG_DIRECTORY64).
+# Optional-header DllCharacteristics bits (PE32+ optional header +70). The
+# 0x1000 bit here is APPCONTAINER, not CET - it is never CET evidence.
 DLLCHARACTERISTIC_MITIGATIONS = (
     ('dynamic_base', 0x0040),
     ('high_entropy_va', 0x0020),
     ('nx_compat', 0x0100),
     ('guard_cf', 0x4000),
-    ('cet_compat_dllchar', 0x1000),
 )
-GUARDFLAG_MITIGATIONS = (
-    ('cf_instrumented', 0x00000100),
-    ('cf_function_table_present', 0x00000400),
-    ('cet_compat_guard', 0x01000000),
-)
-# Newer MSVC linkers record CET in an extended-characteristics debug record
-# (IMAGE_DEBUG_TYPE_EX_DLLCHARACTERISTICS, type 20) instead of the classic
-# DllCharacteristics bit; any of the three spellings counts.
+# Load-config GuardFlags (IMAGE_LOAD_CONFIG_DIRECTORY64 +144) and the CFG
+# function-table fields those flags must agree with (+128/+136).
+GUARDFLAG_CF_INSTRUMENTED = 0x00000100
+GUARDFLAG_CF_FUNCTION_TABLE_PRESENT = 0x00000400
+LOAD_CONFIG_GUARD_FLAGS_OFFSET = 144
+LOAD_CONFIG_CF_TABLE_OFFSET = 128
+LOAD_CONFIG_CF_COUNT_OFFSET = 136
+LOAD_CONFIG_MIN_SIZE = 148  # through GuardFlags
+# CET shadow-stack compatibility is recorded ONLY in the extended DLL
+# characteristics debug record (IMAGE_DEBUG_TYPE_EX_DLLCHARACTERISTICS,
+# type 20, bit 0x0001). No record means no evidence; a truncated or
+# out-of-bounds record is a parse failure, never a guessed value.
 EX_DLLCHARACTERISTICS_DEBUG_TYPE = 20
-EX_DLLCHARACTERISTICS_CET_COMPAT = 0x00000001
+EX_DLLCHARACTERISTICS_CET_COMPAT = 0x0001
+DEBUG_DIRECTORY_ENTRY_SIZE = 28
 REQUIRED_MITIGATIONS = (
     'dynamic_base', 'high_entropy_va', 'nx_compat', 'guard_cf', 'cet_compat',
     'cf_instrumented', 'cf_function_table_present',
 )
 
 
+def pe_cet_compat(data: bytes, layout) -> bool:
+    """CET compatibility from the extended-characteristics debug record."""
+    debug_rva, debug_size = read_struct(
+        data, layout[2] + 6 * 8, '<II', 'debug directory')[0:2]
+    if not debug_rva:
+        return False
+    directory = rva_to_offset(data, layout, debug_rva, debug_size)
+    cet_compat = False
+    for index in range(debug_size // DEBUG_DIRECTORY_ENTRY_SIZE):
+        entry = directory + index * DEBUG_DIRECTORY_ENTRY_SIZE
+        record = read_struct(data, entry, '<28s', 'debug directory entry')[0]
+        if struct.unpack_from('<I', record, 12)[0] != EX_DLLCHARACTERISTICS_DEBUG_TYPE:
+            continue
+        payload_size = struct.unpack_from('<I', record, 16)[0]
+        pointer = struct.unpack_from('<I', record, 24)[0]
+        if payload_size < 4:
+            raise SystemExit(
+                'PE parse failed: extended-characteristics record is smaller '
+                'than its DWORD payload')
+        if not pointer:
+            raise SystemExit(
+                'PE parse failed: extended-characteristics record has no file pointer')
+        if pointer + payload_size > len(data):
+            raise SystemExit('PE parse failed: extended-characteristics record is truncated')
+        if struct.unpack_from('<I', data, pointer)[0] & EX_DLLCHARACTERISTICS_CET_COMPAT:
+            cet_compat = True
+    return cet_compat
+
+
 def pe_mitigations(data: bytes) -> dict:
-    """Derive the exploit-mitigation facts of a PE32+ image from its headers:
-    DllCharacteristics, the load-config GuardFlags (CFG instrumentation and
-    the FID table) and the extended-characteristics debug record (CET)."""
-    pe_offset = pe_header(data)
-    optional_header = pe_offset + 24
-    magic = struct.unpack_from('<H', data, optional_header)[0]
-    if magic not in (0x10b, 0x20b):
-        raise SystemExit('Unknown PE optional header magic')
-    dll_characteristics = struct.unpack_from('<H', data, optional_header + 70)[0]
+    """Derive the exploit-mitigation facts the image can actually prove:
+    DllCharacteristics, the load-config CFG block (flags agreeing with a
+    non-empty function table) and the extended-characteristics debug record
+    (CET). Object-level CFG coverage is proven by the build options, not by
+    these image flags; cet_compat=true only marks the image compatible, not
+    that hardware shadow stacks were enabled at run time."""
+    layout = pe_layout(data)
+    dll_characteristics = read_struct(
+        data, layout[1] + 70, '<H', 'DllCharacteristics')[0]
     mitigations = {name: bool(dll_characteristics & mask)
                    for name, mask in DLLCHARACTERISTIC_MITIGATIONS}
-    data_directories = optional_header + (112 if magic == 0x20b else 96)
-    load_config_rva = struct.unpack_from('<I', data, data_directories + 10 * 8)[0]
-    guard_flags = 0
-    if load_config_rva:
-        config = rva_to_offset(data, load_config_rva)
-        size = struct.unpack_from('<I', data, config)[0]
-        if size >= 148:  # GuardFlags sits at offset 144
-            guard_flags = struct.unpack_from('<I', data, config + 144)[0]
-    for name, mask in GUARDFLAG_MITIGATIONS:
-        mitigations[name] = bool(guard_flags & mask)
-    cet_record = False
-    debug_rva, debug_size = struct.unpack_from('<II', data, data_directories + 6 * 8)
-    for index in range(debug_size // 28) if debug_rva else ():
-        entry = rva_to_offset(data, debug_rva) + index * 28
-        dtype = struct.unpack_from('<I', data, entry + 12)[0]
-        dsize = struct.unpack_from('<I', data, entry + 16)[0]
-        pointer = struct.unpack_from('<I', data, entry + 24)[0]
-        if (dtype == EX_DLLCHARACTERISTICS_DEBUG_TYPE and dsize >= 4 and pointer
-                and struct.unpack_from('<I', data, pointer)[0]
-                & EX_DLLCHARACTERISTICS_CET_COMPAT):
-            cet_record = True
-    cet_dllchar = mitigations.pop('cet_compat_dllchar')
-    cet_guard = mitigations.pop('cet_compat_guard')
-    mitigations['cet_compat'] = cet_dllchar or cet_guard or cet_record
+    config_rva, _ = read_struct(
+        data, layout[2] + 10 * 8, '<II', 'load config directory')[0:2]
+    guard_flags = cf_table = cf_count = 0
+    if config_rva:
+        config = rva_to_offset(data, layout, config_rva, 4)
+        declared = read_struct(data, config, '<I', 'load config size')[0]
+        if declared >= LOAD_CONFIG_MIN_SIZE:
+            guard_flags = read_struct(
+                data, config + LOAD_CONFIG_GUARD_FLAGS_OFFSET, '<I', 'GuardFlags')[0]
+            cf_table, cf_count = read_struct(
+                data, config + LOAD_CONFIG_CF_TABLE_OFFSET, '<QQ',
+                'GuardCFFunctionTable/Count')
+    mitigations['cf_instrumented'] = bool(guard_flags & GUARDFLAG_CF_INSTRUMENTED)
+    mitigations['cf_function_table_present'] = bool(
+        (guard_flags & GUARDFLAG_CF_FUNCTION_TABLE_PRESENT) and cf_table and cf_count)
+    mitigations['cet_compat'] = pe_cet_compat(data, layout)
     return mitigations
 
 
@@ -485,9 +557,11 @@ def main() -> None:
         if name.startswith(('QT6', 'MSVCP140', 'VCRUNTIME140', 'CONCRT140', 'VCRUNTIME140_1')):
             raise SystemExit(f'Forbidden CRT/Qt import: {name}')
 
-    # Mitigation gate: CFG must be instrumented across every production
-    # object (FID table present), and ASLR/DEP/high-entropy/CET must be on.
-    # Derived from the PE bytes independently of what the manifest claims.
+    # Mitigation gate over the PE-provable facts: the image carries CFG
+    # instrumentation with a non-empty FID table, ASLR/DEP/high-entropy VA
+    # and the CET compatibility record. Object-level CFG coverage comes from
+    # the shared build options, not from these image flags. Everything is
+    # re-derived from the PE bytes independently of the manifest's claims.
     mitigations = pe_mitigations(exe_bytes)
     missing = [name for name in REQUIRED_MITIGATIONS if not mitigations.get(name)]
     if missing:
