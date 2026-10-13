@@ -64,28 +64,34 @@ PlainLineAction PlainLineEditor::handle(const Key &key)
     append(low(key.unicode) ? static_cast<wchar_t>(0xfffd) : key.unicode);
     return PlainLineAction::Changed;
 }
-std::optional<std::wstring> readPlainConsoleLine(PlainConsoleInput &input)
+std::optional<std::wstring> readPlainConsoleLine(PlainConsoleInput &input, detail::PlainReadObserver *observer)
 {
     InputModeScope modes(input);
     PlainLineEditor editor;
+    if (observer) observer->progressed(detail::PlainReadStage::Ready, 0);
     for (;;) {
         const auto event = input.next();
         if (event.kind == PlainInputEvent::Kind::Close) return {};
         const auto previous = editor.value();
         if (event.kind == PlainInputEvent::Kind::Cancel) {
-            editor.clear(); input.echo(previous, editor.value()); continue;
+            editor.clear(); input.echo(previous, editor.value());
+            if (observer) observer->progressed(detail::PlainReadStage::Cancelled, 0);
+            continue;
         }
         const auto action = editor.handle(event.key);
         if (action == PlainLineAction::EndOfInput) { input.newline(); return {}; }
         if (action == PlainLineAction::Submitted) {
             input.echo(previous, editor.value()); input.newline(); return editor.value();
         }
-        if (action == PlainLineAction::Changed || action == PlainLineAction::Cancelled)
+        if (action == PlainLineAction::Changed || action == PlainLineAction::Cancelled) {
             input.echo(previous, editor.value());
+            if (observer) observer->progressed(action == PlainLineAction::Cancelled
+                ? detail::PlainReadStage::Cancelled : detail::PlainReadStage::Changed, editor.value().size());
+        }
     }
 }
 namespace detail {
-std::optional<std::string> readRedirectedPlainLine(HANDLE handle, ConsoleControlScope &controls)
+std::optional<std::string> readRedirectedPlainLine(HANDLE handle, ConsoleControlScope &controls, PlainReadObserver *observer)
 {
     const DWORD type = GetFileType(handle);
     // Actual console input uses the event reader. Other character devices,
@@ -94,9 +100,14 @@ std::optional<std::string> readRedirectedPlainLine(HANDLE handle, ConsoleControl
     if (type != FILE_TYPE_PIPE && type != FILE_TYPE_DISK)
         throw Error("CONSOLE_INPUT_FAILED", "Redirected standard input must be a pipe or disk file.");
     std::string value;
+    if (observer) observer->progressed(PlainReadStage::Ready, 0);
     for (;;) {
         if (controls.takeClose()) return {};
-        if (controls.takeCancel()) { value.clear(); continue; }
+        if (controls.takeCancel()) {
+            value.clear();
+            if (observer) observer->progressed(PlainReadStage::Cancelled, 0);
+            continue;
+        }
         if (type == FILE_TYPE_PIPE) {
             DWORD available = 0;
             if (!PeekNamedPipe(handle, nullptr, 0, nullptr, &available, nullptr)) {
@@ -122,6 +133,7 @@ std::optional<std::string> readRedirectedPlainLine(HANDLE handle, ConsoleControl
         if (character == '\n') return value;
         if (value.size() >= 4096) throw Error("INPUT_INVALID", "Input exceeds its limit.");
         value.push_back(character);
+        if (observer) observer->progressed(PlainReadStage::Changed, value.size());
     }
 }
 } // namespace detail

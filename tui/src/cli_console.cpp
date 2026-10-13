@@ -89,16 +89,17 @@ private:
     WORD repeats_ = 0;
     Key repeated_;
 };
-std::optional<std::string> line(std::istream &input, std::ostream &output, ConsoleControlScope &controls, const std::string &prompt)
+std::optional<std::string> line(std::istream &input, std::ostream &output, ConsoleControlScope &controls,
+    const std::string &prompt, detail::PlainReadObserver *observer)
 {
     print(output, prompt);
     DWORD mode = 0;
     if (&input == &std::cin && GetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), &mode)) {
-        const auto value = readNativePlainConsoleLine(controls);
+        const auto value = readNativePlainConsoleLine(controls, observer);
         return value ? std::optional<std::string>(trimmed(wideToUtf8(*value))) : std::nullopt;
     }
     if (&input == &std::cin) {
-        const auto value = detail::readRedirectedPlainLine(GetStdHandle(STD_INPUT_HANDLE), controls);
+        const auto value = detail::readRedirectedPlainLine(GetStdHandle(STD_INPUT_HANDLE), controls, observer);
         return value ? std::optional<std::string>(trimmed(*value)) : std::nullopt;
     }
     std::string value; char ch = 0;
@@ -125,12 +126,12 @@ void wait(TuiController &controller, ConsoleControlScope &controls)
     }
 }
 }
-std::optional<std::wstring> readNativePlainConsoleLine(ConsoleControlScope &controls)
+std::optional<std::wstring> readNativePlainConsoleLine(ConsoleControlScope &controls, detail::PlainReadObserver *observer)
 {
     NativePlainInput input(controls);
-    return readPlainConsoleLine(input);
+    return readPlainConsoleLine(input, observer);
 }
-int runPlainConsoleSession(EngineSession &session, std::istream &input, std::ostream &output)
+int runPlainConsoleSession(EngineSession &session, std::istream &input, std::ostream &output, detail::PlainReadObserver *observer)
 {
     ConsoleControlScope controls;
     // This function may be given an externally owned session. Even on an
@@ -153,7 +154,7 @@ int runPlainConsoleSession(EngineSession &session, std::istream &input, std::ost
         const auto view = session.view();
         print(output, "Proxy: " + view.proxy.url + " | Process: " + view.process.state + " | Coverage: " + view.coverage.state);
         if (view.error) print(output, view.error->code + ": " + view.error->message);
-        const auto action = line(input, output, controls, "[L] Launch  [E] Edit proxy  [B] Backend authorization  [D] Repair launch  [R] Refresh  [Q] Quit");
+        const auto action = line(input, output, controls, "[L] Launch  [E] Edit proxy  [B] Backend authorization  [D] Repair launch  [R] Refresh  [Q] Quit", observer);
         // The native reader consumes cancellation internally. An empty result
         // is EOF or close, including when close also set the cancel signal.
         if (!action) return 0;
@@ -165,8 +166,8 @@ int runPlainConsoleSession(EngineSession &session, std::istream &input, std::ost
         const bool retryDraft = command == L'e' && state.modal() == Modal::ProxyEditor;
         if (!retryDraft) { state.clearModal(); controller.handleKey(shortcut(command)); }
         if (command == L'e' && state.modal() == Modal::ProxyEditor) {
-            const auto host = line(input, output, controls, "Loopback HTTP/Mixed host [" + wideToUtf8(state.editorHost()) + "] (Enter keeps draft):"); if (!host) return 0;
-            const auto port = line(input, output, controls, "Port [" + wideToUtf8(state.editorPort()) + "] (Enter keeps draft):"); if (!port) return 0;
+            const auto host = line(input, output, controls, "Loopback HTTP/Mixed host [" + wideToUtf8(state.editorHost()) + "] (Enter keeps draft):", observer); if (!host) return 0;
+            const auto port = line(input, output, controls, "Port [" + wideToUtf8(state.editorPort()) + "] (Enter keeps draft):", observer); if (!port) return 0;
             state.setEditorSeed(host->empty() ? state.editorHost() : utf8ToWide(*host), port->empty() ? state.editorPort() : utf8ToWide(*port));
             controller.handleKey(enter());
             if (!state.editorError().empty()) print(output, wideToUtf8(state.editorError()));
@@ -175,7 +176,7 @@ int runPlainConsoleSession(EngineSession &session, std::istream &input, std::ost
                 const auto &proposal = *state.consentProposal();
                 print(output, std::string(proposal.enabled ? "Authorize Guard proxy block for later Codex processes in: " : "Remove Guard's unchanged proxy block from: ") + wideToUtf8(proposal.home.wstring()));
             } else print(output, "Repair stops the shared Codex daemon once and may interrupt other clients' tasks on the same Home.");
-            const auto confirm = line(input, output, controls, "Type YES to confirm this single operation (anything else cancels):"); if (!confirm) return 0;
+            const auto confirm = line(input, output, controls, "Type YES to confirm this single operation (anything else cancels):", observer); if (!confirm) return 0;
             if (*confirm == "YES") {
                 for (const wchar_t ch : std::wstring_view(L"YES")) controller.handleKey(shortcut(ch));
                 controller.handleKey(enter());

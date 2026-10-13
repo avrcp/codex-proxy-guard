@@ -6,6 +6,15 @@
 
 namespace cpg { class ConsoleControlScope; }
 namespace cpg::tui {
+namespace detail {
+enum class PlainReadStage { Ready, Changed, Cancelled };
+// Optional internal observer of completed reader transitions. It does not
+// supply input or alter cancellation; the production entry leaves it null.
+struct PlainReadObserver {
+    virtual ~PlainReadObserver() = default;
+    virtual void progressed(PlainReadStage stage, std::size_t units) = 0;
+};
+}
 enum class PlainLineAction { None, Changed, Submitted, EndOfInput, Cancelled };
 // The bounded UTF-16 editor shared by the real console reader and tests.
 class PlainLineEditor {
@@ -33,9 +42,9 @@ struct PlainConsoleInput {
     virtual void echo(std::wstring_view previous, std::wstring_view current) = 0;
     virtual void newline() = 0;
 };
-std::optional<std::wstring> readPlainConsoleLine(PlainConsoleInput &input);
-std::optional<std::wstring> readNativePlainConsoleLine(ConsoleControlScope &controls);
+std::optional<std::wstring> readPlainConsoleLine(PlainConsoleInput &input, detail::PlainReadObserver *observer = nullptr);
+std::optional<std::wstring> readNativePlainConsoleLine(ConsoleControlScope &controls, detail::PlainReadObserver *observer = nullptr);
 namespace detail {
-std::optional<std::string> readRedirectedPlainLine(HANDLE input, ConsoleControlScope &controls);
+std::optional<std::string> readRedirectedPlainLine(HANDLE input, ConsoleControlScope &controls, PlainReadObserver *observer = nullptr);
 }
 } // namespace cpg::tui

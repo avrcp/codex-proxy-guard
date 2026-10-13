@@ -3,7 +3,9 @@
 #include <iosfwd>
 namespace cpg { class EngineSession; }
 namespace cpg::tui {
+namespace detail { struct PlainReadObserver; }
 int runPlainConsole(const std::filesystem::path &configPath);
 // The same production line loop with injected streams and engine services.
-int runPlainConsoleSession(EngineSession &session, std::istream &input, std::ostream &output);
+int runPlainConsoleSession(EngineSession &session, std::istream &input, std::ostream &output,
+    detail::PlainReadObserver *observer = nullptr);
 } // namespace cpg::tui

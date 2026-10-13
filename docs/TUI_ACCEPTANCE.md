@@ -21,6 +21,13 @@ parent sentinel remained unsignalled. The probe now compares kernel object
 identity, with a deliberate broad-inheritance positive control and an explicit
 different-object case. A real sentinel leak still fails unconditionally.
 
+The final gate also reproduced `TerminateProcess` returning access denied
+during child exit even though all held handles settled 6 ms later. Cleanup
+now uses final completion facts; transient termination/cancellation errors do
+not replace the original output-limit result. Actual wait failures and cleanup
+budget overruns remain failures, with stage, native error and elapsed-time
+diagnostics. Deterministic regressions cover both sides of this boundary.
+
 The rc.2 CLI empty-config statement covered the CLI path, not the default
 interactive classifier. The old component tests did not execute the failing
 first-B production handler. RC3 replaces the classifier and JSON UI boundary
@@ -40,7 +47,7 @@ canonical package reruns these suites from its fixed source archive.
 |---|---|---|---|
 | R01 E01–E04 | `app/main.cpp`, `backend/src/command_line.*`, `cli.*`, `cpg/port.h` | `app_command_line`: default resolver injection, Unicode/relative paths, production dispatch, invalid options/strict ports; `backend_engine_cli`: headless output and isolated EOF | PASS |
 | R02 A01–A04 | `session.*`, `tui_controller.*`, `tui_state.*` | Real-session first B/open/cancel/confirm; absent/null entry render; frozen/stale proposal; failed config read burns token; controller clears stale view | PASS |
-| R03 P01–P06 | `foundation/src/process.cpp` | Strict sentinel; concurrent endpoints; deterministic reader after child exit; partial/zero write; setup failures; drain descendant survives; final-write cancel race | PASS |
+| R03 P01–P06 | `foundation/src/process.cpp` | Strict identity sentinel; concurrent endpoints; delayed reader; partial/zero write; setup failures; drain descendant survives; final-write cancel race; transient cleanup API errors vs actual wait/budget failure | PASS |
 | R04 U01–U04 | `session.*`, `tui_controller.*`, `tui_state.*` | Host/Port Enter; failed draft retention; committed refresh failure; immediate busy; field-specific errors; operation ID | PASS |
 | R05 L01–L03 L05–L06 C01–C02 | `launch.*`, `session.*`, controller/result rendering | Normal launch has zero resolve/stop; prepare failure stops nothing; stopped daemon facts survive failure; reused/unknown; one refresh; late verified receipt retained | PASS |
 | R06 C03–C04 T01–T02 | `console_control.*`, terminal/input/plain/controller | Private-console Ctrl+C/Break; busy Q defaults to keep; EOF/invalid output/tiny viewport; real WM_CLOSE owner settle and terminal restore before acknowledgement; idle redirected pipe cancellation without EOF; unsupported character devices fail closed | PASS |
@@ -53,6 +60,10 @@ assertion. New synchronization and fault seams are compiled only into the
 foundation test target; production exposes no seam command or environment flag.
 The console control tests use dedicated hidden test consoles and fake work,
 not a live Desktop or shared daemon. Config/consent tests use disposable paths.
+Native and redirected-pipe cancellation tests synchronize with completed reader
+transitions (ready, character accepted, cancellation applied), rather than
+assuming progress after a fixed sleep. The observer is explicit internal
+dependency injection and is absent from normal production calls.
 
 ## RC3 real application and distribution scope
 

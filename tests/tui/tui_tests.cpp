@@ -1189,6 +1189,49 @@ TEST_CASE("RC3 redirected input rejects invalid and non-console character handle
     REQUIRE_FALSE(GetConsoleMode(nul.get(), &mode));
     rejected(nul.get());
 }
+namespace {
+struct PlainReadHandshake final : cpg::tui::detail::PlainReadObserver {
+    UniqueHandle ready{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
+    UniqueHandle partial{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
+    UniqueHandle cancelled{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
+    std::atomic_int phase{0};
+    std::atomic_bool valid{true};
+    PlainReadHandshake() {
+        if (!ready || !partial || !cancelled) throw Error("TEST_FAILED", "Cannot create reader handshake events.");
+    }
+    void progressed(cpg::tui::detail::PlainReadStage stage, std::size_t units) override {
+        using Stage = cpg::tui::detail::PlainReadStage;
+        if (stage == Stage::Ready) {
+            if (phase != 0 || units != 0) valid = false;
+            phase = 1; SetEvent(ready.get());
+        } else if (stage == Stage::Cancelled) {
+            if (phase != 2 || units != 0) valid = false;
+            phase = 3; SetEvent(cancelled.get());
+        } else if (phase == 1 && units == 1) {
+            phase = 2; SetEvent(partial.get());
+        } else if (phase == 3 && units == 1) {
+            phase = 4; // the post-cancel q was actually consumed
+        } else valid = false;
+    }
+    bool completed() const { return valid && phase == 4; }
+};
+template<class Write>
+void drivePlainCancellation(PlainReadHandshake &read, Write write)
+{
+    // All transitions are acknowledged by the production reader, not elapsed
+    // time or asynchronous GenerateConsoleCtrlEvent submission alone.
+    const auto reached = [&](HANDLE event) {
+        return WaitForSingleObject(event, 2000) == WAIT_OBJECT_0 && read.valid;
+    };
+    if (reached(read.ready.get()) && write("e") && reached(read.partial.get())
+        && GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0) && reached(read.cancelled.get())
+        && write("q\n")) return;
+    read.valid = false;
+    // Unblock the owned child's reader on a failed handshake. The parent still
+    // rejects its missing success receipt/nonzero exit; no retry is performed.
+    PostMessageW(GetConsoleWindow(), WM_CLOSE, 0, 0);
+}
+}
 int main(int argc, char **argv)
 {
     if (argc == 3 && std::string(argv[1]) == "--vt-scope-close-test") {
@@ -1235,21 +1278,19 @@ int main(int argc, char **argv)
             cpgtest::TemporaryDirectory root; Config config; config.home = root.path;
             const auto path = root.file(L"guard.toml"); initializeConfig(path, config, false);
             EngineSession session(path, absentDesktop, normalUser);
-            std::atomic_bool returned{false}, signaled{true};
+            PlainReadHandshake handshake;
             std::thread writer([&] {
-                Sleep(200); DWORD written = 0;
-                if (!WriteFile(pipeWrite.get(), "e", 1, &written, nullptr) || written != 1) signaled = false;
-                Sleep(100);
-                if (!GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0)) signaled = false;
-                Sleep(100);
-                if (returned) signaled = false; // idle cancellation must keep the input loop alive
-                if (!WriteFile(pipeWrite.get(), "q\n", 2, &written, nullptr) || written != 2) signaled = false;
+                drivePlainCancellation(handshake, [&](std::string_view text) {
+                    DWORD written = 0;
+                    return WriteFile(pipeWrite.get(), text.data(), static_cast<DWORD>(text.size()), &written, nullptr)
+                        && written == text.size();
+                });
             });
             int result = 45;
-            try { result = runPlainConsoleSession(session, std::cin, std::cout); returned = true; }
-            catch (...) { returned = true; writer.join(); return 46; }
+            try { result = runPlainConsoleSession(session, std::cin, std::cout, &handshake); }
+            catch (...) { writer.join(); return 46; }
             writer.join();
-            if (result != 0 || !signaled || session.busy() || Config::load(path).manageBackend) return 47;
+            if (result != 0 || !handshake.completed() || session.busy() || Config::load(path).manageBackend) return 47;
             return SetEvent(completed) ? 0 : 48;
         } catch (...) { return 49; }
     }
@@ -1277,27 +1318,28 @@ int main(int argc, char **argv)
             const auto path = root.file(L"guard.toml"); initializeConfig(path, config, false);
             EngineSession session(path, absentDesktop, normalUser);
             DWORD originalMode = 0; if (!GetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), &originalMode)) return 11;
-            std::atomic_bool signaled{true};
+            PlainReadHandshake read;
             std::thread writer([&] {
-                Sleep(200);
-                const auto send = [&](wchar_t ch, WORD vk) {
-                    INPUT_RECORD record{}; record.EventType = KEY_EVENT;
-                    record.Event.KeyEvent.bKeyDown = TRUE; record.Event.KeyEvent.wRepeatCount = 1;
-                    record.Event.KeyEvent.uChar.UnicodeChar = ch; record.Event.KeyEvent.wVirtualKeyCode = vk;
-                    DWORD count = 0;
-                    if (!WriteConsoleInputW(GetStdHandle(STD_INPUT_HANDLE), &record, 1, &count) || count != 1) signaled = false;
-                };
-                send(L'e', 'E'); Sleep(100);
-                if (!GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0)) signaled = false;
-                Sleep(100); send(L'q', 'Q'); send(L'\r', VK_RETURN);
+                drivePlainCancellation(read, [&](std::string_view text) {
+                    for (const char ch : text) {
+                        INPUT_RECORD record{}; record.EventType = KEY_EVENT;
+                        record.Event.KeyEvent.bKeyDown = TRUE; record.Event.KeyEvent.wRepeatCount = 1;
+                        record.Event.KeyEvent.uChar.UnicodeChar = ch == '\n' ? L'\r' : static_cast<wchar_t>(ch);
+                        record.Event.KeyEvent.wVirtualKeyCode = ch == '\n' ? static_cast<WORD>(VK_RETURN)
+                            : static_cast<WORD>(std::towupper(ch));
+                        DWORD count = 0;
+                        if (!WriteConsoleInputW(GetStdHandle(STD_INPUT_HANDLE), &record, 1, &count) || count != 1) return false;
+                    }
+                    return true;
+                });
             });
             int result = 12;
-            try { result = runPlainConsoleSession(session, std::cin, std::cout); }
+            try { result = runPlainConsoleSession(session, std::cin, std::cout, &read); }
             catch (...) { writer.join(); return 13; }
             writer.join();
             DWORD restored = 0;
             if (!GetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), &restored) || restored != originalMode) return 14;
-            return result == 0 && signaled && !session.busy() && !Config::load(path).manageBackend ? 0 : 15;
+            return result == 0 && read.completed() && !session.busy() && !Config::load(path).manageBackend ? 0 : 15;
         } catch (...) { return 16; }
     }
     return cpgtest::runDoctestMain(argc, argv);
