@@ -27,18 +27,19 @@ stale or unhealthy index.
   owned helpers and native application-model activation/identity observation.
 - `backend/src/launch.*`: proxy plans/environment, startup locking, public daemon
   compatibility and shared launch orchestration.
-- `backend/src/session.*`: the transport-free engine session (snapshot view
-  model, single-use confirmation tokens, one-foreground-effect gate that
+- `backend/src/session.*`: the transport-free engine session (typed
+  SessionView, single-use confirmation tokens, one-foreground-effect gate that
   stays busy until a timed-out effect's future is reaped; injectable
   `SessionBudgets`).
 - `backend/src/cli.*`: minimal CLI and the `licenses` notice streamer.
 - `tui/`: Win32 VT TUI (terminal session, input, screen renderer, display
   width, modal state machine, plain-console fallback). The TUI never
-  recomputes engine business rules; it renders the session snapshot.
-- `app/`: the single production entry point. `startup_mode.*` classifies the
-  Unicode command line; `main.cpp` runs the interactive TUI (in-process
-  engine session) or the headless CLI. The activation worker is the same
-  EXE's hidden subcommand — the only self-spawned child.
+  recomputes engine business rules; it renders the typed session view.
+- `app/`: the single production entry point. `main.cpp` receives Unicode
+  `wmain` argv; `backend/src/command_line.*` parses once and resolves each
+  operation's absolute configuration path before TUI/CLI dispatch. The
+  activation worker is the same EXE's hidden subcommand — the only
+  self-spawned child.
 
 All production code is C++20; no Qt, no Rust/FFI, no PowerShell in the
 product. Every production and test object compiles with the shared

@@ -1,18 +1,20 @@
 # Release checklist (no-Qt single EXE)
 
-Every item is a gate; a release ships only when all are checked.
+Public signed distribution requires every applicable gate. Source integration
+and unsigned development packaging may proceed with real-machine/AV items
+explicitly recorded as NOT RUN; they must not be presented as release guarantees.
 
 ## Build and tests
 
 - [ ] Run `.\scripts\test-noqt.ps1` (dev build, all doctest suites:
-      foundation, app startup classification, TUI, engine core/platform/
-      launch/CLI, verifier fixtures).
+      foundation, app command parsing/control, TUI, engine core/platform/
+      launch/CLI/session, verifier fixtures and release input guards).
 - [ ] Confirm `git diff --check` is clean and the tree is clean.
 - [ ] Run canonical `.\scripts\build-portable.cmd -Sign -CertificateSha1 <thumbprint>`
       from the clean pushed commit (refuses a dirty tree). Development
       builds may pass `-AllowUnsignedDev` and are marked unsigned everywhere.
-- [ ] Check release tests, embedded provenance (both `build-info` spellings),
-      plain-console smoke, full `licenses` output, and the import scan
+- [ ] Check release tests, embedded provenance (`build-info`),
+      plain-console smoke with an isolated temporary config, full `licenses` output, and the import scan
       (no Qt6*/msvcp140*/vcruntime140*/concrt140*/unexpected third-party DLL;
       console subsystem; static CRT).
 
@@ -27,7 +29,8 @@ Every item is a gate; a release ships only when all are checked.
       `manifest.source_zip.sha256` and SHA256SUMS.txt, contains no build
       products (`*.obj`/`*.exe`/`*.dll`/`*.pdb`/`*.lib`/`*.ilk`/`*.zip`/
       `*.7z`/`*.pfx`/`*.key`) and no `target/`, `dist/` or `.git/` members,
-      and that the size report is present.
+      and that the size report is present. Confirm archive members match the
+      fixed commit, including tracked dotfiles, and build inputs came from that archive.
 - [ ] Confirm the release directory holds exactly the manifest's artifact
       set (eight files including both sidecars); no stale extras.
 - [ ] Confirm the PE mitigation gate: CFG instrumented with the FID table

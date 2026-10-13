@@ -19,10 +19,10 @@ CodexProxyGuard.exe                       interactive TUI (same process)
        internal-activate-package          short-lived activation worker
 ```
 
-The TUI talks to the engine **in-process**: `app/main.cpp` classifies the
-Unicode command line (`app/startup_mode.cpp`, pure function, unit-tested),
-then either starts the interactive frontend or runs the headless CLI
-(`backend/src/cli.cpp`). There is no GUI→bridge self-child anymore; the only
+The TUI talks to the engine **in-process**: `app/main.cpp` receives Unicode
+`wmain` arguments, and `backend/src/command_line.*` parses them exactly once.
+The dispatcher resolves the default or explicit configuration path once to
+an absolute path; information commands and workers never load configuration. There is no GUI→bridge self-child anymore; the only
 child process Guard ever spawns is its own short-lived activation worker
 (`CREATE_NO_WINDOW`, redirected stdio) and, on the explicitly confirmed
 repair path, the official Codex CLI running the public
@@ -60,19 +60,32 @@ The engine layering is strict:
 - `backend/src/session.*`: the transport-free engine session — candidate
   validation, single-use confirmation tokens, the one-foreground-effect
   gate, TaskResult application. It is the single state machine behind every
-  interactive frontend; its JSON snapshot is the frontend view model.
+  interactive frontend; its typed `SessionView` is the frontend view. JSON remains an external
+  adapter for CLI and worker protocols.
 - `backend/src/cli.*`: the headless CLI and the `licenses` notice streamer
   (embedded RCDATA resources, no GUI, no configuration, no network).
 - `tui/src`: the Win32 VT TUI — `TerminalSession` (RAII console modes, VT
-  enable, alternate screen, title/cursor restoration), `ReadConsoleInputW`
+  enable, alternate screen, acquired cursor/mode restoration), `ReadConsoleInputW`
   normalization, an off-screen `Screen` cell model with a single-write VT
   renderer, Unicode display width (surrogate pairs, combining marks,
   fullwidth forms), the `TuiState` modal machine (proxy editor, YES-typed
   consent/repair confirmations, error modal with suggested follow-ups and a
   redacted clipboard diagnostic, help, too-small notice) and the plain
   line console fallback (`cli_console.cpp`).
-- `app/`: the single production entry, role classification, the embedded
+- `app/`: the single Unicode production entry and the embedded
   notice and VERSIONINFO resources.
+
+The thin `TuiController` is shared by production VT, plain mode and tests.
+It applies busy state immediately between keys, binds saves to operation IDs,
+and preserves diagnostics and receipts when a read or clipboard operation fails.
+Console signals are handled through the shared `ConsoleControlScope`; the
+owner cancels and settles its operation, then restores the terminal before
+acknowledging close. The handler waits at most 3500 ms for that acknowledgement;
+Windows still imposes the final shutdown deadline. Plain input waits on both
+console records and control events. Redirected pipes remain cancellable while
+their writers are idle; redirected disk files are supported. Non-console
+character devices (including NUL) are refused instead of risking a blocking
+device read.
 
 The engine never links the TUI; the entry point injects the interactive
 frontend through a function pointer, keeping `guard_engine` free of any
@@ -85,12 +98,15 @@ frontend dependency.
 one foreground effect; busy state gates every destructive key except
 Ctrl+C and the busy-quit prompt. When an operation exceeds its
 `SessionBudgets` budget the session cancels it but stays busy — refusing new
-operations — until the effect's future is reaped; only then does it surface
-`SESSION_TIMEOUT` (or the effect's own `APPX_ACTIVATION_OUTCOME_UNKNOWN` /
-`CODEX_DAEMON_STOP_*` outcome when that is more precise). Nothing is ever
-detached or dropped. Completion invalidates stale launch observations;
-refresh issues new confirmations. Consent proposals bind a
-CSPRNG single-use token to the current config and the exact Home. Mutation
+operations — until the effect's future is reaped. A budget overrun is retained
+alongside a known receipt or committed configuration, never substituted for
+those facts. Mutation and refresh errors are separate: a successful commit
+followed by a read failure is not retried as a write. Launch results retain
+PID, instance, activation, backend block and daemon facts; the controller
+schedules at most one read-only refresh after settlement and keeps the receipt.
+Nothing is detached or dropped. Consent proposals bind a
+CSPRNG single-use token, target enable value and revision to the current
+config and the exact Home. The dialog retains and submits the same proposal. Mutation
 transactions compare expected config under a held Windows handle. A launch
 holds an incompatible read lease throughout, preventing stale launches from
 recreating an env block after revocation.
@@ -132,6 +148,10 @@ PowerShell baseline fixture.
 packaged EXE's build-info, scans imports, (optionally) signs and verifies,
 and re-verifies every artifact through `scripts/verify-package.py --schema
 static-single` before promotion to `dist/releases/<version>-<commit>`.
+The canonical build holds an exclusive release lock, captures source with
+`git archive` at the fixed commit (including tracked hidden files), and builds
+that snapshot in unique directories under `target`. Plain smoke uses a fresh
+temporary configuration. Signing tools are required only for signed builds.
 Release directories are immutable — the build refuses to overwrite an
 existing version/commit — and the verifier additionally binds the source
 ZIP digest across the sidecar/manifest/SHA256SUMS, rejects build products
@@ -152,3 +172,14 @@ filesystems/runtime configurations fail closed; there is no nontransactional
 fallback and no change to system policy. If TxF is removed or disabled,
 backend block management must be redesigned or refused; ordinary launches
 without that optional block remain available.
+
+## Native build dependencies
+
+The Ninja build probes `/showIncludes` without code page conversion, preserving
+the compiler's actual dependency-prefix bytes. This avoids stale objects when
+MSVC diagnostics use a different encoding from CMake's AUTO decoding. The
+probe is project-local and does not modify the installed toolchain.
+Release path checks reject outside-target intermediates and junction ancestors
+before creation and promotion. They guard misconfiguration; the release script
+is not a security boundary against a malicious actor with the same filesystem
+permissions replacing directories between a path check and a filesystem call.

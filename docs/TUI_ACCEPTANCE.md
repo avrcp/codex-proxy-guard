@@ -1,8 +1,71 @@
-# TUI acceptance — 0.7.0-rc.2 (no-Qt)
+# TUI acceptance — 0.7.0-rc.3 (no Qt)
 
-Execution date: 2026-10-11 (rc.1 evidence) and 2026-10-12 (rc.2 hardening
-evidence) (Asia/Shanghai). Platform: Windows 11 x64, MSVC x64, static CRT
-release profile.
+Execution dates: 2026-10-13 (rc.3), 2026-10-12 (historical rc.2) and
+2026-10-11 (historical rc.1), Asia/Shanghai. Platform: Windows 11 x64,
+MSVC x64, static CRT release profile.
+
+## RC3 correction to the inherited evidence
+
+The rc.2 statement that this host strips the CreateProcess handle list was
+incorrect. The code constructed the list but never assigned
+`STARTUPINFOEXW::lpAttributeList`. Its inheritable sentinel test then returned
+without failing on a leak. The historical claim below is retained for audit,
+but it is **withdrawn as evidence of restricted inheritance**. RC3 assigns the
+attribute list, removes the waiver, and tests that the sentinel cannot be used.
+Both that test and deterministic post-child-exit reader verdict tests failed
+on the old implementation before repair. No host skip is counted as PASS.
+
+The rc.2 CLI empty-config statement covered the CLI path, not the default
+interactive classifier. The old component tests did not execute the failing
+first-B production handler. RC3 replaces the classifier and JSON UI boundary
+and tests the production controller with a real session and injected services.
+
+RC3 plans and source scope are in [RC3 remediation](RC3_REMEDIATION.md).
+
+## RC3 automated acceptance
+
+Execution: 2026-10-13, Windows x64, MSVC 19.51.36257, CMake 4.3.1,
+static CRT, `/W4 /WX /sdl /guard:cf`. The fresh integrated development build
+passed all 10 registered suites with zero skipped doctest cases. Follow-up
+review fixes are included in the final clean-commit verification and the
+canonical package reruns these suites from its fixed source archive.
+
+| Requirement | Implementation | Regression evidence | Result |
+|---|---|---|---|
+| R01 E01–E04 | `app/main.cpp`, `backend/src/command_line.*`, `cli.*`, `cpg/port.h` | `app_command_line`: default resolver injection, Unicode/relative paths, production dispatch, invalid options/strict ports; `backend_engine_cli`: headless output and isolated EOF | PASS |
+| R02 A01–A04 | `session.*`, `tui_controller.*`, `tui_state.*` | Real-session first B/open/cancel/confirm; absent/null entry render; frozen/stale proposal; failed config read burns token; controller clears stale view | PASS |
+| R03 P01–P06 | `foundation/src/process.cpp` | Strict sentinel; concurrent endpoints; deterministic reader after child exit; partial/zero write; setup failures; drain descendant survives; final-write cancel race | PASS |
+| R04 U01–U04 | `session.*`, `tui_controller.*`, `tui_state.*` | Host/Port Enter; failed draft retention; committed refresh failure; immediate busy; field-specific errors; operation ID | PASS |
+| R05 L01–L03 L05–L06 C01–C02 | `launch.*`, `session.*`, controller/result rendering | Normal launch has zero resolve/stop; prepare failure stops nothing; stopped daemon facts survive failure; reused/unknown; one refresh; late verified receipt retained | PASS |
+| R06 C03–C04 T01–T02 | `console_control.*`, terminal/input/plain/controller | Private-console Ctrl+C/Break; busy Q defaults to keep; EOF/invalid output/tiny viewport; real WM_CLOSE owner settle and terminal restore before acknowledgement; idle redirected pipe cancellation without EOF; unsupported character devices fail closed | PASS |
+| R07 U05–U07 | `tui_state.*`, `tui_controller.*` | Long Unicode scope scroll, border/input clipping, caret; paired code/message diagnostics; clipboard failure preserves original PID/daemon facts | PASS |
+| R08 D01–D02 L04 | `package_discovery.*`, `platform.cpp`, `launch.cpp` | Secondary optional null; required FullTrust; retries/count/bytes/deadline/cancel; image/elevation failure; conservative instance timestamp | PASS |
+| R09 B01–B05 | `build-portable.ps1`, `test-noqt.ps1`, `test_release_inputs.py` | Outside-root/version/lock/junction guards; fixed git archive, unique build/size/staging; temporary plain config; unsigned path; final package verifier | Source guards PASS; artifact verification recorded in release manifest/final delivery |
+
+The earlier “host strips HANDLE_LIST” explanation is not used by any current
+assertion. New synchronization and fault seams are compiled only into the
+foundation test target; production exposes no seam command or environment flag.
+The console control tests use dedicated hidden test consoles and fake work,
+not a live Desktop or shared daemon. Config/consent tests use disposable paths.
+
+## RC3 real application and distribution scope
+
+| Scenario | Status |
+|---|---|
+| Default resolution and actual production controller B/save/launch/cancel using isolated services | PASS |
+| Headless production EXE Unicode path, JSON errors, plain EOF | PASS |
+| Explorer double click of the final EXE | NOT RUN |
+| Human attended Windows Terminal / conhost resize and clipboard paste | NOT RUN |
+| Live Desktop normal launch and actual created/reused receipt | NOT RUN |
+| Real Codex Home authorize/revoke/port changes | NOT RUN |
+| Live shared-daemon repair and interruption of other clients | NOT RUN |
+| Windows 10, DPI/multi-monitor, Defender/SmartScreen/third-party AV distribution | NOT RUN |
+| Authenticode signing / public release | NOT RUN; unsigned development package only |
+
+No real-application or distribution guarantee is inferred from the isolated
+regressions. Guard never terminates the activated Desktop, and cancellation
+with unknown submission outcome never triggers an automatic retry.
+
 
 ## 0.7.0-rc.2 hardening evidence (executed 2026-10-12)
 

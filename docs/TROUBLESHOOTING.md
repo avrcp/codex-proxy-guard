@@ -51,8 +51,8 @@ is given), Guard falls back to the line console; `console --plain` forces it
 fails, one redacted `TUI_FAILED: ...` line is printed on stderr and the
 process exits 1 — no crash file is written anywhere.
 
-A foreground operation that exceeds its budget reports `SESSION_TIMEOUT`
-after its cancellation completed; the UI shows "Cancelling timed-out
+A foreground operation that exceeds its budget retains that observation
+alongside any committed configuration or verified receipt; the UI shows "Cancelling timed-out
 operation" while the old task is being reaped and refuses new operations in
 that window. Refresh after a timeout instead of resubmitting.
 
