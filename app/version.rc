@@ -6,7 +6,7 @@
 #define CPG_STRINGIZE2(x) CPG_STRINGIZE(x)
 
 #ifndef CPG_PRODUCT_VERSION
-#define CPG_PRODUCT_VERSION "0.7.0-rc.1"
+#define CPG_PRODUCT_VERSION "0.7.0-rc.3"
 #endif
 #ifndef CPG_BUILD_COMMIT
 #define CPG_BUILD_COMMIT "unknown"

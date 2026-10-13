@@ -209,6 +209,8 @@ def check_source_zip(archive: pathlib.Path, manifest: dict, recorded: dict) -> N
     if recorded.get(archive.name) != digest:
         raise SystemExit('SHA256SUMS.txt source ZIP digest mismatch')
     with zipfile.ZipFile(archive) as bundle:
+        if bundle.comment != manifest['commit'].encode('ascii'):
+            raise SystemExit('Source ZIP Git commit does not match the manifest')
         if bundle.testzip() is not None:
             raise SystemExit('Source ZIP CRC failed')
         for entry in bundle.infolist():
@@ -299,6 +301,8 @@ def main() -> None:
             raise SystemExit(f'release-manifest.json missing key: {key}')
     if manifest.get('schema') != 'static-single' or manifest.get('schema_version') != 1:
         raise SystemExit('Unexpected manifest schema')
+    if manifest.get('dirty') is not False:
+        raise SystemExit('Release provenance must describe a clean commit')
     if manifest.get('qt'):
         raise SystemExit('Manifest claims Qt linkage in a no-Qt release')
     if manifest.get('powershell_appx_discovery'):
@@ -353,6 +357,8 @@ def main() -> None:
             raise SystemExit('Packaged build-info commit mismatch')
         if info.get('language') != 'C++20':
             raise SystemExit('Packaged build-info language mismatch')
+        if info.get('dirty') is not False:
+            raise SystemExit('Packaged build-info is not a clean commit')
         licenses = run(executable, 'licenses')
         if '===== LICENSE =====' not in licenses or '===== json/LICENSE.MIT =====' not in licenses:
             raise SystemExit('Embedded license stream incomplete')

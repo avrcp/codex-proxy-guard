@@ -17,7 +17,7 @@ in the user or machine store; without -Sign the release must explicitly pass
 -AllowUnsignedDev and is marked UNSIGNED DEVELOPMENT BUILD everywhere.
 #>
 param(
-    [string] $Version = '0.7.0-rc.2',
+    [string] $Version = '0.7.0-rc.3',
     [switch] $Sign,
     [string] $CertificateSha1,
     [string] $TimestampUrl = 'http://timestamp.digicert.com',
@@ -28,7 +28,41 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 $Root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
-$Build = if ([IO.Path]::IsPathRooted($BuildDirectory)) { $BuildDirectory } else { Join-Path $Root $BuildDirectory }
+$TargetRoot = [IO.Path]::GetFullPath((Join-Path $Root 'target'))
+$BuildBase = [IO.Path]::GetFullPath($(if ([IO.Path]::IsPathRooted($BuildDirectory)) { $BuildDirectory } else { Join-Path $Root $BuildDirectory }))
+function Assert-TargetPath([string] $Path) {
+    $Full = [IO.Path]::GetFullPath($Path)
+    if (-not $Full.StartsWith($TargetRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Release intermediates must be strictly inside target: $Full"
+    }
+    $Ancestor = $Full
+    while ($Ancestor -and $Ancestor -ne $Root) {
+        if ((Test-Path -LiteralPath $Ancestor) -and ((Get-Item -LiteralPath $Ancestor -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw "Release intermediates cannot traverse reparse points: $Ancestor"
+        }
+        $Ancestor = Split-Path $Ancestor -Parent
+    }
+}
+function Assert-ReleasePath([string] $Path) {
+    $Full = [IO.Path]::GetFullPath($Path)
+    $ReleaseRoot = [IO.Path]::GetFullPath((Join-Path $Root 'dist\releases'))
+    if (-not $Full.StartsWith($ReleaseRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Release destination must stay inside dist/releases: $Full"
+    }
+    $Ancestor = $Full
+    while ($Ancestor -and $Ancestor -ne $Root) {
+        if ((Test-Path -LiteralPath $Ancestor) -and ((Get-Item -LiteralPath $Ancestor -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw "Release destination cannot traverse reparse points: $Ancestor"
+        }
+        $Ancestor = Split-Path $Ancestor -Parent
+    }
+}
+Assert-TargetPath $BuildBase
+if ($Version -notmatch '^\d+\.\d+\.\d+(?:-[A-Za-z0-9.]+)?$') { throw 'Invalid release version.' }
+$RunDirectory = Join-Path $BuildBase ([Guid]::NewGuid().ToString('N'))
+Assert-TargetPath $RunDirectory
+$Build = Join-Path $RunDirectory 'build'
+$SourceRoot = Join-Path $RunDirectory 'source'
 $TransportZipName = "CodexProxyGuard-$Version-windows-x86_64.zip"
 $SourceZipName = "CodexProxyGuard-$Version-source.zip"
 
@@ -53,14 +87,21 @@ function Write-Utf8([string] $Path, [string] $Text) {
     [IO.File]::WriteAllText($Path, $Text + [Environment]::NewLine, (New-Object Text.UTF8Encoding($false)))
 }
 
+# Serialize source capture, tests, signing and promotion across release runs.
+New-Item -ItemType Directory -Path $TargetRoot -Force | Out-Null
+$ReleaseLock = [IO.File]::Open((Join-Path $TargetRoot 'release.lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+try {
 # --- 1. Clean tree + immutable release destination ----------------------------
 $Dirty = @(& git -C $Root status --porcelain=v1 --untracked-files=all).Count
+if ($LASTEXITCODE -ne 0) { throw 'git status failed.' }
 if ($Dirty -ne 0) { throw 'The release build requires a clean working tree.' }
 $Commit = (& git -C $Root rev-parse HEAD | Out-String).Trim()
+if ($LASTEXITCODE -ne 0 -or $Commit -notmatch '^[0-9a-f]{40}$') { throw 'git rev-parse failed.' }
 # Release directories are immutable: a verified, possibly already distributed
 # build of this version/commit must never be silently overwritten. Checked
 # before anything expensive runs.
 $ReleaseDirectory = Join-Path $Root "dist\releases\$Version-$($Commit.Substring(0, 8))"
+Assert-ReleasePath $ReleaseDirectory
 if (Test-Path -LiteralPath $ReleaseDirectory) {
     throw "Release destination already exists; versions/commits are immutable: $ReleaseDirectory"
 }
@@ -79,17 +120,26 @@ $CMake = Join-Path $Vs 'Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\c
 $CTest = Join-Path (Split-Path $CMake) 'ctest.exe'
 $DumpBin = Join-Path $Vs 'VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe'
 $DumpBin = (Get-Item $DumpBin | Select-Object -First 1).FullName
-$SignTool = Join-Path $Vs 'Common7\IDE\CommonExtensions\Microsoft\TeamFoundation\Team Explorer\NativeBinaries\signtool.exe'
-if (-not (Test-Path $SignTool)) {
-    $SignTool = (Get-Command signtool.exe -ErrorAction SilentlyContinue).Source
+$SignTool = $null
+if ($Sign) {
+    $SignTool = Join-Path $Vs 'Common7\IDE\CommonExtensions\Microsoft\TeamFoundation\Team Explorer\NativeBinaries\signtool.exe'
+    if (-not (Test-Path -LiteralPath $SignTool)) {
+        $Command = Get-Command signtool.exe -ErrorAction SilentlyContinue
+        if ($Command) { $SignTool = $Command.Source } else { $SignTool = $null }
+    }
+    if (-not $SignTool) { throw 'signtool.exe is required for signing but was not found.' }
 }
-if ($Sign -and -not $SignTool) { throw 'signtool.exe is required for signing but was not found.' }
 
-if (Test-Path $Build) { Remove-Item -Recurse -Force $Build }
-Invoke-Checked $CMake @('-S', $Root, '-B', $Build, '-G', 'Ninja',
+# Build only the fixed Git object's source. Never copy mutable workspace files.
+New-Item -ItemType Directory -Path $RunDirectory | Out-Null
+$CapturedSourceZip = Join-Path $RunDirectory $SourceZipName
+Invoke-Checked 'git' @('-C', $Root, 'archive', '--format=zip', "--output=$CapturedSourceZip", $Commit)
+Expand-Archive -LiteralPath $CapturedSourceZip -DestinationPath $SourceRoot
+$Env:VSLANG = '1033'
+Invoke-Checked $CMake @('-S', $SourceRoot, '-B', $Build, '-G', 'Ninja',
     "-DCMAKE_MAKE_PROGRAM=$((Get-Command ninja.exe).Source)",
     '-DCMAKE_BUILD_TYPE=Release', '-DBUILD_TESTING=ON',
-    "-DCPG_BUILD_COMMIT=$Commit", '-DCPG_BUILD_DIRTY=false')
+    "-DCPG_BUILD_COMMIT=$Commit", "-DCPG_PRODUCT_VERSION=$Version", '-DCPG_BUILD_DIRTY=false')
 Invoke-Checked $CMake @('--build', $Build, '--parallel')
 $Exe = Join-Path $Build 'app\CodexProxyGuard.exe'
 if (-not (Test-Path $Exe)) { throw 'Build did not produce app\CodexProxyGuard.exe.' }
@@ -98,16 +148,19 @@ if (-not (Test-Path $Exe)) { throw 'Build did not produce app\CodexProxyGuard.ex
 Invoke-Checked $CTest @('--test-dir', $Build, '--output-on-failure', '--no-tests=error')
 
 # --- 5. Smoke: provenance, licenses, plain console ----------------------------
-$Info = (& $Exe 'build-info' | ConvertFrom-Json)
-if ($Info.version -ne $Version -or $Info.commit -ne $Commit -or $Info.language -ne 'C++20') {
+$InfoText = & $Exe 'build-info'
+if ($LASTEXITCODE -ne 0) { throw 'build-info smoke failed.' }
+$Info = $InfoText | ConvertFrom-Json
+if ($Info.version -ne $Version -or $Info.commit -ne $Commit -or $Info.language -ne 'C++20' -or $Info.dirty -ne $false) {
     throw 'Packaged build-info provenance mismatch.'
 }
 $Licenses = (& $Exe 'licenses') -join "`n"
+if ($LASTEXITCODE -ne 0) { throw 'licenses smoke failed.' }
 foreach ($Marker in '===== LICENSE =====', '===== json/LICENSE.MIT =====', '===== toml++/LICENSE =====') {
     if ($Licenses -notlike "*$Marker*") { throw "Embedded license stream missing $Marker." }
 }
-'SmokeConfigProbe' | Out-Null
-$PlainProbe = 'q' | & $Exe 'console' '--plain'
+$SmokeConfig = Join-Path $RunDirectory 'smoke-config.toml'
+$PlainProbe = 'q' | & $Exe 'console' '--plain' '--config' $SmokeConfig
 if ($LASTEXITCODE -ne 0) { throw 'Plain-console smoke failed.' }
 
 # --- 6. Import scan -----------------------------------------------------------
@@ -141,6 +194,8 @@ if ($Sign) {
 # atomic Move-Item instead of file-by-file copies.
 $Staging = Join-Path $Root ("target\release-staging\$Version-$($Commit.Substring(0, 8))-$PID-" +`
     [Guid]::NewGuid().ToString('N').Substring(0, 8))
+Assert-TargetPath $Staging
+Assert-ReleasePath $ReleaseDirectory
 New-Item -ItemType Directory -Path $Staging, (Split-Path $ReleaseDirectory -Parent) -Force | Out-Null
 try {
 
@@ -155,17 +210,7 @@ $TransportHash = Get-Hash $TransportZip
 Write-Utf8 "$TransportZip.sha256" "$TransportHash $TransportZipName"
 
 $SourceZip = Join-Path $Staging $SourceZipName
-$SourceList = & git -C $Root ls-files
-$SourceTemp = Join-Path $env:TEMP "cpg-source-$Commit"
-if (Test-Path $SourceTemp) { Remove-Item -Recurse -Force $SourceTemp }
-New-Item -ItemType Directory -Path $SourceTemp | Out-Null
-foreach ($Relative in $SourceList) {
-    $Target = Join-Path $SourceTemp $Relative
-    New-Item -ItemType Directory -Path (Split-Path $Target -Parent) -Force | Out-Null
-    Copy-Item (Join-Path $Root $Relative) $Target
-}
-Compress-Archive -Path (Join-Path $SourceTemp '*') -DestinationPath $SourceZip -CompressionLevel Optimal
-Remove-Item -Recurse -Force $SourceTemp
+Copy-Item -LiteralPath $CapturedSourceZip -Destination $SourceZip
 $SourceHash = Get-Hash $SourceZip
 Write-Utf8 "$SourceZip.sha256" "$SourceHash $SourceZipName"
 
@@ -175,9 +220,9 @@ Write-Utf8 (Join-Path $Staging 'SHA256SUMS.txt') (@(
     "$SourceHash $SourceZipName"
 ) -join "`n")
 
-$SizeReportDirectory = Join-Path $Root 'dist\size-report'
+$SizeReportDirectory = Join-Path $RunDirectory 'size-report'
 New-Item -ItemType Directory -Path $SizeReportDirectory -Force | Out-Null
-Invoke-Checked (Get-Command python).Source @((Join-Path $Root 'scripts\report-package-size.py'),
+Invoke-Checked (Get-Command python).Source @((Join-Path $SourceRoot 'scripts\report-package-size.py'),
     '--root', $Staging, '--archive', $TransportZip, '--output', $SizeReportDirectory)
 $SizeReport = Join-Path $Staging 'size-report.json'
 Copy-Item (Join-Path $SizeReportDirectory 'size-report.json') $SizeReport
@@ -185,8 +230,9 @@ Copy-Item (Join-Path $SizeReportDirectory 'size-report.json') $SizeReport
 $BuildDate = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
 # PE mitigation facts (CFG/CET/ASLR/DEP) derived by the verifier's own PE
 # parser from the packaged EXE - never hand-maintained here.
-$MitigationsJson = (& (Get-Command python).Source @((Join-Path $Root 'scripts\verify-package.py'),
+$MitigationsJson = (& (Get-Command python).Source @((Join-Path $SourceRoot 'scripts\verify-package.py'),
     '--mitigations-of', $Exe) | Out-String).Trim()
+if ($LASTEXITCODE -ne 0) { throw 'PE mitigation inspection failed.' }
 $Mitigations = $MitigationsJson | ConvertFrom-Json
 $Manifest = [ordered]@{
     schema = 'static-single'
@@ -222,17 +268,27 @@ $Manifest = [ordered]@{
 Write-Utf8 (Join-Path $Staging 'release-manifest.json') ($Manifest | ConvertTo-Json -Depth 5)
 
 # --- 14. Independent re-verification ------------------------------------------
-Invoke-Checked (Get-Command python).Source @((Join-Path $Root 'scripts\verify-package.py'),
+Invoke-Checked (Get-Command python).Source @((Join-Path $SourceRoot 'scripts\verify-package.py'),
     '--release', $Staging, '--schema', 'static-single')
 
 # --- 15. Promotion: one atomic move on the same volume -------------------------
+$FinalHead = (& git -C $Root rev-parse HEAD | Out-String).Trim()
+if ($LASTEXITCODE -ne 0 -or $FinalHead -ne $Commit) { throw 'Source HEAD changed during release.' }
+$FinalDirty = @(& git -C $Root status --porcelain=v1 --untracked-files=all).Count
+if ($LASTEXITCODE -ne 0 -or $FinalDirty -ne 0) { throw 'Working tree changed during release.' }
+if (Test-Path -LiteralPath $ReleaseDirectory) { throw 'Immutable release destination appeared during build.' }
+Assert-TargetPath $Staging
+Assert-ReleasePath $ReleaseDirectory
 Move-Item -LiteralPath $Staging -Destination $ReleaseDirectory
-Invoke-Checked (Get-Command python).Source @((Join-Path $Root 'scripts\verify-package.py'),
+Invoke-Checked (Get-Command python).Source @((Join-Path $SourceRoot 'scripts\verify-package.py'),
     '--release', $ReleaseDirectory, '--schema', 'static-single')
 } finally {
     # The promoted directory is never touched here; only leftover staging of
     # a failed run is cleaned up.
-    if (Test-Path -LiteralPath $Staging) { Remove-Item -Recurse -Force $Staging }
+    if (Test-Path -LiteralPath $Staging) {
+        Assert-TargetPath $Staging
+        Remove-Item -LiteralPath $Staging -Recurse -Force
+    }
 }
 
 Write-Host ''
@@ -240,3 +296,5 @@ Write-Host "Release promoted: $ReleaseDirectory"
 Write-Host "  CodexProxyGuard.exe $([math]::Round($ExeSize / 1MB, 2)) MiB  sha256=$ExeHash"
 Write-Host "  signed=$Signed authenticode=$AuthenticodeStatus"
 if (-not $Signed) { Write-Host '  UNSIGNED DEVELOPMENT BUILD' }
+
+} finally { $ReleaseLock.Dispose() }

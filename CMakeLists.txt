@@ -4,12 +4,13 @@ cmake_minimum_required(VERSION 3.25)
 # The single-EXE product always links the static CRT.
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 project(CodexProxyGuard VERSION 0.7.0 LANGUAGES CXX RC)
+include(cmake/MSVCDeps.cmake)
 if(NOT WIN32)
     message(FATAL_ERROR "Codex Proxy Guard requires Windows.")
 endif()
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CPG_PRODUCT_VERSION "0.7.0-rc.2" CACHE STRING "Product version")
+set(CPG_PRODUCT_VERSION "0.7.0-rc.3" CACHE STRING "Product version")
 set(CPG_BUILD_COMMIT "unknown" CACHE STRING "Source commit")
 set(CPG_BUILD_DIRTY "true" CACHE STRING "Source dirty flag")
 
@@ -40,4 +41,7 @@ if(BUILD_TESTING)
     add_test(NAME verify_package_fixtures
         COMMAND Python3::Interpreter "${CMAKE_SOURCE_DIR}/scripts/tests/test_verify_package.py")
     set_tests_properties(verify_package_fixtures PROPERTIES TIMEOUT 120)
+    add_test(NAME release_input_guards
+        COMMAND Python3::Interpreter "${CMAKE_SOURCE_DIR}/scripts/tests/test_release_inputs.py")
+    set_tests_properties(release_input_guards PROPERTIES TIMEOUT 120)
 endif()

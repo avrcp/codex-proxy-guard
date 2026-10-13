@@ -1,15 +1,5 @@
-<# Configure, compile with warnings-as-errors, and run the no-Qt C++ suites.
-
-This is the migration-era companion to scripts/test-cpp.ps1: it always builds
-the no-Qt product (foundation + migrated engine/TUI/app) and, when a Qt 6.8
-SDK is available at -QtRoot, additionally builds the legacy GUI/bridge
-regression client by leaving CPG_DISABLE_QT_GUI off.
-#>
-param(
-    [string] $QtRoot = 'D:\Qt\6.8.3\msvc2022_64',
-    [string] $BuildDirectory = 'target\cpp-noqt',
-    [switch] $NoQtOnly
-)
+# Configure the C++20 no-Qt product and execute every registered suite.
+param([string] $BuildDirectory = 'target\cpp-noqt')
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 $Root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
@@ -27,20 +17,17 @@ $CMake = Join-Path $Vs 'Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\c
 $CTest = Join-Path (Split-Path $CMake) 'ctest.exe'
 $Ninja = Join-Path $Vs 'Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe'
 $PreviousPath = $Env:PATH
+$Env:VSLANG = "1033"
 try {
     $Commit = (& git -C $Root rev-parse HEAD | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0) { throw 'git rev-parse failed.' }
     $Dirty = [bool](@(& git -C $Root status --porcelain=v1 --untracked-files=all).Count)
+    if ($LASTEXITCODE -ne 0) { throw 'git status failed.' }
     $ConfigureArgs = @(
         '-S', $Root, '-B', $Build, '-G', 'Ninja', "-DCMAKE_MAKE_PROGRAM=$Ninja",
         '-DCMAKE_BUILD_TYPE=Release', '-DBUILD_TESTING=ON',
         "-DCPG_BUILD_COMMIT=$Commit", "-DCPG_BUILD_DIRTY=$($Dirty.ToString().ToLowerInvariant())"
     )
-    if ($NoQtOnly -or -not (Test-Path (Join-Path $QtRoot 'lib\cmake\Qt6'))) {
-        $ConfigureArgs += '-DCPG_DISABLE_QT_GUI=ON'
-    } else {
-        $Env:PATH = "$QtRoot\bin;$Env:PATH"
-        $ConfigureArgs += "-DCMAKE_PREFIX_PATH=$QtRoot"
-    }
     & $CMake @ConfigureArgs
     if ($LASTEXITCODE -ne 0) { throw 'CMake configuration failed.' }
     & $CMake --build $Build --parallel

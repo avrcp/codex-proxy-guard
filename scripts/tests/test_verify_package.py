@@ -139,6 +139,7 @@ class VerifierTests(unittest.TestCase):
 
     def write_source(self):
         with zipfile.ZipFile(self.source, 'w') as bundle:
+            bundle.comment = COMMIT.encode('ascii')
             bundle.writestr('source/main.cpp', 'int main() {}\n')
         self.source.with_name(self.source.name + '.sha256').write_text(
             f'{file_sha256(self.source)} {self.source.name}\n', encoding='utf-8')
@@ -164,6 +165,20 @@ class VerifierTests(unittest.TestCase):
     def test_accepts_consistent_release(self):
         completed = self.verify()
         self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_rejects_dirty_release_provenance(self):
+        self.write_manifest(dirty=True)
+        self.assertNotEqual(self.verify().returncode, 0)
+
+    def test_rejects_source_archive_from_different_commit(self):
+        with zipfile.ZipFile(self.source, 'a') as bundle:
+            bundle.comment = b'f' * 40
+        digest = file_sha256(self.source)
+        self.source.with_name(self.source.name + '.sha256').write_text(
+            f'{digest} {self.source.name}\n', encoding='utf-8')
+        self.write_manifest(source_zip={'path': self.source.name, 'sha256': digest})
+        self.write_sums()
+        self.assertNotEqual(self.verify().returncode, 0)
 
     def test_rejects_manifest_digest_mismatch(self):
         self.write_manifest(executable=dict(self.manifest['executable'], sha256='0' * 64))
