@@ -33,7 +33,7 @@ import zipfile
 
 REQUIRED_MANIFEST_KEYS = (
     'schema', 'schema_version', 'version', 'commit', 'dirty',
-    'created_utc', 'artifacts', 'executable',
+    'created_utc', 'artifacts', 'executable', 'signed',
 )
 ALLOWED_IMPORT_PREFIXES = (
     'ADVAPI32.DLL', 'API-MS-WIN-', 'BCRYPT.DLL', 'CFG.DLL', 'CLR.DLL',
@@ -236,44 +236,194 @@ def check_artifact_set(release: pathlib.Path, manifest: dict) -> None:
             f'Release artifact set mismatch\n  manifest: {sorted(expected)}\n  actual:   {actual}')
 
 
-def verify_authenticode(path: pathlib.Path) -> None:
-    """Independent Authenticode validation through WinVerifyTrust - the
-    manifest's own 'signed' claim is never trusted on faith."""
-    import ctypes.wintypes as wt
+# --- Independent Authenticode validation (WinVerifyTrust) ----------------------
+# Structure and constant definitions follow the Windows SDK wintrust.h layout
+# for a 64-bit host process. The trust provider is reached through an
+# injectable adapter so the tests can drive the exact VERIFY -> CLOSE
+# lifecycle; production loads the real entry point with a checked signature.
+WTD_UI_NONE = 2
+WTD_REVOKE_NONE = 0
+WTD_CHOICE_FILE = 1
+WTD_STATEACTION_VERIFY = 1
+WTD_STATEACTION_CLOSE = 2
 
-    class GUID(ctypes.Structure):
-        _fields_ = [('Data1', wt.DWORD), ('Data2', wt.WORD), ('Data3', wt.WORD),
-                    ('Data4', ctypes.c_ubyte * 8)]
 
-    class WINTRUST_FILE_INFO(ctypes.Structure):
-        _fields_ = [('cbStruct', wt.DWORD), ('pcwszFilePath', wt.LPCWSTR),
-                    ('hFile', wt.HANDLE), ('pgKnownSubject', ctypes.c_void_p)]
+class WinTrustGuid(ctypes.Structure):
+    _fields_ = [('Data1', ctypes.c_uint32), ('Data2', ctypes.c_uint16),
+                ('Data3', ctypes.c_uint16), ('Data4', ctypes.c_ubyte * 8)]
 
-    class WINTRUST_DATA(ctypes.Structure):
-        _fields_ = [('cbStruct', wt.DWORD), ('pPolicyCallbackData', ctypes.c_void_p),
-                    ('pSIPClientData', ctypes.c_void_p), ('dwUIChoice', wt.DWORD),
-                    ('fdwRevocationChecks', wt.DWORD), ('dwUnionChoice', wt.DWORD),
-                    ('pFile', ctypes.POINTER(WINTRUST_FILE_INFO)),
-                    ('dwStateAction', wt.DWORD), ('hWVTStateData', wt.HANDLE),
-                    ('pwszURLReference', wt.LPCWSTR),
-                    ('dwProvFlags', wt.DWORD), ('dwUIContext', wt.DWORD)]
 
-    wintrust = ctypes.WinDLL('wintrust')
-    action = GUID(0x00aac56b, 0xcd44, 0x11d0,
-                  (ctypes.c_ubyte * 8)(0x8c, 0xc2, 0x00, 0xc0, 0x4f, 0xc2, 0x95, 0xee))
-    info = WINTRUST_FILE_INFO(ctypes.sizeof(WINTRUST_FILE_INFO), str(path), None, None)
-    data = WINTRUST_DATA(ctypes.sizeof(WINTRUST_DATA), None, None,
-                         2,  # WTD_UI_NONE
-                         0,  # WTD_REVOKE_NONE
-                         1,  # WTD_CHOICE_FILE
-                         ctypes.byref(info),
-                         1,  # WTD_STATEACTION_VERIFY
-                         None, None, 0, 0)
-    result = wintrust.WinVerifyTrust(None, ctypes.byref(action), ctypes.byref(data))
-    data.dwStateAction = 16  # WTD_STATEACTION_CLOSE
-    wintrust.WinVerifyTrust(None, ctypes.byref(action), ctypes.byref(data))
-    if result != 0:
-        raise SystemExit(f'Authenticode validation failed (WinVerifyTrust 0x{result & 0xffffffff:08x})')
+WINTRUST_ACTION_GENERIC_VERIFY_V2 = WinTrustGuid(
+    0x00aac56b, 0xcd44, 0x11d0,
+    (ctypes.c_ubyte * 8)(0x8c, 0xc2, 0x00, 0xc0, 0x4f, 0xc2, 0x95, 0xee))
+
+
+class WinTrustFileInfo(ctypes.Structure):
+    _fields_ = [('cbStruct', ctypes.c_uint32), ('pcwszFilePath', ctypes.c_wchar_p),
+                ('hFile', ctypes.c_void_p),
+                ('pgKnownSubject', ctypes.POINTER(WinTrustGuid))]
+
+
+class _WinTrustUnionChoice(ctypes.Union):
+    # The dwUnionChoice-selected member; only the file spelling is typed.
+    _fields_ = [('pFile', ctypes.POINTER(WinTrustFileInfo)),
+                ('pCatalog', ctypes.c_void_p), ('pBlob', ctypes.c_void_p),
+                ('pSgnr', ctypes.c_void_p)]
+
+
+class WinTrustData(ctypes.Structure):
+    # Full x64 SDK layout (through pSignatureSettings); trailing members stay
+    # zero-initialized. cbStruct must equal sizeof(this) or WinVerifyTrust
+    # rejects the request.
+    _fields_ = [
+        ('cbStruct', ctypes.c_uint32),
+        ('pPolicyCallbackData', ctypes.c_void_p),
+        ('pSIPClientData', ctypes.c_void_p),
+        ('dwUIChoice', ctypes.c_uint32),
+        ('fdwRevocationChecks', ctypes.c_uint32),
+        ('dwUnionChoice', ctypes.c_uint32),
+        ('pChoice', _WinTrustUnionChoice),
+        ('dwStateAction', ctypes.c_uint32),
+        ('hWVTStateData', ctypes.c_void_p),
+        ('pwszURLReference', ctypes.c_wchar_p),
+        ('dwProvFlags', ctypes.c_uint32),
+        ('dwUIContext', ctypes.c_uint32),
+        ('pExtendedErrorInfo', ctypes.c_void_p),
+        ('enumiPolicy', ctypes.c_uint32),
+        ('psResult', ctypes.c_void_p),
+        ('pawszNetworkURL', ctypes.c_wchar_p),
+        ('psWVTStateData', ctypes.c_void_p),
+        ('pSignatureSettings', ctypes.c_void_p),
+    ]
+    _anonymous_ = ['pChoice']
+
+
+def load_wintrust_api():
+    """Load the real WinVerifyTrust entry point with a checked signature."""
+    if not hasattr(ctypes, 'WinDLL'):
+        raise SystemExit('Authenticode validation requires Windows')
+    verify = ctypes.WinDLL('wintrust').WinVerifyTrust
+    verify.argtypes = [ctypes.c_void_p, ctypes.POINTER(WinTrustGuid),
+                       ctypes.POINTER(WinTrustData)]
+    verify.restype = ctypes.c_long
+    return verify
+
+
+def build_wintrust_request(path: pathlib.Path):
+    """One WINTRUST_DATA configured for a UI-less, file-choice verification.
+
+    The file-info object, its typed pointer and the path string are returned
+    together and must all outlive the calls: the trust provider reads
+    pFile->pcwszFilePath while WinVerifyTrust runs."""
+    file_info = WinTrustFileInfo()
+    file_info.cbStruct = ctypes.sizeof(WinTrustFileInfo)
+    file_info.pcwszFilePath = str(path)
+    file_info_ptr = ctypes.pointer(file_info)  # typed LP_, not a byref argument
+    data = WinTrustData()
+    data.cbStruct = ctypes.sizeof(WinTrustData)
+    data.dwUIChoice = WTD_UI_NONE
+    data.fdwRevocationChecks = WTD_REVOKE_NONE
+    data.dwUnionChoice = WTD_CHOICE_FILE
+    data.pFile = file_info_ptr
+    data.dwStateAction = WTD_STATEACTION_VERIFY
+    return WINTRUST_ACTION_GENERIC_VERIFY_V2, file_info, file_info_ptr, data
+
+
+def run_wintrust_lifecycle(api, action, data):
+    """Run one VERIFY pass and release it with CLOSE afterwards.
+
+    Every actually initiated verification - including one whose call raised -
+    is followed by WTD_STATEACTION_CLOSE over the same state data. Cleanup
+    errors are returned (as an exception object), never raised out of the
+    finally block, so they cannot mask the primary verification result."""
+    verify_status = None
+    close_status = None
+    try:
+        verify_status = api(None, ctypes.byref(action), ctypes.byref(data))
+    finally:
+        data.dwStateAction = WTD_STATEACTION_CLOSE
+        try:
+            close_status = api(None, ctypes.byref(action), ctypes.byref(data))
+        except Exception as error:
+            close_status = error
+    return verify_status, close_status
+
+
+def verify_authenticode(path: pathlib.Path, *, api=None) -> None:
+    """Independent Authenticode validation of a packaged artifact - the
+    manifest's own 'signed' claim is never trusted on faith. Only a VERIFY
+    status of exactly 0 counts as valid; everything else (including a failed
+    state release afterwards) fails the release."""
+    if api is None:
+        api = load_wintrust_api()
+    action, _file_info, _file_ptr, data = build_wintrust_request(path)
+    try:
+        verify_status, close_status = run_wintrust_lifecycle(api, action, data)
+    except Exception as error:
+        raise SystemExit(f'WinVerifyTrust invocation failed: {error}') from error
+    if isinstance(close_status, Exception):
+        raise SystemExit(
+            f'WinVerifyTrust state release failed: {close_status} '
+            f'(VERIFY 0x{verify_status & 0xffffffff:08x})')
+    if verify_status != 0:
+        raise SystemExit(
+            f'Authenticode validation failed: WinVerifyTrust '
+            f'0x{verify_status & 0xffffffff:08x} '
+            f'(close 0x{close_status & 0xffffffff:08x})')
+    if close_status != 0:
+        # A file whose signature verified but whose state data cannot be
+        # released is reported as a cleanup failure, never as Valid.
+        raise SystemExit(
+            f'WinVerifyTrust state release failed: 0x{close_status & 0xffffffff:08x}')
+
+
+def normalize_thumbprint(value) -> str:
+    """Compact lowercase hex form of a SHA-1 thumbprint, or '' if malformed."""
+    if not isinstance(value, str):
+        return ''
+    compact = value.replace(':', '').replace(' ', '').lower()
+    if len(compact) == 40 and all(character in '0123456789abcdef' for character in compact):
+        return compact
+    return ''
+
+
+def check_signature_facts(manifest: dict) -> None:
+    """Signature facts must be internally consistent: a signed release also
+    records executable.signed, a non-empty publisher, the signer thumbprint,
+    timestamp_present and its verification policy, and never the unsigned_dev
+    marker; an unsigned release is explicitly unsigned_dev with no signed
+    executable. The independent WinVerifyTrust pass that follows decides
+    whether a 'signed' release is actually trusted."""
+    signed = manifest.get('signed')
+    executable_signed = manifest['executable'].get('signed')
+    if signed is True:
+        if executable_signed is not True:
+            raise SystemExit('Signed manifest must record executable.signed=true')
+        if manifest.get('unsigned_dev'):
+            raise SystemExit('Signed manifest must not be marked unsigned_dev')
+        if manifest.get('authenticode_status') != 'Valid':
+            raise SystemExit('Signed release must record authenticode_status=Valid')
+        publisher = manifest.get('publisher')
+        if not isinstance(publisher, str) or not publisher.strip():
+            raise SystemExit('Signed release must record a non-empty publisher')
+        if not normalize_thumbprint(manifest.get('signer_thumbprint')):
+            raise SystemExit('Signed release must record the signer certificate thumbprint')
+        expected = manifest.get('expected_certificate_sha1')
+        if expected is not None and normalize_thumbprint(expected) != normalize_thumbprint(
+                manifest.get('signer_thumbprint')):
+            raise SystemExit('Signer thumbprint does not match the expected certificate')
+        if not isinstance(manifest.get('timestamp_present'), bool):
+            raise SystemExit('Signed release must record timestamp_present as a fact')
+        policy = manifest.get('signature_verification_policy')
+        if not isinstance(policy, str) or not policy.strip():
+            raise SystemExit('Signed release must record its signature verification policy')
+    elif signed is False:
+        if not manifest.get('unsigned_dev'):
+            raise SystemExit('Unsigned release must be explicitly marked unsigned_dev')
+        if executable_signed:
+            raise SystemExit('Unsigned manifest must record executable.signed=false')
+    else:
+        raise SystemExit('Manifest must record signed=true/false')
 
 
 def main() -> None:
@@ -401,12 +551,12 @@ def main() -> None:
     check_source_zip(source[0], manifest, recorded)
     check_artifact_set(release, manifest)
 
-    if manifest['executable'].get('signed') and manifest.get('authenticode_status') != 'Valid':
-        raise SystemExit('Signed release must record authenticode_status=Valid')
-    if manifest['executable'].get('signed'):
-        verify_authenticode(executable)
-    if not manifest['executable'].get('signed') and not manifest.get('unsigned_dev'):
-        raise SystemExit('Unsigned release must be explicitly marked unsigned_dev')
+    check_signature_facts(manifest)
+    if manifest.get('signed') is True:
+        # Independent trust validation against the absolute path of the
+        # signed final EXE, after every digest gate has already bound it to
+        # the manifest and the transport ZIP.
+        verify_authenticode(executable.resolve())
     print(f'verified {release.name}: {exe_digest[:16]}... '
           f'({len(exe_bytes)} bytes, imports: {", ".join(imports)})')
 

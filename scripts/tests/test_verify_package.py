@@ -11,6 +11,7 @@ is exercised by the canonical build script; these fixtures pass
 import ctypes
 import hashlib
 import json
+import os
 import pathlib
 import runpy
 import struct
@@ -126,6 +127,7 @@ class VerifierTests(unittest.TestCase):
             'qt': False, 'powershell_appx_discovery': False,
             'subsystem': 'console', 'crt': 'static',
             'mitigations': mitigation_facts(),
+            'signed': False, 'authenticode_status': 'Unsigned',
             'unsigned_dev': True,
             'executable': {'path': 'CodexProxyGuard.exe',
                            'sha256': file_sha256(self.exe),
@@ -229,6 +231,58 @@ class VerifierTests(unittest.TestCase):
         self.write_manifest(authenticode_status='Unavailable',
                             executable=dict(self.manifest['executable'], signed=True))
         self.assertNotEqual(self.verify().returncode, 0)
+
+    def test_rejects_signed_release_without_publisher(self):
+        self.write_signed_manifest(publisher='')
+        self.assertNotEqual(self.verify().returncode, 0)
+
+    def test_rejects_signed_release_without_signer_thumbprint(self):
+        manifest = self.write_signed_manifest()
+        manifest.pop('signer_thumbprint')
+        (self.release / 'release-manifest.json').write_text(
+            json.dumps(manifest), encoding='utf-8')
+        self.assertNotEqual(self.verify().returncode, 0)
+
+    def test_rejects_signed_release_marked_unsigned_dev(self):
+        self.write_signed_manifest(unsigned_dev=True)
+        self.assertNotEqual(self.verify().returncode, 0)
+
+    def test_rejects_signed_manifest_with_unsigned_executable_record(self):
+        self.write_signed_manifest()
+        self.write_manifest(signed=True, unsigned_dev=False,
+                            authenticode_status='Valid',
+                            publisher='CN=Test Signer',
+                            signer_thumbprint='AB' * 20,
+                            timestamp_present=True,
+                            signature_verification_policy='test policy')
+        self.assertNotEqual(self.verify().returncode, 0)
+
+    def test_rejects_signer_thumbprint_mismatching_expected_certificate(self):
+        self.write_signed_manifest(expected_certificate_sha1='CD' * 20)
+        self.assertNotEqual(self.verify().returncode, 0)
+
+    def test_consistent_signed_facts_still_require_actual_trust(self):
+        # Fully consistent signature facts must not pass on their own: the
+        # fixture EXE is unsigned, so the independent WinVerifyTrust pass (or
+        # its absence on a non-Windows host) must fail the release.
+        self.write_signed_manifest()
+        self.assertNotEqual(self.verify().returncode, 0)
+
+    def write_signed_manifest(self, **overrides):
+        manifest = dict(self.manifest)
+        manifest.update(signed=True, unsigned_dev=False,
+                        authenticode_status='Valid',
+                        publisher='CN=Test Signer, O=Guard',
+                        signer_thumbprint='ab' * 20,
+                        timestamp_present=True,
+                        signature_verification_policy=(
+                            'signtool verify /pa /all + signature object + '
+                            'independent WinVerifyTrust'),
+                        executable=dict(self.manifest['executable'], signed=True))
+        manifest.update(overrides)
+        (self.release / 'release-manifest.json').write_text(
+            json.dumps(manifest, indent=2), encoding='utf-8')
+        return manifest
 
     def test_rejects_transport_with_extra_member(self):
         self.write_transport(extra_member='extra.txt')
@@ -344,9 +398,10 @@ class RC3ReviewReproductions(unittest.TestCase):
     def test_wintrust_lifecycle_verifies_then_closes_with_action_2(self):
         module = runpy.run_path(str(VERIFIER))
         calls = []
+        data_type = ctypes.POINTER(module['WinTrustData'])
 
         def fake_api(hwnd, action, data):
-            calls.append(data.contents.dwStateAction)
+            calls.append(ctypes.cast(data, data_type).contents.dwStateAction)
             return 0
 
         module['verify_authenticode'](pathlib.Path('C:/definitely/not/signed.exe'),
@@ -364,6 +419,141 @@ class RC3ReviewReproductions(unittest.TestCase):
         struct.pack_into('<I', image, 0x400 + 144, 0x500)
         struct.pack_into('<II', image, optional + 160, 0, 0)
         self.assertIs(module['pe_mitigations'](bytes(image))['cet_compat'], False)
+
+
+class WinTrustLifecycleTests(unittest.TestCase):
+    """The WinVerifyTrust request and its VERIFY -> CLOSE lifecycle, driven
+    through an injected adapter: no trust provider, no certificate store and
+    no network access are involved."""
+
+    def setUp(self):
+        self.module = runpy.run_path(str(VERIFIER))
+
+    def fake_api(self, verify_result=0, close_result=0, verify_raises=None,
+                 close_raises=None):
+        calls = []
+        data_type = ctypes.POINTER(self.module['WinTrustData'])
+
+        def api(hwnd, action, data):
+            state = ctypes.cast(data, data_type).contents.dwStateAction
+            calls.append(state)
+            if state == self.module['WTD_STATEACTION_VERIFY']:
+                if verify_raises is not None:
+                    raise verify_raises
+                return verify_result
+            if close_raises is not None:
+                raise close_raises
+            return close_result
+
+        api.calls = calls
+        return api
+
+    def test_request_construction_assigns_the_typed_pointer(self):
+        requested = pathlib.Path('X:/release/CodexProxyGuard.exe')
+        action, file_info, file_ptr, data = self.module['build_wintrust_request'](
+            requested)
+        self.assertEqual(ctypes.addressof(data.pFile.contents),
+                         ctypes.addressof(file_info))
+        self.assertEqual(data.pFile.contents.pcwszFilePath, str(requested))
+        self.assertEqual(data.cbStruct, ctypes.sizeof(self.module['WinTrustData']))
+        self.assertEqual(file_info.cbStruct,
+                         ctypes.sizeof(self.module['WinTrustFileInfo']))
+        self.assertEqual(data.dwUIChoice, self.module['WTD_UI_NONE'])
+        self.assertEqual(data.fdwRevocationChecks, self.module['WTD_REVOKE_NONE'])
+        self.assertEqual(data.dwUnionChoice, self.module['WTD_CHOICE_FILE'])
+        self.assertEqual(data.dwStateAction, self.module['WTD_STATEACTION_VERIFY'])
+
+    def test_struct_layout_matches_the_x64_sdk(self):
+        if ctypes.sizeof(ctypes.c_void_p) != 8:
+            self.skipTest('x64 host required for the SDK layout constants')
+        trust_data = self.module['WinTrustData']
+        expected = {
+            'cbStruct': 0, 'dwUIChoice': 24, 'fdwRevocationChecks': 28,
+            'dwUnionChoice': 32, 'pFile': 40, 'dwStateAction': 48,
+            'hWVTStateData': 56, 'pwszURLReference': 64, 'dwProvFlags': 72,
+            'dwUIContext': 76, 'pExtendedErrorInfo': 80, 'enumiPolicy': 88,
+            'psResult': 96, 'pawszNetworkURL': 104, 'psWVTStateData': 112,
+            'pSignatureSettings': 120,
+        }
+        for field, offset in expected.items():
+            self.assertEqual(getattr(trust_data, field).offset, offset, field)
+        self.assertEqual(ctypes.sizeof(trust_data), 128)
+        self.assertEqual(ctypes.sizeof(self.module['WinTrustFileInfo']), 32)
+
+    def test_successful_verification_runs_verify_then_close(self):
+        api = self.fake_api(verify_result=0, close_result=0)
+        self.module['verify_authenticode'](
+            pathlib.Path('X:/signed.exe'), api=api)  # must not raise
+        self.assertEqual(api.calls, [self.module['WTD_STATEACTION_VERIFY'],
+                                     self.module['WTD_STATEACTION_CLOSE']])
+
+    def test_signature_error_still_releases_state_and_reports_the_long_code(self):
+        # TRUST_E_NOSIGNATURE arrives as a negative LONG; only 0 is success.
+        api = self.fake_api(verify_result=-2146762496, close_result=0)
+        with self.assertRaises(SystemExit) as raised:
+            self.module['verify_authenticode'](pathlib.Path('X:/unsigned.exe'), api=api)
+        self.assertIn('800b0100', str(raised.exception))
+        self.assertEqual(api.calls, [self.module['WTD_STATEACTION_VERIFY'],
+                                     self.module['WTD_STATEACTION_CLOSE']])
+
+    def test_invocation_failure_releases_state_and_never_succeeds(self):
+        api = self.fake_api(verify_raises=RuntimeError('trust provider exploded'))
+        with self.assertRaises(SystemExit) as raised:
+            self.module['verify_authenticode'](pathlib.Path('X:/broken.exe'), api=api)
+        self.assertIn('trust provider exploded', str(raised.exception))
+        self.assertEqual(api.calls, [self.module['WTD_STATEACTION_VERIFY'],
+                                     self.module['WTD_STATEACTION_CLOSE']])
+
+    def test_close_failure_keeps_the_primary_result_and_is_not_valid(self):
+        api = self.fake_api(verify_result=0, close_result=5)
+        with self.assertRaises(SystemExit) as raised:
+            self.module['verify_authenticode'](pathlib.Path('X:/signed.exe'), api=api)
+        self.assertIn('state release failed', str(raised.exception))
+        api = self.fake_api(verify_result=-2146762496, close_result=5)
+        with self.assertRaises(SystemExit) as raised:
+            self.module['verify_authenticode'](pathlib.Path('X:/bad.exe'), api=api)
+        # The primary VERIFY status stays in the message, cleanup after it.
+        self.assertIn('800b0100', str(raised.exception))
+        self.assertIn('00000005', str(raised.exception))
+
+    def test_thumbprint_normalization(self):
+        normalize = self.module['normalize_thumbprint']
+        self.assertEqual(normalize('AB:CD:EF:00:11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff:00'),
+                         'abcdef00112233445566778899aabbccddeeff00')
+        self.assertEqual(normalize('abcdef00112233445566778899aabbccddeeff00'),
+                         'abcdef00112233445566778899aabbccddeeff00')
+        self.assertEqual(normalize(''), '')
+        self.assertEqual(normalize(None), '')
+        self.assertEqual(normalize('not-a-thumbprint'), '')
+        self.assertEqual(normalize('ab' * 21), '')
+
+
+@unittest.skipUnless(hasattr(ctypes, 'WinDLL'), 'Windows trust provider required')
+class RealWinTrustTests(unittest.TestCase):
+    """The same request/lifecycle against the real WinVerifyTrust entry point
+    - no certificate store modification, no revocation network fetch."""
+
+    def setUp(self):
+        self.module = runpy.run_path(str(VERIFIER))
+        self.api = self.module['load_wintrust_api']()
+
+    def test_unsigned_fixture_is_rejected_by_the_real_provider(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = pathlib.Path(directory) / 'unsigned.exe'
+            target.write_bytes(minimal_console_pe())
+            with self.assertRaises(SystemExit) as raised:
+                self.module['verify_authenticode'](target, api=self.api)
+            self.assertNotEqual('0x00000000', str(raised.exception))
+
+    def test_embedded_signed_system_binary_is_trusted(self):
+        # vswhere.exe carries an embedded Microsoft signature and is required
+        # by the canonical build script itself, so any build machine has it.
+        program_files = os.environ.get('ProgramFiles(x86)', r'C:\Program Files (x86)')
+        vswhere = pathlib.Path(program_files) / 'Microsoft Visual Studio' / \
+            'Installer' / 'vswhere.exe'
+        if not vswhere.is_file():
+            self.skipTest('no embedded-signed vswhere.exe control binary')
+        self.module['verify_authenticode'](vswhere, api=self.api)  # must not raise
 
 
 if __name__ == '__main__':

@@ -10,7 +10,7 @@ if(NOT WIN32)
 endif()
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CPG_PRODUCT_VERSION "0.7.0-rc.3" CACHE STRING "Product version")
+set(CPG_PRODUCT_VERSION "0.7.0-rc.4" CACHE STRING "Product version")
 set(CPG_BUILD_COMMIT "unknown" CACHE STRING "Source commit")
 set(CPG_BUILD_DIRTY "true" CACHE STRING "Source dirty flag")
 

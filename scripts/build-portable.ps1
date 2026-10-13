@@ -17,7 +17,7 @@ in the user or machine store; without -Sign the release must explicitly pass
 -AllowUnsignedDev and is marked UNSIGNED DEVELOPMENT BUILD everywhere.
 #>
 param(
-    [string] $Version = '0.7.0-rc.3',
+    [string] $Version = '0.7.0-rc.4',
     [switch] $Sign,
     [string] $CertificateSha1,
     [string] $TimestampUrl = 'http://timestamp.digicert.com',
@@ -27,6 +27,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+. (Join-Path $PSScriptRoot 'signature-metadata.ps1')
 $Root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $TargetRoot = [IO.Path]::GetFullPath((Join-Path $Root 'target'))
 $BuildBase = [IO.Path]::GetFullPath($(if ([IO.Path]::IsPathRooted($BuildDirectory)) { $BuildDirectory } else { Join-Path $Root $BuildDirectory }))
@@ -175,15 +176,24 @@ $ImportList = @($ImportText -split "`n" | Where-Object { $_ -match '\.dll$' } | 
 $Signed = $false
 $AuthenticodeStatus = 'Unsigned'
 $Publisher = ''
+$SignerThumbprint = ''
+$TimestampPresent = $false
+$SignaturePolicy = 'none: unsigned development build, no signature verification performed'
 if ($Sign) {
     Invoke-Checked $SignTool @('sign', '/sha1', $CertificateSha1, '/fd', 'SHA256',
         '/tr', $TimestampUrl, '/td', 'SHA256', $Exe)
     & $SignTool @('verify', '/pa', '/all', $Exe)
     if ($LASTEXITCODE -ne 0) { throw 'signtool verify failed after signing.' }
+    # Publisher identity, signer thumbprint and the timestamp fact come from
+    # the signature object itself; signtool's localized text output is never
+    # parsed. The normalized expected thumbprint must equal the actual signer.
+    $Metadata = Get-SignatureMetadata -Path $Exe -ExpectedThumbprint $CertificateSha1
     $Signed = $true
     $AuthenticodeStatus = 'Valid'
-    $Signature = & $SignTool @('verify', '/pa', '/all', '/v', $Exe) | Out-String
-    if ($Signature -match 'Issued to:\s+(.+)$') { $Publisher = $Matches[1].Trim() }
+    $Publisher = $Metadata.publisher
+    $SignerThumbprint = $Metadata.signer_thumbprint
+    $TimestampPresent = $Metadata.timestamp_present
+    $SignaturePolicy = 'signtool verify /pa /all + Get-AuthenticodeSignature policy check + independent WinVerifyTrust (UI none, revocation flags none, default chain policy)'
 }
 
 # Nothing may touch the EXE after this point (signing is the last mutation).
@@ -249,6 +259,9 @@ $Manifest = [ordered]@{
     signed = $Signed
     authenticode_status = $AuthenticodeStatus
     publisher = $Publisher
+    signer_thumbprint = $SignerThumbprint
+    timestamp_present = $TimestampPresent
+    signature_verification_policy = $SignaturePolicy
     unsigned_dev = (-not $Signed)
     build_notes = if ($Signed) { 'Authenticode signed release build' } else { 'UNSIGNED DEVELOPMENT BUILD - not for public distribution' }
     executable = [ordered]@{
