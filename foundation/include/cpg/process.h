@@ -71,8 +71,11 @@ struct ProcessResult {
 // Bounded, cancellable execution of a Guard-owned direct child. Program path
 // and arguments are passed separately (no cmd.exe, no shell, no PowerShell
 // wrapper); stdout/stderr are drained concurrently with per-stream limits;
-// the total budget is enforced end to end. TerminateProcess is ever only
-// applied to this child, never to a process tree.
+// setup and run share the request budget, post-exit drain is limited to 500 ms
+// within that budget, and cleanup is checked against a separate 3 s budget.
+// The caller remains busy until child and I/O threads actually settle, even
+// if an unresponsive OS exceeds the cleanup budget (HELPER_CLEANUP_FAILED).
+// TerminateProcess is only applied to this child, never to a process tree.
 ProcessResult runOwnedProcess(const ProcessRequest &request, const Cancellation &cancel);
 
 // Absolute path of the running executable (never inferred from argv[0]).

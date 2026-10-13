@@ -16,10 +16,15 @@
 #include "cpg/process.h"
 #include "cpg/text.h"
 #include "cpg/win_handle.h"
+#include "process_test_hooks.h"
 
 #include <windows.h>
 
 #include <cstdio>
+#include <array>
+#include <atomic>
+#include <barrier>
+#include <future>
 #include <filesystem>
 #include <string>
 #include <thread>
@@ -311,12 +316,8 @@ TEST_CASE("the owned child inherits only its standard handles")
     CHECK(result.exitCode == 0);
     CHECK(WaitForSingleObject(control, 0) == WAIT_TIMEOUT);
 
-    // Strict: an inheritable handle outside the runner's explicit std-handle
-    // list must not cross. Hosts whose CreateProcess hook strips
-    // PROC_THREAD_ATTRIBUTE_HANDLE_LIST leak every inheritable handle no
-    // matter what the caller does; there the effective barrier is that the
-    // runner duplicates the three std pipe ends as the only inheritable
-    // handles Guard ever holds. Detect that environment instead of failing.
+    // Every inheritable handle outside the explicit std-handle list must be
+    // excluded. A leak is a product failure, never an environmental waiver.
     SECURITY_ATTRIBUTES inheritable{sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE};
     HANDLE event = CreateEventW(&inheritable, TRUE, FALSE, nullptr);
     REQUIRE(event != nullptr);
@@ -325,11 +326,7 @@ TEST_CASE("the owned child inherits only its standard handles")
                          std::to_wstring(reinterpret_cast<std::uintptr_t>(event))};
     result = runOwnedProcess(request, {});
     CHECK(result.normalExit);
-    if (WaitForSingleObject(event, 0) == WAIT_OBJECT_0) {
-        MESSAGE("host CreateProcess ignores the handle-inheritance list; "
-                "no-other-inheritable-handles is the active barrier here");
-        return;
-    }
+    CHECK(WaitForSingleObject(event, 0) == WAIT_TIMEOUT);
     CHECK(result.exitCode == 0);
 }
 
@@ -338,18 +335,237 @@ TEST_CASE("a child that never reads stdin still honors the budget")
     ProcessRequest request = selfRequest({L"--foundation-never-read-stdin"});
     request.timeout = std::chrono::milliseconds(150);
     request.stdinBytes.assign(helperRequestLimit, 'x'); // beyond the pipe buffer
+    const auto start = std::chrono::steady_clock::now();
     CHECK(errorCode([&] { (void)runOwnedProcess(request, {}); }) == "HELPER_TIMEOUT");
+    CHECK(std::chrono::steady_clock::now() - start < std::chrono::seconds(3));
 }
 
-TEST_CASE("a fast-exiting flood is always caught by the output limit")
+TEST_CASE("reader verdicts published after child exit remain authoritative")
 {
-    for (int iteration = 0; iteration < 50; ++iteration) {
-        ProcessRequest request = selfRequest({L"--foundation-output-exit-fast"});
-        request.timeout = std::chrono::milliseconds(10000);
+    for (bool injectReadError : {false, true}) {
+        UniqueHandle publish(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+        REQUIRE(publish);
+        testing::ProcessHooks hooks;
+        hooks.afterRead = [&](bool stdoutStream, HANDLE child, DWORD &error) {
+            if (!stdoutStream) return;
+            if (WaitForSingleObject(child, 5000) != WAIT_OBJECT_0
+                || WaitForSingleObject(publish.get(), 5000) != WAIT_OBJECT_0) {
+                error = ERROR_TIMEOUT;
+                return;
+            }
+            if (injectReadError) error = ERROR_READ_FAULT;
+        };
+        hooks.beforeJoin = [&] { SetEvent(publish.get()); };
+        testing::ProcessHookScope scope(hooks);
+        ProcessRequest request = selfRequest({L"--foundation-small-output"});
+        request.timeout = std::chrono::milliseconds(5000);
         request.stdoutLimit = 1024;
-        INFO("iteration " << iteration);
-        CHECK(errorCode([&] { (void)runOwnedProcess(request, {}); }) == "HELPER_OUTPUT_LIMIT");
+        CHECK(errorCode([&] { (void)runOwnedProcess(request, {}); })
+              == (injectReadError ? "HELPER_IO_FAILED" : "HELPER_OUTPUT_LIMIT"));
     }
+}
+
+TEST_CASE("stdin partial writes complete and zero progress is an I/O failure")
+{
+    ProcessRequest request = selfRequest({L"--foundation-echo"});
+    request.stdinBytes = "all request bytes must arrive";
+    request.timeout = std::chrono::seconds(5);
+    testing::ProcessHooks hooks;
+    testing::ProcessHookScope scope(hooks);
+    hooks.write = [](HANDLE pipe, const void *bytes, DWORD size, DWORD *written) {
+        return WriteFile(pipe, bytes, std::min<DWORD>(size, 3), written, nullptr);
+    };
+    const auto result = runOwnedProcess(request, {});
+    CHECK(result.submitted);
+    CHECK(result.out.find(request.stdinBytes) != std::string::npos);
+    hooks.write = [](HANDLE, const void *, DWORD, DWORD *written) {
+        *written = 0;
+        SetLastError(ERROR_SUCCESS); // no stale last-error may turn this into success
+        return TRUE;
+    };
+    CHECK(errorCode([&] { (void)runOwnedProcess(request, {}); }) == "HELPER_IO_FAILED");
+}
+
+TEST_CASE("post-spawn setup failures reap the direct child and started threads")
+{
+    // Fail before any thread and at each subsequent thread construction.
+    for (int failurePoint = -1; failurePoint < 3; ++failurePoint) {
+        UniqueHandle observedChild;
+        testing::ProcessHooks hooks;
+        hooks.afterCreate = [&](HANDLE child) {
+            HANDLE duplicate = nullptr;
+            if (!DuplicateHandle(GetCurrentProcess(), child, GetCurrentProcess(), &duplicate,
+                                 SYNCHRONIZE, FALSE, 0)) throw std::runtime_error("duplicate");
+            observedChild.reset(duplicate);
+            if (failurePoint == -1) throw std::bad_alloc();
+        };
+        hooks.beforeThread = [&](unsigned index) {
+            if (static_cast<int>(index) == failurePoint) throw std::runtime_error("thread setup");
+        };
+        testing::ProcessHookScope scope(hooks);
+        ProcessRequest request = selfRequest({L"--foundation-sleep"});
+        request.stdinBytes = "test request";
+        request.timeout = std::chrono::seconds(5);
+        const auto started = std::chrono::steady_clock::now();
+        CHECK(errorCode([&] { (void)runOwnedProcess(request, {}); }) == "HELPER_IO_FAILED");
+        REQUIRE(observedChild);
+        CHECK(WaitForSingleObject(observedChild.get(), 0) == WAIT_OBJECT_0);
+        CHECK(std::chrono::steady_clock::now() - started < std::chrono::seconds(3));
+    }
+}
+
+TEST_CASE("cancellation is checked before spawn and before submission")
+{
+    for (bool beforeSpawn : {true, false}) {
+        Cancellation cancellation;
+        bool spawned = false;
+        bool written = false;
+        testing::ProcessHooks hooks;
+        hooks.beforeCreate = [&] { if (beforeSpawn) cancellation.cancel(); };
+        hooks.afterCreate = [&](HANDLE) { spawned = true; };
+        hooks.beforeThread = [&](unsigned index) { if (index == 1) cancellation.cancel(); };
+        hooks.write = [&](HANDLE, const void *, DWORD, DWORD *) { written = true; return FALSE; };
+        testing::ProcessHookScope scope(hooks);
+        ProcessRequest request = selfRequest({L"--foundation-sleep"});
+        request.stdinBytes = "activation request";
+        request.activationSubmission = true;
+        request.timeout = std::chrono::seconds(5);
+        CHECK(errorCode([&] { (void)runOwnedProcess(request, cancellation); }) == "LAUNCH_CANCELLED");
+        CHECK(spawned == !beforeSpawn);
+        CHECK_FALSE(written);
+    }
+}
+
+TEST_CASE("submission is decided after a final write racing cancellation settles")
+{
+    Cancellation cancellation;
+    UniqueHandle settling(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+    REQUIRE(settling);
+    testing::ProcessHooks hooks;
+    hooks.afterWrite = [&] {
+        cancellation.cancel();
+        if (WaitForSingleObject(settling.get(), 5000) != WAIT_OBJECT_0)
+            throw std::runtime_error("owner did not settle");
+    };
+    hooks.beforeJoin = [&] { SetEvent(settling.get()); };
+    testing::ProcessHookScope scope(hooks);
+    ProcessRequest request = selfRequest({L"--foundation-sleep"});
+    request.stdinBytes = "complete activation request";
+    request.activationSubmission = true;
+    request.timeout = std::chrono::seconds(5);
+    CHECK(errorCode([&] { (void)runOwnedProcess(request, cancellation); })
+          == "APPX_ACTIVATION_OUTCOME_UNKNOWN");
+}
+
+TEST_CASE("post-spawn setup consumes the budget before request submission")
+{
+    bool written = false;
+    testing::ProcessHooks hooks;
+    hooks.afterCreate = [](HANDLE) { Sleep(120); };
+    hooks.write = [&](HANDLE, const void *, DWORD, DWORD *) { written = true; return FALSE; };
+    testing::ProcessHookScope scope(hooks);
+    ProcessRequest request = selfRequest({L"--foundation-sleep"});
+    request.stdinBytes = "activation request";
+    request.activationSubmission = true;
+    request.timeout = std::chrono::milliseconds(80);
+    CHECK(errorCode([&] { (void)runOwnedProcess(request, {}); }) == "HELPER_TIMEOUT");
+    CHECK_FALSE(written);
+}
+
+TEST_CASE("late cancellation retains a fully collected completion receipt")
+{
+    Cancellation cancellation;
+    testing::ProcessHooks hooks;
+    hooks.beforeVerdict = [&] { cancellation.cancel(); };
+    testing::ProcessHookScope scope(hooks);
+    ProcessRequest request = selfRequest({L"--foundation-echo"});
+    request.stdinBytes = "valid receipt payload";
+    request.activationSubmission = true;
+    request.timeout = std::chrono::seconds(5);
+    const auto result = runOwnedProcess(request, cancellation);
+    CHECK(result.submitted);
+    CHECK(result.exitCode == 0);
+    CHECK(result.out.find(request.stdinBytes) != std::string::npos);
+}
+
+TEST_CASE("concurrent runners do not inherit each others standard endpoints")
+{
+    std::barrier sync(2);
+    const auto name = L"Local\\CPG-foundation-concurrent-" + std::to_wstring(GetCurrentProcessId());
+    UniqueHandle release(CreateEventW(nullptr, TRUE, FALSE, name.c_str()));
+    REQUIRE(release);
+    const auto invoke = [&](bool slow) {
+        testing::ProcessHooks hooks;
+        hooks.beforeCreate = [&] { sync.arrive_and_wait(); };
+        // Retain all inheritable duplicates until BOTH children exist.
+        hooks.afterCreate = [&](HANDLE) { sync.arrive_and_wait(); };
+        testing::ProcessHookScope scope(hooks);
+        ProcessRequest request = selfRequest(slow
+            ? std::vector<std::wstring>{L"--foundation-wait-event", name}
+            : std::vector<std::wstring>{L"--foundation-small-output"});
+        request.timeout = std::chrono::seconds(5);
+        return runOwnedProcess(request, {});
+    };
+    auto slow = std::async(std::launch::async, [&] { return invoke(true); });
+    struct SignalOnExit { HANDLE event; ~SignalOnExit() { SetEvent(event); } } signal{release.get()};
+    const auto quick = invoke(false);
+    CHECK(quick.exitCode == 0);
+    CHECK(quick.out == std::string(2048, 'x'));
+    CHECK(slow.wait_for(std::chrono::milliseconds(0)) == std::future_status::timeout);
+    SetEvent(release.get());
+    CHECK(slow.get().out.empty());
+}
+
+TEST_CASE("stderr-only output is independently bounded")
+{
+    ProcessRequest request = selfRequest({L"--foundation-stderr-output"});
+    request.timeout = std::chrono::seconds(5);
+    request.stderrLimit = 1024;
+    CHECK(errorCode([&] { (void)runOwnedProcess(request, {}); }) == "HELPER_OUTPUT_LIMIT");
+}
+
+TEST_CASE("a descendant retaining output is not terminated and drain is bounded")
+{
+    const auto suffix = std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64());
+    const auto aliveName = L"Local\\CPG-foundation-alive-" + suffix;
+    const auto doneName = L"Local\\CPG-foundation-done-" + suffix;
+    UniqueHandle alive(CreateEventW(nullptr, TRUE, FALSE, aliveName.c_str()));
+    UniqueHandle done(CreateEventW(nullptr, TRUE, FALSE, doneName.c_str()));
+    REQUIRE(alive);
+    REQUIRE(done);
+    ProcessRequest request = selfRequest({L"--foundation-spawn-descendant", aliveName, doneName});
+    request.timeout = std::chrono::seconds(5);
+    const auto start = std::chrono::steady_clock::now();
+    CHECK(errorCode([&] { (void)runOwnedProcess(request, {}); }) == "HELPER_DRAIN_TIMEOUT");
+    CHECK(std::chrono::steady_clock::now() - start < std::chrono::seconds(3));
+    CHECK(WaitForSingleObject(alive.get(), 0) == WAIT_OBJECT_0);
+    CHECK(WaitForSingleObject(done.get(), 0) == WAIT_TIMEOUT);
+    CHECK(WaitForSingleObject(done.get(), 5000) == WAIT_OBJECT_0);
+}
+
+TEST_CASE("current environment excludes drive state and removes all proxy case variants")
+{
+    // The custom block is intentionally not made by UnicodeEnvironment: it
+    // exercises import of valid Windows drive state and duplicate raw entries.
+    const wchar_t raw[] = L"=C:=C:\\fixture\0HTTP_PROXY=a\0http_proxy=b\0Z_VAR=z\0";
+    std::wstring command = L"\"" + currentExecutablePath().wstring() + L"\" --foundation-check-environment";
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION info{};
+    REQUIRE(CreateProcessW(currentExecutablePath().c_str(), command.data(), nullptr, nullptr,
+                           FALSE, CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
+                           const_cast<wchar_t *>(raw), nullptr, &startup, &info));
+    UniqueHandle process(info.hProcess), thread(info.hThread);
+    REQUIRE(WaitForSingleObject(process.get(), 5000) == WAIT_OBJECT_0);
+    DWORD exit = 99;
+    REQUIRE(GetExitCodeProcess(process.get(), &exit));
+    CHECK(exit == 0);
+    UnicodeEnvironment environment;
+    environment.set(L"\u00e9_proxy", L"value");
+    CHECK(environment.value(L"\u00c9_PROXY") == L"value");
+    environment.remove(L"\u00c9_PROXY");
+    CHECK_FALSE(environment.has(L"\u00e9_proxy"));
+    CHECK_THROWS_AS(environment.set(L"", L"invalid"), Error);
 }
 
 TEST_CASE("environment blocks are ordered for CreateProcess")
@@ -384,6 +600,49 @@ int main(int argc, char **argv)
     for (int index = 1; index < argc; ++index) {
         const std::string argument = argv[index];
         if (argument == "--foundation-sleep") { Sleep(10000); return 0; }
+        if (argument == "--foundation-wait-event" && index + 1 < argc) {
+            UniqueHandle event(OpenEventW(SYNCHRONIZE, FALSE, utf8ToWide(argv[index + 1]).c_str()));
+            return event && WaitForSingleObject(event.get(), 5000) == WAIT_OBJECT_0 ? 0 : 16;
+        }
+        if (argument == "--foundation-check-environment") {
+            auto env = UnicodeEnvironment::current();
+            if (env.has(L"")) return 10;
+            env.remove(L"HtTp_PrOxY");
+            if (env.has(L"HTTP_PROXY")) return 11;
+            const auto &block = env.block();
+            for (const wchar_t *entry = block.data(); *entry; entry += wcslen(entry) + 1)
+                if (*entry == L'=' || std::wstring_view(entry).find(L"PROXY") != std::wstring::npos
+                    || std::wstring_view(entry).find(L"proxy") != std::wstring::npos) return 12;
+            return 0;
+        }
+        if (argument == "--foundation-spawn-descendant" && index + 2 < argc) {
+            const auto alive = utf8ToWide(argv[index + 1]);
+            const auto done = utf8ToWide(argv[index + 2]);
+            std::wstring command = L"\"" + currentExecutablePath().wstring()
+                + L"\" --foundation-descendant " + alive + L" " + done;
+            STARTUPINFOW startup{};
+            startup.cb = sizeof(startup);
+            startup.dwFlags = STARTF_USESTDHANDLES;
+            startup.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+            startup.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+            startup.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+            PROCESS_INFORMATION info{};
+            if (!CreateProcessW(currentExecutablePath().c_str(), command.data(), nullptr, nullptr,
+                                TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &startup, &info)) return 13;
+            CloseHandle(info.hProcess);
+            CloseHandle(info.hThread);
+            UniqueHandle ready(OpenEventW(SYNCHRONIZE, FALSE, alive.c_str()));
+            return ready && WaitForSingleObject(ready.get(), 5000) == WAIT_OBJECT_0 ? 0 : 14;
+        }
+        if (argument == "--foundation-descendant" && index + 2 < argc) {
+            UniqueHandle alive(OpenEventW(EVENT_MODIFY_STATE, FALSE, utf8ToWide(argv[index + 1]).c_str()));
+            UniqueHandle done(OpenEventW(EVENT_MODIFY_STATE, FALSE, utf8ToWide(argv[index + 2]).c_str()));
+            if (!alive || !done) return 15;
+            SetEvent(alive.get());
+            Sleep(1800);
+            SetEvent(done.get());
+            return 0;
+        }
         if (argument == "--foundation-output") {
             std::string flood(65536, 'x');
             fwrite(flood.data(), 1, flood.size(), stdout);
@@ -404,13 +663,12 @@ int main(int argc, char **argv)
             return 0;
         }
         if (argument == "--foundation-never-read-stdin") { Sleep(10000); return 0; }
-        if (argument == "--foundation-output-exit-fast") {
-            // Flood past any realistic stdout limit and exit immediately: the
-            // parent must still catch the overflow after reaping the readers.
-            std::string flood(128 * 1024, 'x');
-            fwrite(flood.data(), 1, flood.size(), stdout);
-            fflush(stdout);
-            return 0;
+        if (argument == "--foundation-small-output" || argument == "--foundation-stderr-output") {
+            const std::string output(2048, 'x');
+            DWORD written = 0;
+            return WriteFile(GetStdHandle(argument == "--foundation-small-output"
+                                              ? STD_OUTPUT_HANDLE : STD_ERROR_HANDLE), output.data(),
+                             static_cast<DWORD>(output.size()), &written, nullptr) ? 0 : 9;
         }
         if (argument == "--foundation-probe-handle" && index + 1 < argc) {
             // Exit codes: 0 = the probed handle value is not valid here (not
