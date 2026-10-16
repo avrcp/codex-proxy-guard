@@ -16,6 +16,11 @@ dependencies = [
 [[package]]
 name = "cpg-engine"
 version = "0.8.0-rc.1"
+dependencies = [
+ "cpg-domain",
+ "cpg-windows",
+ "windows",
+]
 
 [[package]]
 name = "cpg-tui"

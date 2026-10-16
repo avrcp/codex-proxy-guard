@@ -297,6 +297,18 @@ impl cpg_domain::discovery::FsProbe for NativeFsProbe {
     }
 }
 
+/// The per-user temp directory (`GetTempPathW`).
+pub fn temp_path() -> Result<PathBuf> {
+    // SAFETY: sizing call into the local buffer.
+    let mut buffer = vec![0u16; 261];
+    let size = unsafe { windows::Win32::Storage::FileSystem::GetTempPathW(Some(&mut buffer)) };
+    if size == 0 || size as usize >= buffer.len() {
+        return Err(Error::new("LAUNCH_BUSY", "Another Guard instance is launching, or the startup lock is unavailable."));
+    }
+    buffer.truncate(size as usize);
+    Ok(PathBuf::from(String::from_utf16_lossy(&buffer)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
