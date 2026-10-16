@@ -1,0 +1,17 @@
+version = 2
+
+[codex]
+cli_executable_override = ''
+executable_override = ''
+manage_codex_proxy_env = true
+proxy_env_home = "C:\\Users\\O'Brien\\.codex"
+refuse_if_running = true
+
+[proxy]
+host = 'localhost'
+no_proxy = [ 'localhost' ]
+port = 8080
+scheme = 'http'
+
+[tui]
+alternate_screen = 'auto'

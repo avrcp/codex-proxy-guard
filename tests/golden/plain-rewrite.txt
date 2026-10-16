@@ -1,0 +1,9 @@
+Codex Proxy Guard 0.7.0-rc.4 - local proxy launcher
+Proxy: http://localhost:8080 | Process: running | Coverage: not_authorized
+[L] Launch  [E] Edit proxy  [B] Backend authorization  [D] Repair launch  [R] Refresh  [Q] Quit
+Loopback HTTP/Mixed host [localhost] (Enter keeps draft):
+Port [8080] (Enter keeps draft):
+Proxy saved.
+Proxy: http://localhost:8080 | Process: running | Coverage: not_authorized
+[L] Launch  [E] Edit proxy  [B] Backend authorization  [D] Repair launch  [R] Refresh  [Q] Quit
+Proxy saved.

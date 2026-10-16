@@ -1,0 +1,22 @@
+Usage: CodexProxyGuard [options] [command]
+Launch Desktop through a loopback HTTP/Mixed proxy.
+
+Options:
+  -h, -?, --help      Displays help on commandline options.
+  -v, --version       Displays version information.
+  --config <path>     Guard configuration file.
+
+Commands:
+  launch                   Launch Desktop
+    --json                   Print launch receipt as JSON
+    --refresh-codex-daemon   Single-use authorization to stop the shared daemon
+    --activation-only        Registered activation diagnostic
+  init-config              Write the default configuration
+    --force                  Replace the Guard configuration
+    --proxy-host <host>      Loopback proxy host
+    --proxy-port <port>      Proxy port
+  config-path              Print the effective configuration path
+  build-info               Print embedded build provenance
+  licenses                 Stream the embedded offline notices
+  console                  Interactive console (--plain for line mode)
+  internal-activate-package  Activation worker (internal)
