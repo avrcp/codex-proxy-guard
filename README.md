@@ -75,3 +75,12 @@ Guard 的块由 `# BEGIN CODEX PROXY GUARD: proxy-v1` 和对应 END 标记界定
 详见[架构](docs/ARCHITECTURE.md)、[安全边界](docs/SECURITY.md)、[TUI 验收](docs/TUI_ACCEPTANCE.md)、[发布就绪状态](docs/RELEASE_READINESS.md)、[迁移记录](docs/CPP_TUI_MIGRATION_PLAN.md)与[第三方许可](THIRD_PARTY_NOTICES.md)。
 
 `.env` 写入与撤销要求本地 NTFS 事务可用；不支持时保留授权并拒绝修改，无非事务回退。
+
+## Rust track (0.8.0-rc.1)
+
+A full Rust + Ratatui rewrite of the product lives alongside the C++
+implementation on branch `refactor/rust-ratatui-single-exe`; see
+[docs/RUST_TRACK.md](docs/RUST_TRACK.md) and the acceptance record in
+[docs/RUST_TUI_MIGRATION_ACCEPTANCE.md](docs/RUST_TUI_MIGRATION_ACCEPTANCE.md).
+The C++ build remains the product of record until the Rust build passes
+the human real-machine acceptance matrix.
