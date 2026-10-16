@@ -21,13 +21,18 @@ cpg-tui = { path = "crates/cpg-tui" }
 toml = "0.9"
 windows = { version = "0.62", features = [
     "Win32_Foundation",
+    "Win32_Globalization",
     "Win32_Security",
     "Win32_Storage_FileSystem",
+    "Win32_Storage_Packaging_Appx",
     "Win32_System_Com",
     "Win32_System_Console",
-    "Win32_System_Threading",
+    "Win32_System_DataExchange",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_LibraryLoader",
     "Win32_System_SystemInformation",
     "Win32_System_SystemServices",
+    "Win32_System_Threading",
     "Win32_UI_Shell",
 ] }
 ratatui = "0.30"
