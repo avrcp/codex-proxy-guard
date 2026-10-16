@@ -1,0 +1,125 @@
+# Rust + Ratatui Migration Acceptance
+
+Honest acceptance record for the C++ → Rust rewrite on branch
+`refactor/rust-ratatui-single-exe`. Every row states what actually ran on
+this machine; nothing is marked PASS by inference.
+
+```text
+Repository: avrcp/codex-proxy-guard
+Source HEAD (baseline): 0bdf2ed586a9f12f99ff411bd437841fcd6f5433 (C++ 0.7.0-rc.4)
+Rust branch HEAD: 15108c2 (see git log for the exact final SHA)
+Version: 0.8.0-rc.1
+Rust toolchain: rustc 1.96.0 (ac68faa20 2026-05-25), x86_64-pc-windows-msvc
+Windows: Windows 11 x64 (build 26300), non-elevated user session
+```
+
+## Deliverable layout
+
+- `crates/cpg-domain` — pure contracts: config v2 parse/serialize (byte-exact
+  toml++ canonical form), strict JSON (depth 64, escape-decoded duplicate-key
+  rejection), `publicText` redaction scanner, InetPton-parity loopback
+  validation, dotenv managed-block lexical gate and splice logic, AppModel
+  discovery selection rules, activation-worker protocol validation.
+- `crates/cpg-windows` — the single auditable Win32 boundary: owned handles,
+  event cancellation, ordinal-sorted environment blocks, canonical paths,
+  the bounded owned-process runner, TxF, console control, elevation,
+  Toolhelp process state, clipboard, AppModel discovery + activation COM.
+- `crates/cpg-engine` — config transactions/lease, consent + TxF `.env`
+  prepare/revoke, the launch pipeline, and the `EngineSession` state machine.
+- `crates/cpg-tui` — Ratatui console (modals, guard, plain fallback) and the
+  plain line console.
+- `app` — `CodexProxyGuard.exe` single Console binary: strict CLI
+  (byte-identical `--help` to the C++ golden), activation worker
+  subcommand, embedded build info and offline license stream.
+
+## Stage gates
+
+| Stage | State | Evidence |
+|---|---|---|
+| 0 baseline freeze | PASS | `docs/RUST_MIGRATION_BASELINE.md`, `tests/golden/*` captured from C++ `0bdf2ed` build; commit `eeb7774` |
+| 1 domain | PASS | 47 unit tests incl. byte-exact config roundtrips vs. frozen goldens; `cargo clippy -D warnings` clean |
+| 2 windows adapter | PASS | 25 tests on the real machine: native package discovery read-only, TxF commit/rollback, owned-process timeout/cancel/output-limit, environment blocks, paths, elevation |
+| 3 config + consent | PASS | 5 config-store tests: TxF rollback/commit, race refusal (CONFLICT/IO only, never torn), consent guard, revoke splice |
+| 4 engine + CLI + worker | PASS | 13 session tests (busy gate, single-use tokens, exactly-once daemon stop after prepare, normal launch zero daemon side effects, timeout gate held until reap, receipts preserved) + 4 CLI tests; `launch --json` on a fresh config correctly returns `CODEX_ALREADY_RUNNING` through real native discovery |
+| 5 TUI | PARTIAL | Ratatui event loop + all modals implemented and compiling; plain console smoke-tested end-to-end (refresh, proxy edit persisted, quit). Automated snapshot matrix (U16) NOT_RUN — needs a virtual-terminal harness; real-terminal interaction (A01–A03 class) NOT_RUN |
+| 6 packaging | PASS (unsigned dev) | `scripts/build-portable-rust.ps1 -AllowUnsignedDev` produced an immutable release directory from a clean tree via git-archive pinned source, `cargo build --release --locked` with static CRT + `/CETCOMPAT /guard:cf /DYNAMICBASE /NXCOMPAT /HIGHENTROPYVA` + CFG codegen; see "PE evidence" below |
+| 7 real-machine acceptance + C++ retirement | NOT_RUN / deliberately deferred | A01–A14 require a human operator; C++ sources retained until that matrix passes (per the migration manual) |
+
+## Automation matrix (U01–U20 mapping)
+
+| ID | State | Evidence |
+|---|---|---|
+| U01 config | PASS | domain config tests: unknown keys, wrong types, >64 KiB, invalid values + golden roundtrips |
+| U02 proxy | PASS | domain proxy tests: localhost/127-8/::1/IPv6 brackets/remote refusal/ASCII ports |
+| U03 CLI | PASS | app cli tests + live parity probes: duplicate options, mutual exclusion, `--`, unknown command, CJK/relative `--config` paths |
+| U04 strict JSON | PASS | domain json tests: nested/escape-decoded duplicates, depth 64/65, trailing data, BOM, bad escapes |
+| U05 redaction | PASS | domain text tests: URI credentials, USERPROFILE (both slash forms), ANSI/OSC, secret lines, control/format filtering |
+| U06 paths | PASS | cpg-windows paths tests: `\\?\` prefixes, cleanPath forms, containment, canonical files |
+| U07 AppModel discovery | PASS | cpg-windows appmodel test reads the real installed package envelopes read-only; domain discovery tests cover trust rules, `..`/absolute/drive refusal, override resolution |
+| U08 worker protocol | PASS | domain worker tests: request validation (AUMID shape, printable args, sizes), receipt shape + contradictory-fact rejection |
+| U09 owned process | PASS | cpg-windows process tests: concurrent drains, stdin round-trip, HELPER_TIMEOUT/LAUNCH_CANCELLED/HELPER_OUTPUT_LIMIT |
+| U10 environment | PASS | ordinal sort, case-variant collapse, `=C:` exclusion, double-NUL |
+| U11 consent | PASS | engine session tests: single-use token, revision binding, stale-token CONFIG_CHANGED, enable/revoke through real files |
+| U12 dotenv | PASS | domain dotenv tests: lexical gate (line-exact refusal), marker-in-quoted-value, conflicts incl. `export ALL_PROXY=`, splice CRLF preservation |
+| U13 TxF | PASS | cpg-windows txf tests (rollback restores, commit persists, missing→conflict) + engine race test |
+| U14 session | PASS | engine session tests: double-Enter SESSION_BUSY, timeout → gate held → late receipt facts preserved, one refresh after launch |
+| U15 launch ordering | PASS | engine session tests: normal launch stop_calls==0; repair prepare_calls==1 before stop_calls==1; production `launch --json` refused a running Desktop |
+| U16 TUI snapshots | NOT_RUN | rendering exists; snapshot matrix not yet built |
+| U17 terminal restore | PARTIAL | mode-guard round-trip test PASS on attached console; Ctrl+C/close/WM_CLOSE signal paths implemented but real-terminal event tests NOT_RUN |
+| U18 clipboard | PARTIAL | CF_UNICODETEXT copy implemented + non-fatal failure path; manual Notepad verification (A12) NOT_RUN |
+| U19 release | PASS (unsigned) | release script + artifact below; import-table scan PASS (see PE evidence); signature state = UNSIGNED DEVELOPMENT BUILD |
+| U20 authorization scope | PASS | engine tests: consent enable/revoke, pre-bound Home flow, refused launch consumes proposal |
+
+## PE evidence (release binary)
+
+Produced by `scripts/build-portable-rust.ps1 -AllowUnsignedDev`:
+
+```text
+Artifact:   dist/releases/CodexProxyGuard-0.8.0-rc.1-rust-<sha>/CodexProxyGuard.exe
+Size:       ~3.6 MiB (static CRT; no side-by-side DLLs)
+Mitigations: CFG (rustc control-flow-guard=checks + /guard:cf),
+             CET (/CETCOMPAT), ASLR (/DYNAMICBASE + /HIGHENTROPYVA),
+             DEP (/NXCOMPAT) — link flags in .cargo/config.toml, verified in
+             the link command line of the release log
+Import scan: third-party DLL imports are system DLLs only (ktmw32,
+             kernel32 and the standard MSVC static-CRT set); no packers,
+             no runtime extraction
+Signature:  UNSIGNED DEVELOPMENT BUILD → public_release_ready: BLOCKED
+```
+
+The packaged C++ verifier (`scripts/verify-package.py --schema
+static-single`) still targets the CMake artifact schema; wiring it to the
+Rust manifest (notices list, build-info fields) is follow-up work recorded
+here rather than claimed.
+
+## Manual acceptance (A01–A14): NOT_RUN (all)
+
+No interactive real-machine session was performed in this migration run:
+the operator must execute A01–A14 against the produced EXE. Automated tests
+never launched, stopped, or modified the real Desktop/daemon/Home beyond
+read-only AppModel enumeration; `launch --json` invocations during parity
+probes were refused by the running-process gate before any activation.
+
+## Known deviations from the C++ (intentional, reviewed)
+
+1. `build-info` `language` is `Rust` (the one sanctioned schema change).
+2. `licenses` lists the Rust dependency notice set (ratatui, crossterm,
+   toml, windows-rs, project license) instead of the C++ set.
+3. The settle path does not call `CancelSynchronousIo` on reader threads
+   (Rust threads do not expose handles); unblocking relies on pipe closure
+   after terminating the owned child, inside the same 3 s settle budget.
+4. TUI line editor is character-based (no grapheme-cluster cursor moves);
+   host/port fields are ASCII-validated by the engine anyway.
+5. `Event::Poll` uses a 20 ms crossterm poll slice instead of a blocking
+   Win32 wait; busy/timeout semantics are driven by the same session
+   budgets.
+
+## Remaining risks / next steps
+
+- Build the TUI snapshot matrix (U16) and run A01–A14 with a human
+  operator; record evidence per row.
+- Extend `scripts/verify-package.py` to the Rust manifest so the packaged
+  artifact gets the same WinVerifyTrust/CET/CFG machine gate the C++
+  releases had.
+- Retirement of the C++ sources only after the real-machine matrix passes
+  (tracked tag for the C++ product remains `main@0bdf2ed`).
