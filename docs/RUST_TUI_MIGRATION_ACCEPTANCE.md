@@ -75,22 +75,38 @@ Windows: Windows 11 x64 (build 26300), non-elevated user session
 Produced by `scripts/build-portable-rust.ps1 -AllowUnsignedDev`:
 
 ```text
-Artifact:   dist/releases/CodexProxyGuard-0.8.0-rc.1-rust-<sha>/CodexProxyGuard.exe
-Size:       ~3.6 MiB (static CRT; no side-by-side DLLs)
-Mitigations: CFG (rustc control-flow-guard=checks + /guard:cf),
-             CET (/CETCOMPAT), ASLR (/DYNAMICBASE + /HIGHENTROPYVA),
-             DEP (/NXCOMPAT) — link flags in .cargo/config.toml, verified in
-             the link command line of the release log
-Import scan: third-party DLL imports are system DLLs only (ktmw32,
-             kernel32 and the standard MSVC static-CRT set); no packers,
-             no runtime extraction
-Signature:  UNSIGNED DEVELOPMENT BUILD → public_release_ready: BLOCKED
+Artifact:   dist/releases/CodexProxyGuard-0.8.0-rc.1-rust-fc3eaf62/CodexProxyGuard.exe
+Size:       1,196,544 bytes (static CRT; no side-by-side DLLs)
+SHA256:     43B913AF82896AA2FE7105413E86C2FD2154054AC5D68DB6CB5D0720E5E6DE4F
+Provenance: {"commit":"466fd81e7a85e574ee81ea73c515b0a24c61c9b0","dirty":false,"language":"Rust","version":"0.8.0-rc.1"}
 ```
 
-The packaged C++ verifier (`scripts/verify-package.py --schema
-static-single`) still targets the CMake artifact schema; wiring it to the
-Rust manifest (notices list, build-info fields) is follow-up work recorded
-here rather than claimed.
+PE evidence — every gate re-checked with the production verifier's own
+`pe_mitigations` / `pe_imports` implementation from
+`scripts/verify-package.py` (the CET check reads the type-20 extended DLL
+characteristics record exactly as fixed in C++ a02b7f7):
+
+```text
+dynamic_base:             True
+high_entropy_va:          True
+nx_compat:                True
+guard_cf:                 True   (0x4000 DllCharacteristics + link /guard:cf)
+cet_compat:               True   (EX_DLLCHARACTERISTICS type-20 record bit 0x1)
+cf_instrumented:          True   (rustc -C control-flow-guard=checks; GuardFlags 0x100)
+cf_function_table_present:True
+imports: ADVAPI32, api-ms-win-core-synch, BCRYPTPRIMITIVES, COMBASE,
+         KERNEL32, KTMW32, NTDLL, OLE32, OLEAUT32, SHELL32, SHLWAPI,
+         USER32 — system DLLs only; no packers, no runtime extraction
+Signature: UNSIGNED DEVELOPMENT BUILD → public_release_ready: BLOCKED
+```
+
+The packaged-C++ verifier's zip/manifest schema (`--schema static-single`)
+still targets the CMake artifact layout; wiring it to the Rust release
+directory layout is follow-up work recorded here rather than claimed.
+An earlier release attempt (`...-rust-466fd81e`) was superseded because a
+RUSTFLAGS environment override silently dropped the config-file hardening
+flags; commit fc3eaf6 fixes the script and the hardened rebuild above is
+the current artifact.
 
 ## Manual acceptance (A01–A14): NOT_RUN (all)
 
