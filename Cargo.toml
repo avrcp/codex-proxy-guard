@@ -1,0 +1,40 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/cpg-domain",
+    "crates/cpg-windows",
+    "crates/cpg-engine",
+    "crates/cpg-tui",
+    "app",
+]
+
+[workspace.package]
+version = "0.8.0-rc.1"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+cpg-domain = { path = "crates/cpg-domain" }
+cpg-windows = { path = "crates/cpg-windows" }
+cpg-engine = { path = "crates/cpg-engine" }
+cpg-tui = { path = "crates/cpg-tui" }
+toml = "0.9"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_Console",
+    "Win32_System_Threading",
+    "Win32_System_SystemInformation",
+    "Win32_System_SystemServices",
+    "Win32_UI_Shell",
+] }
+ratatui = "0.30"
+crossterm = "0.29"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = "s"
+panic = "unwind"

@@ -1,0 +1,13 @@
+# Windows MSVC hardening for every Rust build of CodexProxyGuard.
+# - CET shadow stacks and CFG-aware linker instrumentation mirror the C++
+#   release gates; the packaged verifier re-checks the actual PE evidence.
+# - The release packaging script adds `-C target-feature=+crt-static` on top.
+[target.x86_64-pc-windows-msvc]
+rustflags = [
+    "-C", "control-flow-guard=checks",
+    "-C", "link-arg=/CETCOMPAT",
+    "-C", "link-arg=/guard:cf",
+    "-C", "link-arg=/DYNAMICBASE",
+    "-C", "link-arg=/NXCOMPAT",
+    "-C", "link-arg=/HIGHENTROPYVA",
+]
