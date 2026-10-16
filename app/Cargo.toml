@@ -9,3 +9,7 @@ name = "CodexProxyGuard"
 path = "src/main.rs"
 
 [dependencies]
+cpg-domain = { workspace = true }
+cpg-engine = { workspace = true }
+cpg-tui = { workspace = true }
+cpg-windows = { workspace = true }

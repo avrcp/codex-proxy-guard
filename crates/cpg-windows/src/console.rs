@@ -160,6 +160,41 @@ pub fn signal_count() -> u32 {
     COUNT.load(Ordering::SeqCst)
 }
 
+/// Runs one cancellable console operation: the owner thread translates
+/// console signals into cancellation while the operation runs on a worker
+/// thread; the scope settles before returning (port of `runConsoleOperation`).
+pub fn run_console_operation<T, F>(operation: F) -> T
+where
+    T: Send + 'static,
+    F: FnOnce(&Cancellation) -> T + Send + 'static,
+{
+    let scope = ConsoleControlScope::new();
+    let cancel = scope.cancellation().clone();
+    let worker_cancel = cancel.clone();
+    let worker = std::thread::spawn(move || operation(&worker_cancel));
+    loop {
+        if scope.take_cancel() || scope.take_close() {
+            cancel.cancel();
+        }
+        if worker.is_finished() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    worker.join().expect("console operation worker")
+}
+
+/// True when standard input is a pipe or disk file (worker framing guard).
+pub fn stdin_is_pipe_or_disk() -> bool {
+    use windows::Win32::Storage::FileSystem::{FILE_TYPE_DISK, FILE_TYPE_PIPE, GetFileType};
+    // SAFETY: standard handle query and type probe only.
+    unsafe {
+        let handle = GetStdHandle(STD_INPUT_HANDLE).unwrap_or_default();
+        let kind = GetFileType(handle);
+        kind == FILE_TYPE_PIPE || kind == FILE_TYPE_DISK
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

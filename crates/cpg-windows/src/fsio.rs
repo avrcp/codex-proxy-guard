@@ -69,7 +69,12 @@ pub fn create_file(
     disposition: windows::Win32::Storage::FileSystem::FILE_CREATION_DISPOSITION,
 ) -> Result<OwnedHandle> {
     use windows::core::PCWSTR;
-    let wide: Vec<u16> = path.as_os_str().to_string_lossy().encode_utf16().chain([0]).collect();
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .to_string_lossy()
+        .encode_utf16()
+        .chain([0])
+        .collect();
     // SAFETY: null-terminated path; the returned handle is owned.
     let handle = unsafe {
         windows::Win32::Storage::FileSystem::CreateFileW(
@@ -82,17 +87,26 @@ pub fn create_file(
             None,
         )
     };
-    OwnedHandle::new(handle.unwrap_or(windows::Win32::Foundation::HANDLE::default()))
-        .ok_or_else(|| Error::new("CONFIG_LOCK_FAILED", "Configuration is busy, missing, or not writable."))
+    OwnedHandle::new(handle.unwrap_or(windows::Win32::Foundation::HANDLE::default())).ok_or_else(
+        || {
+            Error::new(
+                "CONFIG_LOCK_FAILED",
+                "Configuration is busy, missing, or not writable.",
+            )
+        },
+    )
 }
 
 /// Read-only shared open returning the raw Win32 error code on failure so
 /// callers can distinguish "absent" from genuine I/O errors.
-pub fn try_open_read_shared(
-    path: &std::path::Path,
-) -> std::result::Result<OwnedHandle, u32> {
+pub fn try_open_read_shared(path: &std::path::Path) -> std::result::Result<OwnedHandle, u32> {
     use windows::core::PCWSTR;
-    let wide: Vec<u16> = path.as_os_str().to_string_lossy().encode_utf16().chain([0]).collect();
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .to_string_lossy()
+        .encode_utf16()
+        .chain([0])
+        .collect();
     // SAFETY: null-terminated path; the returned handle is owned.
     let result = unsafe {
         windows::Win32::Storage::FileSystem::CreateFileW(

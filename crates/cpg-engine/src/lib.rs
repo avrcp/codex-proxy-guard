@@ -17,6 +17,6 @@ pub use launch::{
     resolve_codex_cli, stop_codex_daemon,
 };
 pub use session::{
-    ConsentProposal, EngineSession, LaunchOutcome, LaunchReceipt, MutationOutcome, RepairProposal,
-    SessionBudgets, SessionServices, SessionView,
+    ConsentProposal, EngineSession, Event, ForegroundState, LaunchOutcome, LaunchReceipt,
+    MutationOutcome, RepairProposal, SessionBudgets, SessionServices, SessionView,
 };

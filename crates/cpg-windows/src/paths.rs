@@ -303,7 +303,10 @@ pub fn temp_path() -> Result<PathBuf> {
     let mut buffer = vec![0u16; 261];
     let size = unsafe { windows::Win32::Storage::FileSystem::GetTempPathW(Some(&mut buffer)) };
     if size == 0 || size as usize >= buffer.len() {
-        return Err(Error::new("LAUNCH_BUSY", "Another Guard instance is launching, or the startup lock is unavailable."));
+        return Err(Error::new(
+            "LAUNCH_BUSY",
+            "Another Guard instance is launching, or the startup lock is unavailable.",
+        ));
     }
     buffer.truncate(size as usize);
     Ok(PathBuf::from(String::from_utf16_lossy(&buffer)))

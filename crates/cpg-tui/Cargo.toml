@@ -5,3 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+cpg-domain = { workspace = true }
+cpg-engine = { workspace = true }
+cpg-windows = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
