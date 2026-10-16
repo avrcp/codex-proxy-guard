@@ -558,7 +558,7 @@ mod tests {
         let codex_home = home.join(".codex");
         let env_path = codex_home.join(".env");
 
-        let config = Config {
+        let mut config = Config {
             manage_backend: true,
             home: codex_home.clone(),
             ..Config::default()
