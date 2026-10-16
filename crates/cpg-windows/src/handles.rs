@@ -32,10 +32,13 @@ impl Drop for OwnedHandle {
             // SAFETY: the handle is non-null/non-invalid and owned exclusively
             // by this instance; every constructor path comes from a Win32 API
             // that returned an owned handle to this process.
-            unsafe { CloseHandle(self.0) };
+            let _ = unsafe { CloseHandle(self.0) };
         }
     }
 }
 
-impl Send for OwnedHandle {}
-impl Sync for OwnedHandle {}
+// SAFETY: a Win32 handle is an opaque kernel value; moving it across threads
+// and sharing references is sound because all mutation goes through Win32
+// calls that synchronize on the kernel object.
+unsafe impl Send for OwnedHandle {}
+unsafe impl Sync for OwnedHandle {}

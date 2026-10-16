@@ -13,7 +13,7 @@ pub mod text;
 pub mod worker;
 
 pub use config::Config;
-pub use error::{Error, fail};
+pub use error::{Error, Result, fail};
 pub use json::{Json, json_dump, parse_strict_json_object};
 pub use proxy::parse_port_strict;
 pub use text::{public_text, strict_utf8, utf8_to_wide, wide_to_utf8};
