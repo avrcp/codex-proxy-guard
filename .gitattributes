@@ -1,4 +1,3 @@
-# Preserve upstream license/attribution bytes, including their original whitespace.
-licenses/Qt/** -text -whitespace
-backend/third_party/toml++/toml.hpp -text -whitespace
-backend/third_party/toml++/LICENSE -text -whitespace
+# Frozen byte-evidence fixtures must round-trip through git archive without
+# any end-of-line conversion.
+tests/golden/** -text
