@@ -56,7 +56,16 @@ try {
         $env:CPG_PRODUCT_VERSION = $Version
         $env:CPG_BUILD_COMMIT = $commit
         $env:CPG_BUILD_DIRTY = "false"
-        $env:RUSTFLAGS = "$env:RUSTFLAGS -C target-feature=+crt-static"
+        # The RUSTFLAGS environment variable REPLACES .cargo/config.toml
+        # rustflags, so the release build carries the full hardening set
+        # explicitly: CFG codegen, static CRT, CET/CFG/ASLR/DEP link args.
+        $env:RUSTFLAGS = "-C control-flow-guard=checks " +
+            "-C target-feature=+crt-static " +
+            "-C link-arg=/CETCOMPAT " +
+            "-C link-arg=/guard:cf " +
+            "-C link-arg=/DYNAMICBASE " +
+            "-C link-arg=/NXCOMPAT " +
+            "-C link-arg=/HIGHENTROPYVA"
 
         Write-Host "cargo build --release --locked" -ForegroundColor Cyan
         cargo build --release --locked --target x86_64-pc-windows-msvc
