@@ -5,11 +5,15 @@
 //! `runOwnedProcess`. The runner only ever terminates processes it created
 //! and still holds handles for.
 //!
-//! Deviation from the C++ (recorded in the acceptance document): the settle
-//! loop does not call `CancelSynchronousIo` on reader threads — Rust
-//! threads do not expose handles. Unblock paths are identical in practice:
-//! writer drop closes the pipe, and terminating the owned child breaks the
-//! readers' pipes, after which the settle budget still governs.
+//! Reader/writer threads park in synchronous pipe I/O that terminating the
+//! owned child cannot always break (a grandchild may still hold the write
+//! end). Each I/O thread therefore registers its real native thread handle
+//! so the settler can issue `CancelSynchronousIo`, which aborts the in-flight
+//! `ReadFile`/`WriteFile` with `ERROR_OPERATION_ABORTED`; the loops treat
+//! that abort as a stop once `stopping` is set. If even cancelled I/O cannot
+//! be reaped within the settle budget the failure is reported explicitly
+//! (`HELPER_CLEANUP_FAILED`) - threads are never detached and an unreaped
+//! helper is never reported as success.
 
 use crate::cancellation::Cancellation;
 use crate::handles::OwnedHandle;
@@ -20,18 +24,20 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{DuplicateHandle, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile};
+use windows::Win32::System::IO::CancelSynchronousIo;
 use windows::Win32::System::Pipes::CreatePipe;
 use windows::Win32::System::Threading::{
     CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
-    EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, InitializeProcThreadAttributeList,
-    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION,
-    STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute,
-    WaitForSingleObject,
+    EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetCurrentThread, GetExitCodeProcess,
+    InitializeProcThreadAttributeList, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_CREATION_FLAGS,
+    PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess,
+    UpdateProcThreadAttribute, WaitForSingleObject,
 };
 use windows::core::PCWSTR;
 
 pub const HELPER_REQUEST_LIMIT: usize = 16 * 1024;
 const SETTLE_BUDGET: Duration = Duration::from_secs(3);
+const CANCEL_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const WAIT_SLICE: Duration = Duration::from_millis(10);
 const DRAIN_BUDGET: Duration = Duration::from_millis(500);
 
@@ -144,14 +150,69 @@ impl ReaderState {
     }
 }
 
+/// A shared slot holding a real handle of one I/O thread. Rust
+/// `JoinHandle`s expose no native thread handle, so each reader/writer
+/// thread registers its own duplicated handle here for the settler's
+/// `CancelSynchronousIo`.
+#[derive(Default)]
+struct IoThreadHandle {
+    handle: Mutex<Option<OwnedHandle>>,
+}
+
+impl IoThreadHandle {
+    /// Registers the calling thread's own handle (duplicated into a real
+    /// handle valid process-wide). Best effort: when duplication fails the
+    /// settler falls back to flag-based stopping only.
+    fn register_current_thread(&self) {
+        let mut duplicate = windows::Win32::Foundation::HANDLE::default();
+        // SAFETY: duplicating the current thread's pseudo handle inside our
+        // own process; the duplicate is owned by this slot.
+        let ok = unsafe {
+            DuplicateHandle(
+                GetCurrentProcess(),
+                GetCurrentThread(),
+                GetCurrentProcess(),
+                &mut duplicate,
+                0,
+                false,
+                windows::Win32::Foundation::DUPLICATE_SAME_ACCESS,
+            )
+        };
+        if ok.is_ok()
+            && let Some(owned) = OwnedHandle::new(duplicate)
+        {
+            *self.handle.lock().expect("io thread handle") = Some(owned);
+        }
+    }
+
+    /// Cancels any synchronous I/O the thread is parked in; the aborted
+    /// `ReadFile`/`WriteFile` returns `ERROR_OPERATION_ABORTED`, which the
+    /// I/O loops treat as a stop once `stopping` is set.
+    fn cancel_io(&self) {
+        if let Ok(guard) = self.handle.lock()
+            && let Some(handle) = guard.as_ref()
+        {
+            // SAFETY: a real handle of the live I/O thread owned by this slot.
+            let _ = unsafe { CancelSynchronousIo(handle.raw()) };
+        }
+    }
+}
+
 fn spawn_reader(
     pipe_read: OwnedHandle,
     limit: usize,
     stopping: Arc<AtomicBool>,
-) -> (std::thread::JoinHandle<()>, Arc<ReaderState>) {
+) -> (
+    std::thread::JoinHandle<()>,
+    Arc<ReaderState>,
+    Arc<IoThreadHandle>,
+) {
     let state = ReaderState::new(limit);
     let worker_state = Arc::clone(&state);
+    let io = Arc::new(IoThreadHandle::default());
+    let thread_io = Arc::clone(&io);
     let handle = std::thread::spawn(move || {
+        thread_io.register_current_thread();
         let mut buffer = [0u8; 4096];
         loop {
             if stopping.load(Ordering::SeqCst) {
@@ -192,7 +253,7 @@ fn spawn_reader(
         }
         worker_state.done.store(true, Ordering::SeqCst);
     });
-    (handle, state)
+    (handle, state, io)
 }
 
 fn spawn_writer(
@@ -202,8 +263,11 @@ fn spawn_writer(
     cancel: Cancellation,
     submitted: Arc<AtomicBool>,
     write_error: Arc<AtomicU32>,
-) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || {
+) -> (std::thread::JoinHandle<()>, Arc<IoThreadHandle>) {
+    let io = Arc::new(IoThreadHandle::default());
+    let thread_io = Arc::clone(&io);
+    let handle = std::thread::spawn(move || {
+        thread_io.register_current_thread();
         let mut written = 0usize;
         while written < stdin_bytes.len() && !stopping.load(Ordering::SeqCst) && !cancel.cancelled()
         {
@@ -251,7 +315,8 @@ fn spawn_writer(
             submitted.store(true, Ordering::SeqCst);
         }
         // Drop closes the write end so a blocked reader can finish.
-    })
+    });
+    (handle, io)
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -464,12 +529,12 @@ pub fn run_owned_process(
     let stopping = Arc::new(AtomicBool::new(false));
     let submitted = Arc::new(AtomicBool::new(false));
     let write_error = Arc::new(AtomicU32::new(0));
-    let (stdout_thread, stdout_state) = spawn_reader(
+    let (stdout_thread, stdout_state, stdout_cancel) = spawn_reader(
         stdout_pipe.read,
         request.stdout_limit,
         Arc::clone(&stopping),
     );
-    let (stderr_thread, stderr_state) = spawn_reader(
+    let (stderr_thread, stderr_state, stderr_cancel) = spawn_reader(
         stderr_pipe.read,
         request.stderr_limit,
         Arc::clone(&stopping),
@@ -478,24 +543,29 @@ pub fn run_owned_process(
     // still settles the already-created child before reporting.
     if cancel.check().is_err() || Instant::now() >= deadline {
         stopping.store(true, Ordering::SeqCst);
+        // The child may already have spawned descendants holding the pipe
+        // write ends; cancel parked reader I/O before the unbounded joins.
+        stdout_cancel.cancel_io();
+        stderr_cancel.cancel_io();
         // SAFETY: terminating only the child this runner created above.
         let _ = unsafe { TerminateProcess(process.raw(), 1) };
         let _ = stdout_thread.join();
         let _ = stderr_thread.join();
         return fail("LAUNCH_CANCELLED", "Operation cancelled");
     }
-    let writer_thread = if !request.stdin_bytes.is_empty() {
-        Some(spawn_writer(
+    let (writer_thread, writer_cancel) = if !request.stdin_bytes.is_empty() {
+        let (thread, io) = spawn_writer(
             stdin_pipe.write,
             request.stdin_bytes.to_vec(),
             Arc::clone(&stopping),
             cancel.clone(),
             Arc::clone(&submitted),
             Arc::clone(&write_error),
-        ))
+        );
+        (Some(thread), Some(io))
     } else {
         drop(stdin_pipe.write);
-        None
+        (None, None)
     };
 
     struct Owned {
@@ -504,19 +574,34 @@ pub fn run_owned_process(
         stdout_thread: Option<std::thread::JoinHandle<()>>,
         stderr_thread: Option<std::thread::JoinHandle<()>>,
         writer_thread: Option<std::thread::JoinHandle<()>>,
+        stdout_cancel: Arc<IoThreadHandle>,
+        stderr_cancel: Arc<IoThreadHandle>,
+        writer_cancel: Option<Arc<IoThreadHandle>>,
         settled: bool,
         termination_requested: bool,
         cleanup: Cleanup,
     }
     impl Owned {
+        fn cancel_all_io(&self) {
+            self.stdout_cancel.cancel_io();
+            self.stderr_cancel.cancel_io();
+            if let Some(writer) = self.writer_cancel.as_ref() {
+                writer.cancel_io();
+            }
+        }
         fn settle(&mut self, mut abort: bool) {
             if self.settled {
                 return;
             }
             if abort {
                 self.stopping.store(true, Ordering::SeqCst);
+                // Abort any pipe I/O the threads are already parked in;
+                // terminating the owned child alone cannot break a pipe a
+                // grandchild still holds.
+                self.cancel_all_io();
             }
             let cleanup_started = Instant::now();
+            let mut cancel_retry_at = Instant::now() + CANCEL_RETRY_INTERVAL;
             let mut terminate_attempted = false;
             loop {
                 // SAFETY: owned, valid process handle; zero timeout polls.
@@ -556,10 +641,20 @@ pub fn run_owned_process(
                     self.cleanup.failed = true;
                     self.cleanup.stage = "settle_budget";
                     self.stopping.store(true, Ordering::SeqCst);
+                    // Keep re-issuing the OS-level I/O cancellation: a
+                    // registration race (cancel before the thread registered
+                    // its handle) or a latched cancel consumed by an earlier
+                    // read must not turn into an unbounded wait.
+                    self.cancel_all_io();
+                    cancel_retry_at = Instant::now() + CANCEL_RETRY_INTERVAL;
                     abort = true;
-                    // An unresponsive kernel/driver cannot be made hard-real-
-                    // time: retain ownership until it settles; never detach or
-                    // manufacture an idle/success result.
+                    // A kernel/driver that refuses the cancellation cannot be
+                    // made hard-real-time: retain ownership until it settles;
+                    // never detach or manufacture an idle/success result.
+                }
+                if !complete && abort && Instant::now() >= cancel_retry_at {
+                    self.cancel_all_io();
+                    cancel_retry_at = Instant::now() + CANCEL_RETRY_INTERVAL;
                 }
                 if complete {
                     break;
@@ -590,6 +685,9 @@ pub fn run_owned_process(
         stdout_thread: Some(stdout_thread),
         stderr_thread: Some(stderr_thread),
         writer_thread,
+        stdout_cancel,
+        stderr_cancel,
+        writer_cancel,
         settled: false,
         termination_requested: false,
         cleanup: Cleanup {
@@ -780,9 +878,17 @@ mod tests {
     /// threads park in `ReadFile` until the I/O is actually cancelled - the
     /// audit F02 stuck-pipe shape. The whole command is one argument because
     /// the runner quotes every argument (cmd only strips the outer quotes of
-    /// a single fully-quoted /c string).
-    fn stuck_pipe_arguments() -> Vec<String> {
-        vec!["/d /c waitfor /t 25 CpgStuckPipeSignal".into()]
+    /// a single fully-quoted /c string). The signal name is unique per
+    /// invocation: waitfor signals are system-global and survive this
+    /// runner's cancellation for the grandchild's full lifetime, so reusing a
+    /// name collides with the previous test run's leftover waiter.
+    fn stuck_pipe_arguments(kind: &str) -> Vec<String> {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let unique = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        vec![format!(
+            "/d /c waitfor /t 25 CpgStuck{kind}{}{unique}",
+            std::process::id()
+        )]
     }
 
     #[test]
@@ -796,7 +902,7 @@ mod tests {
         let started = Instant::now();
         let error = run_helper(
             &system32("cmd.exe"),
-            &stuck_pipe_arguments(),
+            &stuck_pipe_arguments("Timeout"),
             b"",
             &cancel,
             Duration::from_secs(5),
@@ -831,7 +937,7 @@ mod tests {
         let started = Instant::now();
         let error = run_helper(
             &system32("cmd.exe"),
-            &stuck_pipe_arguments(),
+            &stuck_pipe_arguments("Cancel"),
             b"",
             &cancel,
             Duration::from_secs(30),
