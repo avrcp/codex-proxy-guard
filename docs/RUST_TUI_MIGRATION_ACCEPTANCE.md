@@ -78,7 +78,9 @@ Produced by `scripts/build-portable-rust.ps1 -AllowUnsignedDev`:
 Artifact:   dist/releases/CodexProxyGuard-0.8.0-rc.1-rust-fc3eaf62/CodexProxyGuard.exe
 Size:       1,196,544 bytes (static CRT; no side-by-side DLLs)
 SHA256:     43B913AF82896AA2FE7105413E86C2FD2154054AC5D68DB6CB5D0720E5E6DE4F
-Provenance: {"commit":"466fd81e7a85e574ee81ea73c515b0a24c61c9b0","dirty":false,"language":"Rust","version":"0.8.0-rc.1"}
+Provenance: {"commit":"fc3eaf62c793ce7b40ccb7850f0b0be32af14f57","dirty":false,"language":"Rust","version":"0.8.0-rc.1"}
+(correction 2026-10-17: the archived build-info.json always said fc3eaf62; the
+earlier "466fd81e" line here was a transcription error, not a provenance defect.)
 ```
 
 PE evidence — every gate re-checked with the production verifier's own
@@ -125,11 +127,13 @@ activation.
 1. `build-info` `language` is `Rust` (the one sanctioned schema change).
 2. `licenses` lists the Rust dependency notice set (ratatui, crossterm,
    toml, windows-rs, project license) instead of the C++ set.
-3. The settle path does not call `CancelSynchronousIo` on reader threads
-   (Rust threads do not expose handles); unblocking relies on pipe closure
-   after terminating the owned child, inside the same 3 s settle budget.
-4. TUI line editor is character-based (no grapheme-cluster cursor moves);
-   host/port fields are ASCII-validated by the engine anyway.
+3. Superseded 2026-10-17 (second-audit F02): reader/writer threads now
+   register their native handles and the settler issues
+   `CancelSynchronousIo`, so a descendant holding the pipe write end can
+   no longer park cleanup (see RUST_TUI_SECOND_AUDIT_REMEDIATION.md).
+4. TUI line editor is character-based with a cursor (Left/Right/Home/End/
+   Delete and single-line paste); grapheme-cluster moves remain out of
+   scope because host/port fields are ASCII-validated by the engine.
 5. `Event::Poll` uses a 20 ms crossterm poll slice instead of a blocking
    Win32 wait; busy/timeout semantics are driven by the same session
    budgets.

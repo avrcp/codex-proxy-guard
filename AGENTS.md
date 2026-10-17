@@ -158,9 +158,10 @@ git diff --check
 ```
 
 Windows portable artifacts must always come from the canonical script,
-which gates the PE mitigation set with the `verify-package.py` parsing
-core (CFG/CET/ASLR/DEP + import scan; wiring its zip/manifest schema to
-the Rust release layout is tracked follow-up work). Release directories
+which gates promotion on `verify-package.py --schema rust-static-single`
+(PE mitigation set CFG/CET/ASLR/DEP + import scan + manifest/zip/SHA
+binding + offline CLI smoke + independent WinVerifyTrust for signed
+builds; tamper fixture: `scripts/test-verify-package-rust.py`). Release directories
 are immutable — the build refuses an existing destination and promotes
 with one atomic move from unique staging. Completion also requires
 release build/package smoke, SHA/build-info verification, import-table

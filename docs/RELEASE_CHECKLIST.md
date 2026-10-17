@@ -15,16 +15,21 @@ release guarantees.
       from the clean pushed commit (refuses a dirty tree; development
       builds may pass `-AllowUnsignedDev` and are marked unsigned
       everywhere).
-- [ ] Check the release-mode test run inside the script, the packaged
-      EXE's `build-info` provenance, `--help`/`--version`/`licenses`
-      smoke, and plain-console smoke with an isolated temporary config.
+- [ ] Check the release-mode test run inside the script. The script
+      itself signs BEFORE hashing, re-queries the signature
+      independently, writes the manifest + SHA256SUMS over the final
+      artifacts, and runs the full
+      `verify-package.py --schema rust-static-single` gate (which
+      includes the packaged `build-info` provenance and the
+      `--help`/`--version`/`licenses` offline smoke) before promotion.
+      Also smoke the plain console with an isolated temporary config.
 
 ## Package verification
 
 - [ ] The release directory under `dist/releases/<version>-rust-<commit>`
       holds exactly the artifact set (EXE, source.zip, SHA256SUMS,
-      build-info.json); releases are immutable — the build refuses an
-      existing destination.
+      build-info.json, release-manifest.json); releases are immutable —
+      the build refuses an existing destination.
 - [ ] The source ZIP is the pinned `git archive` snapshot of the built
       commit (tracked dotfiles included) and the build inputs came from
       that snapshot, not the working tree.
@@ -36,12 +41,16 @@ release guarantees.
 - [ ] Import scan: system DLLs only; no msvcp140/vcruntime140 (static
       CRT), no third-party runtime DLLs, no packers.
 - [ ] Authenticode for signed releases: signtool with SHA-256 file
-      digest and RFC 3161 timestamp; independently re-validate before
-      distribution. Unsigned releases are marked `UNSIGNED DEVELOPMENT
-      BUILD` and `public_release_ready: BLOCKED`.
+      digest and RFC 3161 timestamp; the build re-queries the signature
+      itself and the verifier independently runs WinVerifyTrust over the
+      final EXE before promotion. Unsigned releases are marked
+      `UNSIGNED DEVELOPMENT BUILD` and `public_release_ready: BLOCKED`.
+- [ ] Fixture suite for the verifier:
+      `python scripts/test-verify-package-rust.py` (intact package plus
+      ten tampered variants) stays green.
 
-## Known follow-up (tracked, not claimed)
+## Closed follow-ups
 
-- Wire `verify-package.py --schema` to the Rust release layout so the
-  zip/manifest/SHA linkage gates run end-to-end on the packaged
-  artifact (the PE/import core already passes on the Rust EXE).
+- `verify-package.py --schema rust-static-single` is wired to the Rust
+  release layout and gates promotion end-to-end (second-audit F07,
+  2026-10-17).
