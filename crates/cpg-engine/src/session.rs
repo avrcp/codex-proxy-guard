@@ -1460,6 +1460,122 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_launch_settles_then_refresh_succeeds() {
+        let (harness, services) = Harness::new(true);
+        let mut session = harness.session(services);
+        session.request_refresh();
+        settle(&mut session);
+        // Block the launch worker so the cancellation is observable.
+        harness.launch_block.store(true, Ordering::SeqCst);
+        session.request_launch(false, "").expect("launch");
+        std::thread::sleep(Duration::from_millis(30));
+        session.cancel();
+        settle(&mut session);
+        assert!(!session.busy(), "gate reopens after the cancelled task settles");
+        // A later refresh must not inherit the consumed cancellation token.
+        session.request_refresh();
+        settle(&mut session);
+        let view = session.view();
+        assert!(view.ready, "refresh after cancel must succeed");
+        assert!(
+            view.error.is_none(),
+            "stale cancellation leaked: {:?}",
+            view.error.map(|error| (error.code, error.message))
+        );
+    }
+
+    #[test]
+    fn timeout_settles_then_next_launch_is_not_pre_cancelled() {
+        let (harness, services) = Harness::new(true);
+        let mut session = harness.session(services);
+        session.request_refresh();
+        settle(&mut session);
+        harness.launch_block.store(true, Ordering::SeqCst);
+        session.request_launch(false, "").expect("launch");
+        for _ in 0..200 {
+            session.poll();
+            if session.cancelling_after_timeout() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(session.cancelling_after_timeout(), "budget exceeded");
+        assert!(session.busy(), "gate stays closed until reaped");
+        harness.launch_block.store(false, Ordering::SeqCst);
+        settle(&mut session);
+        let outcome = session.launch_outcome().expect("outcome");
+        assert!(outcome.exceeded_budget);
+        // The next launch runs on a fresh token and completes normally.
+        session.request_launch(false, "").expect("second launch accepted");
+        settle(&mut session);
+        let outcome = session.launch_outcome().expect("second outcome");
+        assert!(
+            outcome.error.is_none(),
+            "next launch pre-cancelled: {:?}",
+            outcome.error.map(|error| (error.code, error.message))
+        );
+        assert!(!outcome.exceeded_budget);
+        assert_eq!(outcome.receipt.as_ref().expect("receipt").pid, Some(4242));
+    }
+
+    #[test]
+    fn cancel_one_operation_does_not_cancel_following_operation() {
+        let (harness, services) = Harness::new(true);
+        let mut session = harness.session(services);
+        for round in 0..2 {
+            session.request_refresh();
+            settle(&mut session);
+            harness.launch_block.store(true, Ordering::SeqCst);
+            session.request_launch(false, "").expect("blocked launch");
+            std::thread::sleep(Duration::from_millis(30));
+            session.cancel();
+            settle(&mut session);
+            harness.launch_block.store(false, Ordering::SeqCst);
+            session.request_refresh();
+            settle(&mut session);
+            assert!(
+                session.view().ready,
+                "round {round}: refresh after cancel must succeed"
+            );
+            session.request_launch(false, "").expect("round {round}: launch");
+            settle(&mut session);
+            let outcome = session.launch_outcome().expect("round outcome");
+            assert!(
+                outcome.error.is_none(),
+                "round {round}: {:?}",
+                outcome.error.map(|error| (error.code, error.message))
+            );
+        }
+    }
+
+    #[test]
+    fn old_worker_cannot_cancel_new_operation() {
+        let (harness, services) = Harness::new(true);
+        let mut session = harness.session(services);
+        session.request_refresh();
+        settle(&mut session);
+        harness.launch_block.store(true, Ordering::SeqCst);
+        session.request_launch(false, "").expect("launch");
+        std::thread::sleep(Duration::from_millis(30));
+        session.cancel();
+        // The cancelled worker is still settling; the single foreground gate
+        // must refuse a second launch instead of letting it run concurrently.
+        let error = session.request_launch(false, "").unwrap_err();
+        assert_eq!(error.code, "SESSION_BUSY");
+        harness.launch_block.store(false, Ordering::SeqCst);
+        settle(&mut session);
+        // After the reap, a new operation starts cleanly with no ghost result.
+        session.request_refresh();
+        settle(&mut session);
+        assert!(session.view().ready);
+        session.request_launch(false, "").expect("launch after reap");
+        settle(&mut session);
+        let outcome = session.launch_outcome().expect("outcome");
+        assert!(outcome.error.is_none());
+        assert_eq!(outcome.receipt.as_ref().expect("receipt").pid, Some(4242));
+    }
+
+    #[test]
     fn mutation_committed_fact_survives_refresh_failure() {
         let (harness, services) = Harness::new(true);
         let mut session = harness.session(services);
