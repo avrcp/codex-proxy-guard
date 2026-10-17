@@ -98,10 +98,10 @@ pub fn parse_ipv6(text: &str) -> Option<[u16; 8]> {
         }
     };
     let total = head_groups.len() + tail_groups.len();
-    let fill = 8 - total;
-    if total > 8 {
-        return None;
-    }
+    // Reject an over-full expansion before any width arithmetic: the plain
+    // subtraction below would underflow (and panic in Debug builds) on
+    // inputs like `1:2:3:4:5:6:7:8::9`.
+    let fill = 8usize.checked_sub(total)?;
     // With an explicit "::" the fill must be >= 1 unless the whole address is
     // exactly "::" — "1:2:3:4:5:6:7:8::" is invalid IPv6 text.
     let whole_address_is_unspecified = head.is_empty() && tail.unwrap().is_empty();
@@ -197,6 +197,34 @@ mod tests {
         assert!(parse_ipv6("1:2:3:4:5:6:7:8:9").is_none());
         assert!(parse_ipv6("1::2::3").is_none());
         assert!(parse_ipv6("::ffff:127.0.0.1").is_some());
+    }
+
+    #[test]
+    fn ipv6_overfull_expansion_is_rejected_without_panicking() {
+        // Nine groups with a `::` made the old width subtraction underflow
+        // (a Debug-build panic) before the `total > 8` rejection ran.
+        let overfull = [
+            "1:2:3:4:5:6:7:8::9",
+            "9::1:2:3:4:5:6:7:8",
+            "::1:2:3:4:5:6:7:8:9",
+            "1:2:3:4:5:6:7:8::",
+            "::1:2:3:4:5:6:7:8",
+            "1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1",
+            "1:2:3:4:5:6:7:1.2.3.4::9",
+        ];
+        for text in overfull {
+            let result = std::panic::catch_unwind(|| parse_ipv6(text));
+            assert!(
+                result.is_ok(),
+                "parse of {text:?} panicked instead of rejecting"
+            );
+            assert!(result.unwrap().is_none(), "{text:?} must be rejected");
+        }
+        // Adjacent boundaries stay classified: one fill group is valid,
+        // eight explicit groups plus `::` are not (InetPton semantics).
+        assert!(parse_ipv6("1:2:3:4:5:6::8").is_some());
+        assert!(parse_ipv6("::ffff:1.2.3.4").is_some());
+        assert!(parse_ipv6("1:2:3:4:5:6:7::8").is_none());
     }
 
     #[test]
