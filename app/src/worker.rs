@@ -2,12 +2,12 @@
 //! stdin request (≤16 KiB, 30 s), schema-v1 validation, COM activation with
 //! AO_NONE and identity observation, one bounded stdout receipt.
 
-use cpg_domain::Result;
-use cpg_domain::json::{Json, json_dump};
+use cpg_domain::json::json_dump;
 use cpg_domain::text::public_text;
 use cpg_domain::worker::{validate_activation_receipt, validate_activation_request};
-use std::io::{Read, Write};
-use std::time::{Duration, Instant};
+use cpg_windows::console::{BoundedRead, read_stdin_bounded};
+use std::io::Write;
+use std::time::Duration;
 
 const REQUEST_LIMIT: usize = 16 * 1024;
 
@@ -21,44 +21,18 @@ fn fail(code: &str, message: &str) -> ! {
 }
 
 /// Reads the request from stdin with a hard 30-second budget and the 16 KiB
-/// ceiling. Redirected or piped input only; interactive consoles are refused.
+/// ceiling. The bounded adapter polls pipes (an idle pipe would ignore any
+/// timeout wrapped around a blocking read), refuses consoles and enforces
+/// the byte limit; redirected or piped input only.
 fn read_request() -> Vec<u8> {
-    if !cpg_windows::console::stdin_is_pipe_or_disk() {
-        fail(
+    match read_stdin_bounded(REQUEST_LIMIT, Duration::from_secs(30)) {
+        Ok(BoundedRead::Bytes(bytes)) => bytes,
+        Ok(BoundedRead::Eof) => Vec::new(),
+        Err(error) => fail(
             "APPX_ACTIVATION_PROTOCOL_INVALID",
-            "Worker requires bounded redirected input",
-        );
+            &format!("Worker request read failed: {error}"),
+        ),
     }
-    let started = Instant::now();
-    let mut bytes = Vec::new();
-    let mut buffer = [0u8; 4096];
-    let stdin = std::io::stdin();
-    let mut input = stdin.lock();
-    loop {
-        if started.elapsed() >= Duration::from_secs(30) {
-            fail(
-                "APPX_ACTIVATION_PROTOCOL_INVALID",
-                "Worker request read timed out",
-            );
-        }
-        match input.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(count) => {
-                bytes.extend_from_slice(&buffer[..count]);
-                if bytes.len() > REQUEST_LIMIT {
-                    fail(
-                        "APPX_ACTIVATION_PROTOCOL_INVALID",
-                        "Worker request exceeds 16 KiB",
-                    );
-                }
-            }
-            Err(_) => fail(
-                "APPX_ACTIVATION_PROTOCOL_INVALID",
-                "Cannot read worker input",
-            ),
-        }
-    }
-    bytes
 }
 
 pub fn activation_worker() -> i32 {
@@ -89,6 +63,3 @@ pub fn activation_worker() -> i32 {
     }
     0
 }
-
-#[allow(dead_code)]
-fn sink(_: Result<Json>) {}

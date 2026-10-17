@@ -195,6 +195,231 @@ pub fn stdin_is_pipe_or_disk() -> bool {
     }
 }
 
+/// Outcome of one bounded standard-input read.
+#[derive(Debug, PartialEq)]
+pub enum BoundedRead {
+    /// All bytes until end of stream, within the limit.
+    Bytes(Vec<u8>),
+    /// The stream was already closed with no bytes.
+    Eof,
+}
+
+/// Reads the standard input stream to EOF under a hard wall-clock budget
+/// and a byte ceiling. A blocking `read` on an idle pipe would ignore any
+/// timeout check around it, so pipes are polled with `PeekNamedPipe` (a
+/// broken pipe reports EOF), disk files read directly, and consoles or
+/// other character devices are refused outright.
+pub fn read_stdin_bounded(
+    limit: usize,
+    timeout: std::time::Duration,
+) -> std::io::Result<BoundedRead> {
+    // SAFETY: standard handle query only.
+    let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) }
+        .map_err(|_| std::io::Error::other("standard input is not available"))?;
+    read_handle_bounded(handle, limit, timeout)
+}
+
+fn read_handle_bounded(
+    handle: windows::Win32::Foundation::HANDLE,
+    limit: usize,
+    timeout: std::time::Duration,
+) -> std::io::Result<BoundedRead> {
+    use std::io::ErrorKind;
+    use windows::Win32::Storage::FileSystem::{
+        FILE_TYPE_CHAR, FILE_TYPE_DISK, FILE_TYPE_PIPE, GetFileType, ReadFile,
+    };
+    use windows::Win32::System::Pipes::PeekNamedPipe;
+    let started = std::time::Instant::now();
+    let kind = unsafe { GetFileType(handle) };
+    if kind == FILE_TYPE_CHAR {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "interactive consoles are not bounded input",
+        ));
+    }
+    if kind != FILE_TYPE_PIPE && kind != FILE_TYPE_DISK {
+        return Err(std::io::Error::new(
+            ErrorKind::Unsupported,
+            "unsupported standard input device",
+        ));
+    }
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut buffer = [0u8; 4096];
+    loop {
+        if bytes.len() > limit {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                "input exceeds its byte limit",
+            ));
+        }
+        if kind == FILE_TYPE_PIPE {
+            let mut available = 0u32;
+            // SAFETY: peek the given pipe handle into a local counter; no
+            // data is copied by the peek itself.
+            let peeked = unsafe {
+                PeekNamedPipe(
+                    handle,
+                    None,
+                    0,
+                    None,
+                    Some(&mut available as *mut u32),
+                    None,
+                )
+            };
+            if peeked.is_err() {
+                // A broken pipe after some bytes is the stream's EOF.
+                return Ok(if bytes.is_empty() {
+                    BoundedRead::Eof
+                } else {
+                    BoundedRead::Bytes(bytes)
+                });
+            }
+            if available == 0 {
+                if started.elapsed() >= timeout {
+                    return Err(std::io::Error::new(
+                        ErrorKind::TimedOut,
+                        "input timed out before end of stream",
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                continue;
+            }
+            let want = buffer.len().min(available as usize);
+            let mut got = 0u32;
+            // SAFETY: data is available per the peek, so this read cannot
+            // block; the buffer slice matches the requested length.
+            if unsafe { ReadFile(handle, Some(&mut buffer[..want]), Some(&mut got), None) }.is_err()
+            {
+                return Err(std::io::Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "input closed mid-read",
+                ));
+            }
+            if got == 0 {
+                return Ok(finish_bounded(bytes));
+            }
+            bytes.extend_from_slice(&buffer[..got as usize]);
+        } else {
+            if started.elapsed() >= timeout {
+                return Err(std::io::Error::new(
+                    ErrorKind::TimedOut,
+                    "input timed out before end of stream",
+                ));
+            }
+            let mut got = 0u32;
+            // SAFETY: disk reads of the standard handle return promptly; the
+            // buffer and count are locals.
+            let read = unsafe { ReadFile(handle, Some(&mut buffer), Some(&mut got), None) };
+            match read {
+                Ok(()) if got == 0 => return Ok(finish_bounded(bytes)),
+                Ok(()) => bytes.extend_from_slice(&buffer[..got as usize]),
+                Err(_) => {
+                    return Err(std::io::Error::new(
+                        ErrorKind::UnexpectedEof,
+                        "input closed mid-read",
+                    ));
+                }
+            }
+        }
+    }
+}
+
+fn finish_bounded(bytes: Vec<u8>) -> BoundedRead {
+    if bytes.is_empty() {
+        BoundedRead::Eof
+    } else {
+        BoundedRead::Bytes(bytes)
+    }
+}
+
+#[cfg(test)]
+mod bounded_tests {
+    use super::BoundedRead;
+    use std::time::Duration;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::Pipes::CreatePipe;
+
+    /// An owned raw HANDLE closed exactly once on drop; the write end is
+    /// moved into writer threads, so it is marked Send (a HANDLE is just a
+    /// kernel identifier; no Rust aliasing is attached).
+    struct PipeEnd(HANDLE);
+
+    // SAFETY: the handle is an opaque kernel identifier owned exclusively
+    // by this wrapper; moving it across threads creates no aliasing.
+    unsafe impl Send for PipeEnd {}
+
+    fn create_pipe() -> (PipeEnd, PipeEnd) {
+        let mut read = HANDLE::default();
+        let mut write = HANDLE::default();
+        // SAFETY: local out-pointers; both ends are owned by PipeEnd.
+        assert!(unsafe { CreatePipe(&mut read, &mut write, None, 0) }.is_ok());
+        (PipeEnd(read), PipeEnd(write))
+    }
+
+    impl Drop for PipeEnd {
+        fn drop(&mut self) {
+            // SAFETY: owned handle closed exactly once.
+            unsafe { windows::Win32::Foundation::CloseHandle(self.0) }.ok();
+        }
+    }
+
+    #[test]
+    fn pipe_data_then_eof_is_collected() {
+        let (read, write) = create_pipe();
+        let writer = std::thread::spawn(move || {
+            use windows::Win32::Storage::FileSystem::WriteFile;
+            std::thread::sleep(Duration::from_millis(50));
+            // SAFETY: the write handle is owned by this thread.
+            let _ = unsafe { WriteFile(write.0, Some(b"payload"), None, None) };
+            drop(write);
+        });
+        let outcome = super::read_handle_bounded(read.0, 4096, Duration::from_secs(2));
+        writer.join().expect("writer");
+        drop(read);
+        assert_eq!(
+            outcome.expect("bounded read"),
+            BoundedRead::Bytes(b"payload".to_vec())
+        );
+    }
+
+    #[test]
+    fn idle_open_pipe_times_out_instead_of_hanging() {
+        let (read, write) = create_pipe();
+        // The writer thread keeps the pipe open but sends nothing; a naive
+        // blocking read would hang until it closes.
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(600));
+            drop(write);
+        });
+        let started = std::time::Instant::now();
+        let outcome = super::read_handle_bounded(read.0, 4096, Duration::from_millis(150));
+        let elapsed = started.elapsed();
+        drop(read);
+        let error = outcome.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "timeout must not wait for the writer: {elapsed:?}"
+        );
+        writer.join().expect("writer");
+    }
+
+    #[test]
+    fn byte_limit_is_enforced() {
+        let (read, write) = create_pipe();
+        let writer = std::thread::spawn(move || {
+            use windows::Win32::Storage::FileSystem::WriteFile;
+            // SAFETY: the write handle is owned by this thread.
+            let _ = unsafe { WriteFile(write.0, Some(&[b'x'; 64]), None, None) };
+            drop(write);
+        });
+        let outcome = super::read_handle_bounded(read.0, 16, Duration::from_secs(2));
+        drop(read);
+        writer.join().expect("writer");
+        assert_eq!(outcome.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
