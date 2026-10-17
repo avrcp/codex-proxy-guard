@@ -774,6 +774,81 @@ mod tests {
             .join(name)
     }
 
+    /// `cmd /d /c waitfor /t 25 <signal>` keeps a silent grandchild alive for
+    /// 25 s that inherits the direct child's stdout (this runner's pipe write
+    /// end). Terminating the owned `cmd` cannot break the pipe, so reader
+    /// threads park in `ReadFile` until the I/O is actually cancelled - the
+    /// audit F02 stuck-pipe shape. The whole command is one argument because
+    /// the runner quotes every argument (cmd only strips the outer quotes of
+    /// a single fully-quoted /c string).
+    fn stuck_pipe_arguments() -> Vec<String> {
+        vec!["/d /c waitfor /t 25 CpgStuckPipeSignal".into()]
+    }
+
+    #[test]
+    fn stuck_pipe_descendant_cleanup_is_bounded() {
+        assert!(
+            system32("waitfor.exe").is_file(),
+            "waitfor.exe fixture missing"
+        );
+        let cancel = Cancellation::new();
+        let mut environment = crate::environment::UnicodeEnvironment::current().unwrap();
+        let started = Instant::now();
+        let error = run_helper(
+            &system32("cmd.exe"),
+            &stuck_pipe_arguments(),
+            b"",
+            &cancel,
+            Duration::from_secs(5),
+            64 * 1024,
+            &mut environment,
+            false,
+        )
+        .unwrap_err();
+        let elapsed = started.elapsed();
+        assert_eq!(error.code, "HELPER_TIMEOUT");
+        assert!(
+            elapsed < Duration::from_secs(15),
+            "cleanup waited {elapsed:?} for a silent pipe-holding descendant"
+        );
+    }
+
+    #[test]
+    fn cancel_during_stuck_pipe_cleanup_is_bounded() {
+        assert!(
+            system32("waitfor.exe").is_file(),
+            "waitfor.exe fixture missing"
+        );
+        let cancel = Cancellation::new();
+        let mut environment = crate::environment::UnicodeEnvironment::current().unwrap();
+        let canceller = {
+            let cancel = cancel.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(400));
+                cancel.cancel();
+            })
+        };
+        let started = Instant::now();
+        let error = run_helper(
+            &system32("cmd.exe"),
+            &stuck_pipe_arguments(),
+            b"",
+            &cancel,
+            Duration::from_secs(30),
+            64 * 1024,
+            &mut environment,
+            false,
+        )
+        .unwrap_err();
+        let elapsed = started.elapsed();
+        canceller.join().expect("canceller");
+        assert_eq!(error.code, "LAUNCH_CANCELLED");
+        assert!(
+            elapsed < Duration::from_secs(15),
+            "cancelled cleanup waited {elapsed:?} for a silent pipe-holding descendant"
+        );
+    }
+
     #[test]
     fn command_quoting_matches_windows_rules() {
         let mut command = Vec::new();
