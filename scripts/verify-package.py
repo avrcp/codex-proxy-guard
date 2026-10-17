@@ -588,7 +588,7 @@ def verify_rust_release(release: pathlib.Path, manifest: dict, skip_execution: b
         run(executable, '--version')
         run(executable, '--help')
         licenses = run(executable, 'licenses')
-        if '===== LICENSE =====' not in licenses:
+        if '===== LICENSE (' not in licenses:
             raise SystemExit('Embedded license stream incomplete')
 
     source = release / 'source.zip'
