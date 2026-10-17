@@ -41,6 +41,7 @@ windows = { version = "0.62", features = [
     "Win32_UI_Shell",
 ] }
 ratatui = "0.30"
+unicode-width = "0.2"
 crossterm = "0.29"
 
 [profile.release]

@@ -19,6 +19,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use std::path::Path;
 use std::time::Duration;
+use unicode_width::UnicodeWidthStr;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Modal {
@@ -70,6 +71,9 @@ struct Model {
     refreshed_launch: Option<i64>,
     spinner_phase: u8,
     busy_label: String,
+    /// Last observed terminal size; gates confirmations that cannot show
+    /// the full authorization scope.
+    viewport: (u16, u16),
 }
 
 impl Model {
@@ -96,6 +100,7 @@ impl Model {
             refreshed_launch: None,
             spinner_phase: 0,
             busy_label: "Updating".to_owned(),
+            viewport: (0, 0),
         }
     }
 
@@ -419,12 +424,20 @@ impl Model {
             KeyCode::Enter => {
                 let mut action = Action::None;
                 if self.confirm_buffer == "YES" {
-                    if self.modal == Modal::Repair {
+                    let consent = self.modal == Modal::Consent;
+                    let proposal = self.session.view().consent;
+                    if !confirmation_fully_visible(self.viewport, consent, proposal.as_ref()) {
+                        // The scope (or its side effects) is clipped: a typed
+                        // YES authorizes nothing until it is fully readable.
+                        // The buffer is kept so a resize plus Enter can
+                        // confirm without retyping.
+                        return Action::None;
+                    } else if self.modal == Modal::Repair {
                         if let Some(repair) = self.session.view().repair.clone() {
                             action = Action::ConfirmRepair(repair);
                             self.modal = Modal::None;
                         }
-                    } else if let Some(consent) = self.session.view().consent.clone() {
+                    } else if let Some(consent) = proposal {
                         action = Action::ConfirmConsent(consent);
                         self.modal = Modal::None;
                     }
@@ -685,6 +698,131 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
     }
 }
 
+/// Rows a single text line occupies when word-wrapped at `width` (greedy
+/// wrap with hard breaks for overlong words, matching the Paragraph wrap
+/// used for these sentences closely enough for a conservative gate).
+fn wrapped_rows(text: &str, width: usize) -> usize {
+    if width == 0 {
+        return usize::MAX;
+    }
+    let mut rows = 1usize;
+    let mut current = 0usize; // columns used on the current row
+    let mut first = true; // word would start the row (no separator needed)
+    for word in text.split(' ').filter(|word| !word.is_empty()) {
+        let columns = word.width();
+        if !first && current + 1 + columns <= width {
+            current += 1 + columns;
+            continue;
+        }
+        if !first {
+            rows += 1;
+        }
+        if columns <= width {
+            current = columns;
+        } else {
+            // Hard-break a word wider than a full row.
+            rows += columns / width - usize::from(columns % width == 0);
+            current = if columns % width == 0 {
+                width
+            } else {
+                columns % width
+            };
+        }
+        first = false;
+    }
+    rows
+}
+
+/// Logical lines of the confirmation text. `true` marks the exact-Home
+/// line, which must be visible unwrapped: authorizing a scope the user
+/// cannot read end-to-end is never allowed (audit F08).
+fn confirmation_lines(consent: bool, proposal: Option<&ConsentProposal>) -> Vec<(String, bool)> {
+    if let (true, Some(proposal)) = (consent, proposal) {
+        vec![
+            (
+                if proposal.enabled {
+                    "Authorize HTTP_PROXY/HTTPS_PROXY/NO_PROXY in this exact Home:"
+                } else {
+                    "Remove Guard's unchanged proxy block from this exact Home:"
+                }
+                .to_owned(),
+                false,
+            ),
+            (proposal.home.display().to_string(), true),
+            (String::new(), false),
+            (
+                "Only Guard's marked block is managed. It affects later Codex processes sharing this Home."
+                    .to_owned(),
+                false,
+            ),
+        ]
+    } else {
+        vec![
+            (
+                "Stop the shared Codex background server once. This may interrupt other clients' tasks on the same Home."
+                    .to_owned(),
+                false,
+            ),
+            (
+                "The backend proxy block is prepared before the stop.".to_owned(),
+                false,
+            ),
+        ]
+    }
+}
+
+/// Popup width: the fixed 72-column dialog, widened (capped at 100) so a
+/// long Home path can sit on one unwrapped row on wide terminals.
+fn confirmation_popup_width(consent: bool, proposal: Option<&ConsentProposal>) -> u16 {
+    let mut width = 72u16;
+    if let (true, Some(proposal)) = (consent, proposal) {
+        let needed = proposal.home.display().to_string().width() as u16 + 8;
+        width = width.max(needed).min(100);
+    }
+    width
+}
+
+/// True when the whole confirmation text - including the exact Home - is
+/// visible at once at the current terminal size, together with the YES row.
+/// `YES` entered while this is false authorizes nothing.
+fn confirmation_fully_visible(
+    viewport: (u16, u16),
+    consent: bool,
+    proposal: Option<&ConsentProposal>,
+) -> bool {
+    let area = Rect {
+        x: 0,
+        y: 0,
+        width: viewport.0,
+        height: viewport.1,
+    };
+    let rect = centered(area, confirmation_popup_width(consent, proposal), 17);
+    let inner = rect.inner(ratatui::layout::Margin {
+        vertical: 1,
+        horizontal: 2,
+    });
+    if inner.width < 8 || inner.height < 5 {
+        return false;
+    }
+    // Rows above the confirmation row (rendered 3 rows above the bottom).
+    let content_rows = inner.height.saturating_sub(3) as usize;
+    let width = inner.width as usize;
+    let mut rows = 0usize;
+    for (line, exact_home) in confirmation_lines(consent, proposal) {
+        if line.is_empty() {
+            rows += 1;
+        } else if exact_home {
+            if line.width() > width {
+                return false;
+            }
+            rows += 1;
+        } else {
+            rows += wrapped_rows(&line, width);
+        }
+    }
+    rows > 0 && rows <= content_rows
+}
+
 fn render_modal(frame: &mut Frame, model: &Model, area: Rect) {
     let popup = |frame: &mut Frame, title: &str, width, height| -> Rect {
         let rect = centered(area, width, height);
@@ -741,6 +879,7 @@ fn render_modal(frame: &mut Frame, model: &Model, area: Rect) {
         }
         Modal::Consent | Modal::Repair => {
             let consent = model.modal == Modal::Consent;
+            let proposal = model.session.view().consent;
             let rect = popup(
                 frame,
                 if consent {
@@ -748,28 +887,18 @@ fn render_modal(frame: &mut Frame, model: &Model, area: Rect) {
                 } else {
                     "Repair Launch"
                 },
-                72,
+                confirmation_popup_width(consent, proposal.as_ref()),
                 17,
             );
             let inner = rect.inner(ratatui::layout::Margin {
                 vertical: 1,
                 horizontal: 2,
             });
-            let message = if let Some(proposal) =
-                model.session.view().consent.as_ref().filter(|_| consent)
-            {
-                format!(
-                    "{}\n{}\n\nOnly Guard's marked block is managed. It affects later Codex processes sharing this Home.",
-                    if proposal.enabled {
-                        "Authorize HTTP_PROXY/HTTPS_PROXY/NO_PROXY in this exact Home:"
-                    } else {
-                        "Remove Guard's unchanged proxy block from this exact Home:"
-                    },
-                    proposal.home.display()
-                )
-            } else {
-                "Stop the shared Codex background server once. This may interrupt other clients' tasks on the same Home.\nThe backend proxy block is prepared before the stop.".to_owned()
-            };
+            let message = confirmation_lines(consent, proposal.as_ref())
+                .iter()
+                .map(|(line, _)| line.as_str())
+                .collect::<Vec<&str>>()
+                .join("\n");
             let lines: Vec<Line> = message.lines().map(Line::from).collect();
             frame.render_widget(
                 Paragraph::new(lines)
@@ -777,16 +906,24 @@ fn render_modal(frame: &mut Frame, model: &Model, area: Rect) {
                     .scroll((model.confirm_scroll as u16, 0)),
                 inner,
             );
-            let confirm = Line::from(vec![
-                Span::styled(
-                    "Type YES to confirm this single operation: ",
-                    Style::default().fg(Color::Yellow),
-                ),
-                Span::styled(
-                    format!("{}_", model.confirm_buffer),
-                    Style::default().bold(),
-                ),
-            ]);
+            let gate_open = confirmation_fully_visible(model.viewport, consent, proposal.as_ref());
+            let confirm = if gate_open {
+                Line::from(vec![
+                    Span::styled(
+                        "Type YES to confirm this single operation: ",
+                        Style::default().fg(Color::Yellow),
+                    ),
+                    Span::styled(
+                        format!("{}_", model.confirm_buffer),
+                        Style::default().bold(),
+                    ),
+                ])
+            } else {
+                Line::from(Span::styled(
+                    "Window too small for the full scope - enlarge it to confirm.",
+                    Style::default().fg(Color::Red),
+                ))
+            };
             frame.render_widget(
                 Paragraph::new(confirm).alignment(Alignment::Left),
                 Rect {
@@ -936,6 +1073,9 @@ fn run_loop(guard: &mut TerminalGuard, config_path: &Path) -> Result<i32> {
                 // Idle Ctrl+C is consumed as a no-op (key events keep their
                 // existing behavior), busy Ctrl+Break cancels the operation.
                 model.session.cancel();
+            }
+            if let Ok(size) = guard.terminal_mut().size() {
+                model.viewport = (size.width, size.height);
             }
             let frame_result = guard.terminal_mut().draw(|frame| render(frame, &model));
             if frame_result.is_err() {
@@ -1123,4 +1263,144 @@ fn apply_action(model: &mut Model, action: Action) -> Result<()> {
 #[allow(dead_code)]
 fn sink(_value: Result<Vec<u16>>) {
     let _ = wide_to_utf8;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cpg_domain::discovery::Desktop;
+    use cpg_engine::SessionServices;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    fn proposal_with_home(home: &str) -> ConsentProposal {
+        ConsentProposal {
+            token: "token".to_owned(),
+            enabled: true,
+            home: PathBuf::from(home),
+            revision: 1,
+        }
+    }
+
+    #[test]
+    fn wrap_row_counts_match_greedy_word_wrap() {
+        assert_eq!(wrapped_rows("aa bb cc", 4), 3);
+        assert_eq!(wrapped_rows("aa bb", 8), 1);
+        assert_eq!(wrapped_rows("abcdefgh", 4), 2, "hard-break overlong words");
+        assert_eq!(wrapped_rows("abcdefghij", 4), 3);
+    }
+
+    #[test]
+    fn confirmation_gate_requires_fullly_visible_scope() {
+        let normal = proposal_with_home(r"C:\Users\luke\.codex");
+        assert!(confirmation_fully_visible((100, 30), true, Some(&normal)));
+        assert!(confirmation_fully_visible((100, 30), false, None));
+        assert!(
+            !confirmation_fully_visible((24, 6), true, Some(&normal)),
+            "tiny window cannot confirm"
+        );
+        assert!(
+            !confirmation_fully_visible((30, 8), true, Some(&normal)),
+            "clipped popup cannot confirm"
+        );
+        // A long Home path widens the popup (capped at 100) so wide
+        // terminals can still confirm, narrow ones cannot.
+        let long_home =
+            proposal_with_home(&(r"C:\Users\".to_owned() + &"x".repeat(64) + r"\.codex"));
+        assert_eq!(long_home.home.display().to_string().len(), 80);
+        assert!(confirmation_fully_visible(
+            (100, 30),
+            true,
+            Some(&long_home)
+        ));
+        assert!(!confirmation_fully_visible(
+            (70, 24),
+            true,
+            Some(&long_home)
+        ));
+        // CJK Home paths measure by display width, not character count.
+        let cjk_home = proposal_with_home(&format!(r"C:\{}", "用".repeat(36)));
+        assert!(
+            !confirmation_fully_visible((72, 24), true, Some(&cjk_home)),
+            "36 CJK characters are 72 columns wide, not 39"
+        );
+        assert!(confirmation_fully_visible((100, 30), true, Some(&cjk_home)));
+    }
+
+    fn model_with_consent(case: &str) -> Model {
+        let directory =
+            std::env::temp_dir().join(format!("cpg-tui-confirm-{}-{case}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("temp dir");
+        let path = directory.join("config.toml");
+        cpg_engine::config_store::initialize_config(
+            &path,
+            &cpg_domain::config::Config::default(),
+            false,
+        )
+        .expect("config");
+        let desktop = Desktop {
+            registered: true,
+            ..Desktop::default()
+        };
+        let services = SessionServices {
+            process: |_| cpg_windows::process_state::ProcessState {
+                state: "stopped",
+                pid: 0,
+            },
+            proposal_home: cpg_engine::config_store::consent_home,
+            discover: Arc::new(move |_config, _cancel| Ok(desktop.clone())),
+            launch: Arc::new(|_config, _path, _options, _cancel, _facts| {
+                Ok(cpg_domain::json::Json::Null)
+            }),
+        };
+        let mut session = EngineSession::with_services(
+            path,
+            services,
+            cpg_engine::session::SessionBudgets {
+                mutation: Duration::from_millis(500),
+                launch: Duration::from_millis(500),
+            },
+            || "not_elevated",
+        )
+        .expect("session");
+        session.request_refresh();
+        while session.busy() {
+            session.poll();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(session.view().consent.is_some(), "consent proposal");
+        Model::new(session)
+    }
+
+    #[test]
+    fn typed_yes_authorizes_only_when_scope_is_visible() {
+        let mut model = model_with_consent("typed-yes");
+        model.modal = Modal::Consent;
+        model.confirm_buffer = "YES".to_owned();
+        model.viewport = (24, 6);
+        let action = model.key(KeyEvent::from(KeyCode::Enter));
+        assert!(
+            matches!(action, Action::None),
+            "clipped scope must not authorize on YES"
+        );
+        // The same typed YES authorizes once the full scope is visible.
+        model.viewport = (100, 30);
+        let action = model.key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(action, Action::ConfirmConsent(_)));
+    }
+
+    #[test]
+    fn shrink_after_typing_blocks_authorization() {
+        let mut model = model_with_consent("shrink");
+        model.modal = Modal::Consent;
+        model.viewport = (100, 30);
+        for character in "YES".chars() {
+            model.key(KeyEvent::from(KeyCode::Char(character)));
+        }
+        // The user typed the confirmation, then shrank the window.
+        model.viewport = (30, 8);
+        let action = model.key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(action, Action::None));
+    }
 }

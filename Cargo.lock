@@ -196,6 +196,7 @@ dependencies = [
  "cpg-windows",
  "crossterm",
  "ratatui",
+ "unicode-width",
 ]
 
 [[package]]
