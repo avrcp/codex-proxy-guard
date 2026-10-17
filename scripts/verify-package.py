@@ -35,6 +35,19 @@ REQUIRED_MANIFEST_KEYS = (
     'schema', 'schema_version', 'version', 'commit', 'dirty',
     'created_utc', 'artifacts', 'executable', 'signed',
 )
+# Rust single-EXE release layout (scripts/build-portable-rust.ps1):
+# exactly these files, no transport ZIP.
+RUST_SCHEMA = 'rust-static-single'
+RUST_REQUIRED_MANIFEST_KEYS = (
+    'schema', 'schema_version', 'version', 'commit', 'dirty', 'created_utc',
+    'language', 'subsystem', 'crt', 'artifacts', 'executable', 'signed',
+    'source_zip', 'mitigations',
+)
+RUST_ARTIFACTS = (
+    'CodexProxyGuard.exe', 'SHA256SUMS', 'build-info.json',
+    'source.zip', 'release-manifest.json',
+)
+RUST_SUMMED_ARTIFACTS = ('CodexProxyGuard.exe', 'build-info.json', 'source.zip')
 ALLOWED_IMPORT_PREFIXES = (
     'ADVAPI32.DLL', 'API-MS-WIN-', 'BCRYPT.DLL', 'CFG.DLL', 'CLR.DLL',
     'COMBASE.DLL', 'COMCTL32.DLL', 'CRYPT32.DLL', 'DBGHELP.DLL',
@@ -498,11 +511,135 @@ def check_signature_facts(manifest: dict) -> None:
         raise SystemExit('Manifest must record signed=true/false')
 
 
+def parse_sums(release: pathlib.Path) -> dict:
+    sums = release / 'SHA256SUMS'
+    if not sums.is_file():
+        raise SystemExit('SHA256SUMS missing')
+    recorded = {}
+    for line in sums.read_text(encoding='utf-8-sig').splitlines():
+        parts = line.split()
+        if len(parts) == 2:
+            recorded[parts[1]] = parts[0]
+    return recorded
+
+
+def verify_rust_release(release: pathlib.Path, manifest: dict, skip_execution: bool) -> None:
+    """Verification of the Rust single-EXE release layout: EXE PE gates,
+    build-info provenance, source ZIP binding, SHA256SUMS, exact artifact
+    set and signature facts - the same parsing cores as static-single."""
+    if manifest.get('schema') != RUST_SCHEMA or manifest.get('schema_version') != 1:
+        raise SystemExit('Unexpected manifest schema')
+    if manifest.get('dirty') is not False:
+        raise SystemExit('Release provenance must describe a clean commit')
+    if manifest.get('language') != 'Rust':
+        raise SystemExit('Manifest must record the Rust language')
+    if manifest.get('subsystem') != 'console':
+        raise SystemExit('Manifest must record the console subsystem')
+    if manifest.get('crt') != 'static':
+        raise SystemExit('Manifest must record the static CRT')
+    if manifest.get('qt'):
+        raise SystemExit('Manifest claims Qt linkage in a no-Qt release')
+    if manifest.get('powershell_appx_discovery'):
+        raise SystemExit('Manifest claims PowerShell discovery in a native-discovery release')
+
+    executable = release / 'CodexProxyGuard.exe'
+    if not executable.is_file():
+        raise SystemExit('CodexProxyGuard.exe missing from the release')
+    exe_bytes = executable.read_bytes()
+    exe_digest = file_digest(executable)
+    if manifest['executable'].get('sha256') != exe_digest:
+        raise SystemExit('EXE digest does not match the manifest')
+    if manifest['executable'].get('size') != len(exe_bytes):
+        raise SystemExit('EXE size does not match the manifest')
+    if pe_subsystem(exe_bytes) != 3:
+        raise SystemExit('EXE is not a console-subsystem binary')
+    imports = pe_imports(exe_bytes)
+    if not imports:
+        raise SystemExit('EXE import table is empty or unreadable')
+    forbidden = [name for name in imports if not name.startswith(ALLOWED_IMPORT_PREFIXES)]
+    if forbidden:
+        raise SystemExit(f'Non-system import detected: {", ".join(forbidden)}')
+    for name in imports:
+        if name.startswith(('QT6', 'MSVCP140', 'VCRUNTIME140', 'CONCRT140', 'VCRUNTIME140_1')):
+            raise SystemExit(f'Forbidden CRT/Qt import: {name}')
+
+    mitigations = pe_mitigations(exe_bytes)
+    missing = [name for name in REQUIRED_MITIGATIONS if not mitigations.get(name)]
+    if missing:
+        raise SystemExit(f'PE mitigation gate failed, missing: {", ".join(missing)}')
+    if manifest.get('mitigations') != mitigations:
+        raise SystemExit('Manifest mitigations disagree with the PE headers')
+
+    # Provenance: the build-info.json fact must agree with the manifest, and
+    # (outside the fixture suite) with what the packaged EXE itself prints.
+    info = json.loads((release / 'build-info.json').read_text(encoding='utf-8-sig'))
+    if info.get('version') != manifest['version']:
+        raise SystemExit('Packaged build-info version mismatch')
+    if info.get('commit') != manifest['commit']:
+        raise SystemExit('Packaged build-info commit mismatch')
+    if info.get('dirty') is not False:
+        raise SystemExit('Packaged build-info is not a clean commit')
+    if info.get('language') != 'Rust':
+        raise SystemExit('Packaged build-info language mismatch')
+    if not skip_execution:
+        executed = json.loads(run(executable, 'build-info'))
+        if executed != info:
+            raise SystemExit('Executed build-info disagrees with build-info.json')
+        run(executable, '--version')
+        run(executable, '--help')
+        licenses = run(executable, 'licenses')
+        if '===== LICENSE =====' not in licenses:
+            raise SystemExit('Embedded license stream incomplete')
+
+    source = release / 'source.zip'
+    if not source.is_file():
+        raise SystemExit('source.zip missing from the release')
+    source_digest = file_digest(source)
+    if manifest.get('source_zip', {}).get('sha256') != source_digest:
+        raise SystemExit('Source ZIP digest does not match the manifest')
+    if manifest.get('source_zip', {}).get('path') != source.name:
+        raise SystemExit('Source ZIP path does not match the manifest')
+    with zipfile.ZipFile(source) as bundle:
+        if bundle.comment != manifest['commit'].encode('ascii'):
+            raise SystemExit('Source ZIP Git commit does not match the manifest')
+        if bundle.testzip() is not None:
+            raise SystemExit('Source ZIP CRC failed')
+        for entry in bundle.infolist():
+            name = entry.filename.replace('\\', '/')
+            if name.endswith('/'):
+                continue
+            if name.lower().endswith(FORBIDDEN_SOURCE_SUFFIXES):
+                raise SystemExit(f'Source ZIP contains a build product: {name}')
+            segments = [segment.lower() for segment in name.split('/')[:-1]]
+            if any(segment in FORBIDDEN_SOURCE_SEGMENTS for segment in segments):
+                raise SystemExit(f'Source ZIP contains a forbidden directory: {name}')
+
+    recorded = parse_sums(release)
+    if sorted(recorded) != sorted(RUST_SUMMED_ARTIFACTS):
+        raise SystemExit(
+            f'SHA256SUMS must cover exactly {sorted(RUST_SUMMED_ARTIFACTS)}, '
+            f'found {sorted(recorded)}')
+    for name, recorded_digest in recorded.items():
+        if file_digest(release / name) != recorded_digest:
+            raise SystemExit(f'SHA256SUMS digest mismatch for {name}')
+    if recorded['CodexProxyGuard.exe'] != exe_digest:
+        raise SystemExit('SHA256SUMS EXE digest mismatch')
+
+    check_artifact_set(release, manifest)
+
+    check_signature_facts(manifest)
+    if manifest.get('signed') is True:
+        verify_authenticode(executable.resolve())
+    print(f'verified {release.name}: {exe_digest[:16]}... '
+          f'({len(exe_bytes)} bytes, imports: {", ".join(imports)})')
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument('--release', help='release directory to verify')
     parser.add_argument('--schema', default='static-single',
-                        choices=['static-single'], help='expected package schema')
+                        choices=['static-single', RUST_SCHEMA],
+                        help='expected package schema')
     parser.add_argument('--mitigations-of', metavar='EXE',
                         help='print the PE mitigation facts of an EXE as JSON and exit')
     parser.add_argument('--skip-execution', action='store_true',
@@ -518,6 +655,12 @@ def main() -> None:
         raise SystemExit(f'Release directory missing: {release}')
 
     manifest = json.loads((release / 'release-manifest.json').read_text(encoding='utf-8-sig'))
+    if args.schema == RUST_SCHEMA:
+        for key in RUST_REQUIRED_MANIFEST_KEYS:
+            if key not in manifest:
+                raise SystemExit(f'release-manifest.json missing key: {key}')
+        verify_rust_release(release, manifest, args.skip_execution)
+        return
     for key in REQUIRED_MANIFEST_KEYS:
         if key not in manifest:
             raise SystemExit(f'release-manifest.json missing key: {key}')

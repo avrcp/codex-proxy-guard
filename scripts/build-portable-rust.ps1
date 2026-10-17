@@ -90,14 +90,17 @@ try {
         New-Item -ItemType Directory -Path $PackageDir | Out-Null
         Copy-Item $Exe -Destination (Join-Path $PackageDir "CodexProxyGuard.exe")
 
-        # 5. Build info + digests.
+        # 5. Build info + source archive (no digests yet).
         & (Join-Path $PackageDir "CodexProxyGuard.exe") build-info | Out-File -Encoding utf8 (Join-Path $PackageDir "build-info.json")
-        $Hash = (Get-FileHash $Exe -Algorithm SHA256).Hash
-        "$Hash  CodexProxyGuard.exe" | Out-File -Encoding ascii (Join-Path $PackageDir "SHA256SUMS")
+        if ($LASTEXITCODE -ne 0) { Fail "packaged EXE build-info failed." }
         Copy-Item $Archive -Destination (Join-Path $PackageDir "source.zip")
 
-        # 6. Signing (public releases must be Authenticode-signed).
+        # 6. Signing BEFORE any digest is recorded: Authenticode changes the
+        #    EXE bytes, so SHA256SUMS written earlier would describe a file
+        #    that no longer exists (audit F06). The signature is then queried
+        #    independently - signtool's exit code alone is not proof.
         $signState = "UNSIGNED DEVELOPMENT BUILD"
+        $signerFacts = $null
         if ($Sign) {
             $signState = "SIGNED"
             $signtool = Get-Command signtool.exe -ErrorAction SilentlyContinue
@@ -113,6 +116,16 @@ try {
             if (-not $signtool) { Fail "signtool.exe not found for signing." }
             & $signtool.Source sign /fd SHA256 /sha1 $CertificateSha1 /tr http://timestamp.digicert.com /td SHA256 (Join-Path $PackageDir "CodexProxyGuard.exe")
             if ($LASTEXITCODE -ne 0) { Fail "signtool failed." }
+            $signature = Get-AuthenticodeSignature -FilePath (Join-Path $PackageDir "CodexProxyGuard.exe")
+            if ($signature.Status -ne "Valid") {
+                Fail "independent signature query reports Status=$($signature.Status); refusing to release."
+            }
+            if (-not $signature.SignerCertificate) { Fail "signature carries no signer certificate." }
+            $signerFacts = @{
+                Thumbprint = $signature.SignerCertificate.Thumbprint
+                Publisher = $signature.SignerCertificate.Subject
+                Timestamp = ($null -ne $signature.TimeStamperCertificate)
+            }
         }
 
         Write-Host "Package state: $signState" -ForegroundColor Yellow
@@ -120,12 +133,39 @@ try {
             Fail "unsigned build requires -AllowUnsignedDev."
         }
 
-        # 7. Immutable promotion with one atomic move.
+        # 7. Manifest + SHA256SUMS over the FINAL artifacts, then the full
+        #    independent verifier (PE gates, provenance, source binding,
+        #    offline CLI smoke, signature) - promotion only on success.
+        $manifestArgs = @(
+            (Join-Path $Repo "scripts\write-rust-manifest.py"),
+            "--release", $PackageDir,
+            "--version", $Version,
+            "--commit", $commit
+        )
+        if ($Sign) {
+            $manifestArgs += @(
+                "--signed",
+                "--thumbprint", $signerFacts.Thumbprint,
+                "--expected-thumbprint", $CertificateSha1,
+                "--publisher", $signerFacts.Publisher,
+                "--timestamp-present", "$(if ($signerFacts.Timestamp) {'true'} else {'false'})"
+            )
+        } else {
+            $manifestArgs += "--unsigned-dev"
+        }
+        & python $manifestArgs
+        if ($LASTEXITCODE -ne 0) { Fail "manifest generation failed." }
+
+        & python (Join-Path $Repo "scripts\verify-package.py") --release $PackageDir --schema rust-static-single
+        if ($LASTEXITCODE -ne 0) { Fail "package verification failed; nothing was promoted." }
+
+        # 8. Immutable promotion with one atomic move.
         New-Item -ItemType Directory -Path $ReleaseRoot -Force | Out-Null
         Move-Item $PackageDir -Destination $ReleaseDir
+        $VerifiedHash = (Get-FileHash (Join-Path $ReleaseDir "CodexProxyGuard.exe") -Algorithm SHA256).Hash
         Write-Host ""
         Write-Host "RELEASE READY: $ReleaseDir" -ForegroundColor Green
-        Write-Host "  EXE SHA256: $Hash"
+        Write-Host "  EXE SHA256: $VerifiedHash"
         Write-Host "  Sign state: $signState"
         Write-Host "  public_release_ready: $(if ($signState -eq 'SIGNED') {'YES'} else {'BLOCKED (unsigned dev build)'})"
     }
