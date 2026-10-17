@@ -909,6 +909,13 @@ pub fn run(config_path: &Path) -> Result<i32> {
 }
 
 fn run_loop(guard: &mut TerminalGuard, config_path: &Path) -> Result<i32> {
+    // Console control handler for this process: raw mode keeps Ctrl+C
+    // arriving as ordinary key events (handled by `Model::key`), so this
+    // scope covers Ctrl+Break, window Close and logoff/shutdown. Close
+    // routes to cancel-and-exit; the OS enforces its own final termination
+    // deadline after CTRL_CLOSE_EVENT, so settlement is bounded by the
+    // engine's reap, not by an unbounded wait.
+    let controls = cpg_windows::console::ConsoleControlScope::new();
     let stdout = std::io::stdout();
     {
         let mut locked = stdout.lock();
@@ -920,6 +927,16 @@ fn run_loop(guard: &mut TerminalGuard, config_path: &Path) -> Result<i32> {
         model.session.request_refresh();
         model.synchronize();
         loop {
+            if controls.take_close() {
+                model.exit_requested = true;
+                if model.session.busy() {
+                    model.session.cancel();
+                }
+            } else if controls.take_cancel() && model.session.busy() {
+                // Idle Ctrl+C is consumed as a no-op (key events keep their
+                // existing behavior), busy Ctrl+Break cancels the operation.
+                model.session.cancel();
+            }
             let frame_result = guard.terminal_mut().draw(|frame| render(frame, &model));
             if frame_result.is_err() {
                 return Err(Error::new(
