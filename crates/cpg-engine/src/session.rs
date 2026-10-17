@@ -448,10 +448,9 @@ enum Task {
 }
 
 impl Task {
-    fn run(self, session: &SessionShared) -> TaskResult {
-        let cancel = session.cancel.clone();
+    fn run(self, session: &SessionShared, cancel: &Cancellation) -> TaskResult {
         match self {
-            Task::Refresh => refresh(&session.path, &session.services, &cancel),
+            Task::Refresh => refresh(&session.path, &session.services, cancel),
             Task::SetProxy {
                 expected,
                 invalid,
@@ -461,7 +460,7 @@ impl Task {
                 match config_store::update_proxy(&session.path, &expected, invalid, &host, port) {
                     Ok(updated) => {
                         let _ = cancel.check(); // a committed write stays authoritative even when cancelled here
-                        let mut result = refresh(&session.path, &session.services, &cancel);
+                        let mut result = refresh(&session.path, &session.services, cancel);
                         let mutation = MutationOutcome {
                             committed: true,
                             committed_config: Some(updated.clone()),
@@ -493,7 +492,7 @@ impl Task {
                 ) {
                     Ok(updated) => {
                         let _ = cancel.check(); // a committed write stays authoritative even when cancelled here
-                        let mut result = refresh(&session.path, &session.services, &cancel);
+                        let mut result = refresh(&session.path, &session.services, cancel);
                         result.mutation = Some(MutationOutcome {
                             committed: true,
                             committed_config: Some(updated.clone()),
@@ -524,7 +523,7 @@ impl Task {
                         repair,
                         activation_only: false,
                     },
-                    &cancel,
+                    cancel,
                     Some(&mut facts),
                 );
                 let mut result = TaskResult::default();
@@ -589,7 +588,6 @@ fn refresh(path: &Path, services: &SessionServices, cancel: &Cancellation) -> Ta
 struct SessionShared {
     path: PathBuf,
     services: SessionServices,
-    cancel: Cancellation,
 }
 
 /// The authoritative in-process state boundary.
@@ -611,6 +609,11 @@ pub struct EngineSession {
     launch_outcome: Option<LaunchOutcome>,
     operation_result: Json,
     worker: Option<std::thread::JoinHandle<()>>,
+    /// The cancellation token owned by the in-flight foreground operation.
+    /// A fresh token is minted per dispatch so one operation's cancel or
+    /// timeout event can never pre-cancel the next operation; it is dropped
+    /// only after the worker has been reaped.
+    active_cancel: Option<Cancellation>,
     mailbox: Arc<Mutex<Receiver<TaskResult>>>,
     dispatched_at: Instant,
 }
@@ -640,11 +643,7 @@ impl EngineSession {
             ));
         }
         Ok(EngineSession {
-            shared: Arc::new(SessionShared {
-                path,
-                services,
-                cancel: Cancellation::new(),
-            }),
+            shared: Arc::new(SessionShared { path, services }),
             budgets,
             query_elevation,
             state: TaskResult::default(),
@@ -661,6 +660,7 @@ impl EngineSession {
             launch_outcome: None,
             operation_result: Json::Null,
             worker: None,
+            active_cancel: None,
             mailbox: Arc::new(Mutex::new(mpsc_channel_none())),
             dispatched_at: Instant::now(),
         })
@@ -790,7 +790,9 @@ impl EngineSession {
 
     pub fn cancel(&mut self) {
         if self.pending {
-            self.shared.cancel.cancel();
+            if let Some(cancel) = self.active_cancel.as_ref() {
+                cancel.cancel();
+            }
             self.invalidate();
         }
     }
@@ -804,9 +806,14 @@ impl EngineSession {
         let (sender, receiver) = std::sync::mpsc::channel();
         *self.mailbox.lock().expect("mailbox") = receiver;
         let shared = Arc::clone(&self.shared);
+        // Per-operation cancellation: only the worker of this dispatch holds
+        // this token; the previous operation's cancel state dies with it.
+        let cancel = Cancellation::new();
+        self.active_cancel = Some(cancel.clone());
         let spawned = std::thread::spawn(move || {
-            let result =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| task.run(&shared)));
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                task.run(&shared, &cancel)
+            }));
             let result = match result {
                 Ok(result) => result,
                 Err(_) => TaskResult {
@@ -839,16 +846,20 @@ impl EngineSession {
             if Instant::now() - self.dispatched_at > budget
                 && self.foreground == ForegroundState::Running
             {
-                self.shared.cancel.cancel();
+                if let Some(cancel) = self.active_cancel.as_ref() {
+                    cancel.cancel();
+                }
                 self.invalidate();
                 self.foreground = ForegroundState::CancellingAfterTimeout;
             }
             return Event::None;
         };
-        // Reap the worker before opening the gate.
+        // Reap the worker before opening the gate; the operation's token is
+        // retired together with it so nothing can pre-cancel the next one.
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
+        self.active_cancel = None;
         let exceeded = self.foreground == ForegroundState::CancellingAfterTimeout;
         self.pending = false;
         self.launching = false;
@@ -1471,7 +1482,10 @@ mod tests {
         std::thread::sleep(Duration::from_millis(30));
         session.cancel();
         settle(&mut session);
-        assert!(!session.busy(), "gate reopens after the cancelled task settles");
+        assert!(
+            !session.busy(),
+            "gate reopens after the cancelled task settles"
+        );
         // A later refresh must not inherit the consumed cancellation token.
         session.request_refresh();
         settle(&mut session);
@@ -1506,7 +1520,9 @@ mod tests {
         let outcome = session.launch_outcome().expect("outcome");
         assert!(outcome.exceeded_budget);
         // The next launch runs on a fresh token and completes normally.
-        session.request_launch(false, "").expect("second launch accepted");
+        session
+            .request_launch(false, "")
+            .expect("second launch accepted");
         settle(&mut session);
         let outcome = session.launch_outcome().expect("second outcome");
         assert!(
@@ -1537,7 +1553,9 @@ mod tests {
                 session.view().ready,
                 "round {round}: refresh after cancel must succeed"
             );
-            session.request_launch(false, "").expect("round {round}: launch");
+            session
+                .request_launch(false, "")
+                .expect("round {round}: launch");
             settle(&mut session);
             let outcome = session.launch_outcome().expect("round outcome");
             assert!(
@@ -1568,7 +1586,9 @@ mod tests {
         session.request_refresh();
         settle(&mut session);
         assert!(session.view().ready);
-        session.request_launch(false, "").expect("launch after reap");
+        session
+            .request_launch(false, "")
+            .expect("launch after reap");
         settle(&mut session);
         let outcome = session.launch_outcome().expect("outcome");
         assert!(outcome.error.is_none());
