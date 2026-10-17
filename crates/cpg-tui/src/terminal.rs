@@ -1,14 +1,13 @@
-//! Terminal capability probe and the Ratatui terminal guard: raw mode,
-//! alternate screen (per `tui.alternate_screen`), mouse capture off, and a
-//! restore order that runs even on panic paths.
+//! Terminal capability probe and the Ratatui terminal guard. Initialization
+//! goes through exactly one authoritative Ratatui entry point (which also
+//! installs Ratatui's panic hook); restore mirrors it symmetrically for the
+//! alternate screen, raw mode, keyboard enhancement and cursor visibility.
 
 use cpg_domain::{Error, Result};
 use crossterm::event::{
     KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
-use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-};
+use crossterm::terminal::{LeaveAlternateScreen, disable_raw_mode};
 use crossterm::{execute, queue};
 use std::io::Stdout;
 use std::panic::{self, AssertUnwindSafe};
@@ -27,37 +26,41 @@ pub struct TerminalGuard {
 }
 
 impl TerminalGuard {
-    /// Enters raw mode and (depending on `alternate`) the alternate screen.
+    /// Enters raw mode and (depending on `alternate`) the alternate screen
+    /// through Ratatui's own initialization:
+    /// - `try_init` enables raw mode and enters the alternate screen;
+    /// - `try_init_with_options` enables raw mode only, so
+    ///   `tui.alternate_screen=never` is honored for real.
+    ///
+    /// Both return a `Result` and install Ratatui's restoring panic hook, so
+    /// no manual raw/alternate-screen toggling runs alongside them.
     pub fn enter(alternate: bool) -> Result<TerminalGuard> {
-        enable_raw_mode().map_err(|_| {
+        let terminal = if alternate {
+            ratatui::try_init()
+        } else {
+            ratatui::try_init_with_options(ratatui::TerminalOptions::default())
+        }
+        .map_err(|_| {
             Error::new(
                 "CONSOLE_OUTPUT_FAILED",
-                "Cannot put the console into raw mode.",
+                "Cannot initialize the terminal interface.",
             )
         })?;
-        if alternate {
+        {
             let stdout = std::io::stdout();
             let mut locked = stdout.lock();
-            let _ = execute!(locked, EnterAlternateScreen);
+            // Sent for real (and popped on restore); terminals without the
+            // protocol ignore the sequence.
+            let _ = execute!(
+                locked,
+                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+            );
         }
-        let terminal = ratatui::init(); // uses the ratatui default guard
-        let _ = PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES);
-        let guard = TerminalGuard {
+        Ok(TerminalGuard {
             terminal,
             alternate,
             restored: AtomicBool::new(false),
-        };
-        // Panic hook: restore the terminal before the default hook unwinds.
-        let previous = panic::take_hook();
-        panic::set_hook(Box::new(move |info| {
-            let _ = disable_raw_mode();
-            let stdout = std::io::stdout();
-            let mut locked = stdout.lock();
-            let _ = execute!(locked, LeaveAlternateScreen);
-            let _ = crossterm::cursor::Show;
-            previous(info);
-        }));
-        Ok(guard)
+        })
     }
 
     pub fn terminal_mut(&mut self) -> &mut ratatui::DefaultTerminal {
@@ -77,7 +80,7 @@ impl TerminalGuard {
         use std::io::Write as _;
         let _ = locked.flush();
         let _ = disable_raw_mode();
-        let _ = PopKeyboardEnhancementFlags;
+        let _ = execute!(locked, PopKeyboardEnhancementFlags);
     }
 }
 
