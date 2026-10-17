@@ -1,12 +1,12 @@
 # Codex Proxy Guard
 
-Windows 控制台本地代理启动器：纯 C++20 + Win32，无 Qt、无 PowerShell discovery。`0.7.0-rc.4` 是一个 Console 子系统单文件 EXE（静态 CRT `/MT`；全部对象以 `/guard:cf` 编译，最终映像链接 ASLR/DEP/高熵 VA/CET 加固——CET 以扩展 DLL 特征记录为准），默认提供原生 VT TUI，并通过 Windows 应用模型正确激活已注册的 ChatGPT Desktop。
+Windows 控制台本地代理启动器：纯 Rust 2024 + Win32（`windows` crate）+ Ratatui TUI，无 Qt、无 PowerShell discovery、无 C++ 桥接。`0.8.0-rc.1` 是一个 Console 子系统单文件 EXE（静态 CRT；每个 crate 以 `-C control-flow-guard=checks` 编译，最终映像链接 `/guard:cf /CETCOMPAT /DYNAMICBASE /NXCOMPAT /HIGHENTROPYVA` 加固——CET 以扩展 DLL 特征记录为准），默认提供 Ratatui VT TUI，并通过 Windows 应用模型正确激活已注册的 ChatGPT Desktop。
 
 Guard 将代理参数交给新启动的 ChatGPT Desktop / Codex Desktop，并可在明确授权的 Codex Home 中维护一个代理环境块。它不测量网络连通性，不管理代理服务，不读取认证数据，也不修改 Windows 系统代理或 Codex `config.toml`。
 
 ## 使用（单文件）
 
-正式产物是 `dist/releases/<version>-<commit>/CodexProxyGuard.exe`：复制这一个文件即可运行。无 DLL 依赖、无需安装 VC redist；重命名或放进含中文/空格的目录均正常工作。实际大小与 SHA-256 记录在每次构建的 manifest 中；导入表只依赖 Windows 系统 DLL。
+正式产物是 `dist/releases/<version>-<commit>/CodexProxyGuard.exe`：复制这一个文件即可运行。无 DLL 依赖、无需安装 VC redist；重命名或放进含中文/空格的目录均正常工作。SHA-256 记录在发布目录的 `SHA256SUMS` 中；导入表只依赖 Windows 系统 DLL。
 
 TUI 不是 daemon：关闭 Guard 不会关闭 Desktop；Guard 不管理代理软件，不检测网络，不修改系统代理。VT 输出不可用时自动回退行式控制台。
 
@@ -24,7 +24,7 @@ TUI 不是 daemon：关闭 Guard 不会关闭 Desktop；Guard 不管理代理软
 .\CodexProxyGuard.exe licenses             # 离线输出全部内嵌许可与 notices
 ```
 
-TUI 按键：`Enter`/`L` 启动、`E` 编辑代理、`B` 授权/撤销 Codex 后端代理块、`D` 修复启动、`R`/`F5` 刷新、`?`/`F1` 帮助、`Ctrl+C` 取消前台操作、`Q` 退出。授权与修复须在模态中键入 `YES`；编辑器支持 Tab 切换、Home/End/方向键/退格/删除。TUI 和 plain 通过同进程引擎会话提交操作；原生激活使用短命的自有 worker 子进程。忙时 Q 需明确选择取消并退出，等待自有操作回收后退出；空闲 Ctrl+C 不修改授权提案。
+TUI 按键：`Enter`/`L` 启动、`E` 编辑代理、`B` 授权/撤销 Codex 后端代理块、`D` 修复启动、`R`/`F5` 刷新、`?`/`F1` 帮助、`Ctrl+C` 取消前台操作、`Q` 退出。授权与修复须在模态中键入 `YES`；编辑器支持 Tab 切换（端口仅数字）。TUI 和 plain 通过同进程引擎会话提交操作；原生激活使用短命的自有 worker 子进程。忙时 Q 需明确选择取消并退出，等待自有操作回收后退出；空闲 Ctrl+C 不修改授权提案。
 
 代理编辑器在 Host 或 Port 上按 Enter 都提交完整表单；保存失败保留草稿。若已提交后刷新失败，只重试读取。授权弹窗绑定打开时显示的确切 Home 和一次性提案，配置变化后须重新确认。
 
@@ -32,7 +32,7 @@ TUI 按键：`Enter`/`L` 启动、`E` 编辑代理、`B` 授权/撤销 Codex 后
 
 修复启动每次单独确认，可执行一次公开的 `codex app-server daemon stop`，可能中断其他客户端共享任务。注册应用必须先授权并成功准备代理块。提交激活后取消可能只能报告结果未知（`APPX_ACTIVATION_OUTCOME_UNKNOWN`），不会自动重试。
 
-许可与第三方声明（项目 MIT、toml++、nlohmann/json）全部内嵌在 EXE 内：`licenses` 子命令输出同一内容，离线可用。
+许可与第三方声明（项目 MIT；ratatui、crossterm、toml、windows-rs 的上游许可）全部内嵌在 EXE 内：`licenses` 子命令输出同一内容，离线可用。
 
 ## 配置
 
@@ -54,7 +54,7 @@ manage_codex_proxy_env = false
 alternate_screen = "auto"
 ```
 
-`executable_override` 和 `cli_executable_override` 是可选的绝对 EXE 路径；注册包的 EXE 覆盖仍须经应用模型激活。`tui.alternate_screen` 控制 TUI 备用屏幕（`auto`/`always`/`never`；`always` 且 VT 不可用时回退行式控制台）。
+`executable_override` 和 `cli_executable_override` 是可选的绝对 EXE 路径；注册包的 EXE 覆盖仍须经应用模型激活。`tui.alternate_screen` 控制 TUI 备用屏幕（`auto`/`always`/`never`；VT 不可用时回退行式控制台）。
 
 Guard 的块由 `# BEGIN CODEX PROXY GUARD: proxy-v1` 和对应 END 标记界定。块外原字节保留；现有代理变量（含 `export` 拼写）、异常标记或被修改的块会阻止写入。撤销先安全移除块，再保存关闭授权；失败保持授权和绑定 Home。`init-config --force` 不能覆盖尚未撤销的授权。
 
@@ -62,25 +62,21 @@ Guard 的块由 `# BEGIN CODEX PROXY GUARD: proxy-v1` 和对应 END 标记界定
 
 ## 开发与打包
 
-要求 Windows、MSVC x64、CMake ≥ 3.25、Ninja、Python 3。生产依赖仅 Windows SDK/STL 与 vendored toml++/nlohmann/json；测试使用 vendored doctest。
+要求 Windows、Rust stable（`rust-toolchain.toml` 固定 1.96.0，`x86_64-pc-windows-msvc`）、MSVC 链接工具。生产依赖仅 `windows`/`windows` COM 绑定、ratatui/crossterm、toml；一切 Win32 调用集中在 `crates/cpg-windows`。
 
 ```powershell
-.\scripts\test-noqt.ps1                    # 开发构建 + 全部测试
-.\scripts\build-portable.cmd -AllowUnsignedDev   # 未签名开发发布
-.\scripts\build-portable.cmd -Sign -CertificateSha1 <thumbprint>   # 正式签名发布
+cargo test --workspace                     # 全部 89 个测试
+.\scripts\test-rust.ps1                    # fmt + clippy(-D warnings) + tests + diff 检查
+.\scripts\build-portable-rust.cmd -AllowUnsignedDev       # 未签名开发发布
+.\scripts\build-portable-rust.cmd -Sign -CertificateSha1 <thumbprint>   # 正式签名发布
 ```
 
-发布流水线（clean tree → 固定 commit 的 git archive → 独立源码/构建目录 → 构建 → 全部测试 → 打包 EXE smoke → 导入表扫描 → 可选 Authenticode 签名与验签 → SHA-256 → transport ZIP + source ZIP + size report → release-manifest.json）由 `scripts/verify-package.py --schema static-single` 独立重验后提升到 `dist/releases/<version>-<commit>/`。未签名产物处处标注 `UNSIGNED DEVELOPMENT BUILD`；公开分发要求有效 Authenticode。
+发布流水线（clean tree → 固定 commit 的 git archive → 独立源码目录 → `cargo build --release --locked`（完整硬化 RUSTFLAGS）→ release 模式全测试 → 打包 EXE smoke → SHA-256 → source.zip → 不可变提升到 `dist/releases/<version>-rust-<commit>/`）。未签名产物处处标注 `UNSIGNED DEVELOPMENT BUILD`；公开分发要求有效 Authenticode。PE 缓解与导入表以 `scripts/verify-package.py` 的解析核心核验。
 
-详见[架构](docs/ARCHITECTURE.md)、[安全边界](docs/SECURITY.md)、[TUI 验收](docs/TUI_ACCEPTANCE.md)、[发布就绪状态](docs/RELEASE_READINESS.md)、[迁移记录](docs/CPP_TUI_MIGRATION_PLAN.md)与[第三方许可](THIRD_PARTY_NOTICES.md)。
+详见[架构](docs/ARCHITECTURE.md)、[安全边界](docs/SECURITY.md)、[迁移验收](docs/RUST_TUI_MIGRATION_ACCEPTANCE.md)、[发布就绪状态](docs/RELEASE_READINESS.md)、[基线契约](docs/RUST_MIGRATION_BASELINE.md)与[第三方许可](THIRD_PARTY_NOTICES.md)。
 
 `.env` 写入与撤销要求本地 NTFS 事务可用；不支持时保留授权并拒绝修改，无非事务回退。
 
-## Rust track (0.8.0-rc.1)
+## 历史实现
 
-A full Rust + Ratatui rewrite of the product lives alongside the C++
-implementation on branch `refactor/rust-ratatui-single-exe`; see
-[docs/RUST_TRACK.md](docs/RUST_TRACK.md) and the acceptance record in
-[docs/RUST_TUI_MIGRATION_ACCEPTANCE.md](docs/RUST_TUI_MIGRATION_ACCEPTANCE.md).
-The C++ build remains the product of record until the Rust build passes
-the human real-machine acceptance matrix.
+C++（0.7.x）与 Qt（0.6.x）实现已从工作树退役，可经 git 历史检索（C++ 最后提交 `0bdf2ed`；Qt 时代见 `v0.6.1-rc.1` 标签）。

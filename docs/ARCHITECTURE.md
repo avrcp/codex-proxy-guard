@@ -1,15 +1,18 @@
 # Architecture
 
-The application is pure C++20 over the Windows SDK and the STL: no Qt, no
-Rust, no FFI, no telemetry. The single production executable —
-`CodexProxyGuard.exe` — is a Console-subsystem binary built by the root CMake
-project with MSVC `/W4 /WX`, the static CRT (`/MT`), and the `/sdl` +
-`/guard:cf` hardening applied to **every** compiled object through the shared
-`cpg_build_options` INTERFACE target (library code included, so CFG has no
-partial-coverage hole), plus the /guard:cf/DYNAMICBASE/NXCOMPAT/
-HIGHENTROPYVA/CETCOMPAT link flags. Runtime dependencies are vendored
-header-only libraries (toml++ 3.4.0, nlohmann/json 3.12.0); test binaries
-additionally use vendored doctest 2.4.12.
+The application is pure Rust 2024 over the `windows` crate bindings: no
+Qt, no C/C++ product code, no FFI bridges, no telemetry. The single
+production executable — `CodexProxyGuard.exe` — is a Console-subsystem
+binary built by the Cargo workspace with the toolchain pinned in
+`rust-toolchain.toml`. Hardening is applied to **every** crate through
+`.cargo/config.toml` (`-C control-flow-guard=checks` codegen plus
+`/CETCOMPAT /guard:cf /DYNAMICBASE /NXCOMPAT /HIGHENTROPYVA` link args);
+the release script re-sets the identical set through the environment
+because an env RUSTFLAGS replaces config rustflags. The static CRT is a
+release-build selection (`+crt-static`). Runtime dependencies are the
+`windows`/`windows-strings` bindings, `ratatui` + `crossterm` for the
+frontend, and `toml` for configuration parsing; the binary imports only
+Windows system DLLs.
 
 ## One executable, two process roles
 
@@ -19,117 +22,128 @@ CodexProxyGuard.exe                       interactive TUI (same process)
        internal-activate-package          short-lived activation worker
 ```
 
-The TUI talks to the engine **in-process**: `app/main.cpp` receives Unicode
-`wmain` arguments, and `backend/src/command_line.*` parses them exactly once.
-The dispatcher resolves the default or explicit configuration path once to
-an absolute path; information commands and workers never load configuration. There is no GUI→bridge self-child anymore; the only
-child process Guard ever spawns is its own short-lived activation worker
-(`CREATE_NO_WINDOW`, redirected stdio) and, on the explicitly confirmed
-repair path, the official Codex CLI running the public
+The TUI talks to the engine **in-process**: `app/src/main.rs` receives
+Unicode arguments, and `app/src/cli.rs` parses them exactly once with the
+strict parser (single-use value options, exact usage text). The dispatcher
+resolves the default or explicit configuration path once to an absolute
+path; information commands and workers never load configuration. The only
+child processes Guard ever spawns are its own short-lived activation
+worker (`CREATE_NO_WINDOW`, redirected stdio) and, on the explicitly
+confirmed repair path, the official Codex CLI running the public
 `app-server daemon stop` command.
 
-The engine layering is strict:
+## Crate layering
 
-- `foundation/`: shared primitives — `publicText` redaction scanner, strict
-  UTF-8 conversions, Windows path normalization/containment/canonicalization
-  through held handles, strict JSON object parsing (duplicate keys at every
-  level via an escape-decoded key walker, depth/size limits, no comments or
-  trailing data), the Win32-event `Cancellation`, `UniqueHandle` RAII, the
-  `UnicodeEnvironment` block builder (emits the CreateProcessW-required
-  ordinal-sorted, duplicate-collapsed double-NUL block) and the bounded
-  `runOwnedProcess` runner (separate program/arguments, no shell; the three
-  child-side pipe ends are duplicated as the only inheritable handles Guard
-  ever holds and passed through a PROC_THREAD_ATTRIBUTE_HANDLE_LIST; stdin is
-  written by a dedicated cancellable writer thread that closes the write end
-  for EOF; stdout/stderr drain concurrently with per-stream limits, read
-  errors are distinguished from EOF, the verdict is re-checked after all
-  joins so a fast-exiting flood cannot pass as normal, and post-submission
-  failures keep the outcome-unknown semantics).
-- `backend/src/core.*`: strict TOML via toml++ 3.4.0, loopback validation,
-  config transactions/read leases, marked `.env` transactions, redaction and
-  strict UTF-8/JSON.
-- `backend/src/platform.*` + `package_discovery.*`: native AppModel package
-  discovery (`FindPackagesByPackageFamily`/`PackageIdFromFullName`/
-  `GetPackagePathByFullName`/IAppxFactory manifest reader — no PowerShell,
-  no fallback to it), process/root and elevation checks, owned helper
-  execution, native activation and held-handle package/AUMID/elevation/
-  creation/lifetime observations.
-- `backend/src/launch.*`: Chromium proxy arguments, process environment,
-  safe CLI resolution, explicit public daemon stop, cross-process startup
-  lock and the shared launch pipeline.
-- `backend/src/session.*`: the transport-free engine session — candidate
-  validation, single-use confirmation tokens, the one-foreground-effect
-  gate, TaskResult application. It is the single state machine behind every
-  interactive frontend; its typed `SessionView` is the frontend view. JSON remains an external
-  adapter for CLI and worker protocols.
-- `backend/src/cli.*`: the headless CLI and the `licenses` notice streamer
-  (embedded RCDATA resources, no GUI, no configuration, no network).
-- `tui/src`: the Win32 VT TUI — `TerminalSession` (RAII console modes, VT
-  enable, alternate screen, acquired cursor/mode restoration), `ReadConsoleInputW`
-  normalization, an off-screen `Screen` cell model with a single-write VT
-  renderer, Unicode display width (surrogate pairs, combining marks,
-  fullwidth forms), the `TuiState` modal machine (proxy editor, YES-typed
-  consent/repair confirmations, error modal with suggested follow-ups and a
-  redacted clipboard diagnostic, help, too-small notice) and the plain
-  line console fallback (`cli_console.cpp`).
-- `app/`: the single Unicode production entry and the embedded
-  notice and VERSIONINFO resources.
+```text
+                     app (strict CLI + role dispatcher)
+                       │
+             ┌─────────┴─────────┐
+             ▼                   ▼
+         cpg-tui             cpg-engine
+             │                   │
+             └─────► cpg-domain ◄┘
+                                 ▲
+                                 │
+                            cpg-windows
+```
 
-The thin `TuiController` is shared by production VT, plain mode and tests.
-It applies busy state immediately between keys, binds saves to operation IDs,
-and preserves diagnostics and receipts when a read or clipboard operation fails.
-Console signals are handled through the shared `ConsoleControlScope`; the
-owner cancels and settles its operation, then restores the terminal before
-acknowledging close. The handler waits at most 3500 ms for that acknowledgement;
-Windows still imposes the final shutdown deadline. Plain input waits on both
-console records and control events. Redirected pipes remain cancellable while
-their writers are idle; redirected disk files are supported. Non-console
-character devices (including NUL) are refused instead of risking a blocking
-device read.
-
-The engine never links the TUI; the entry point injects the interactive
-frontend through a function pointer, keeping `guard_engine` free of any
-frontend dependency.
+- `crates/cpg-domain`: pure contracts, zero I/O. `config.rs` holds schema
+  v2 plus the byte-exact canonical serializer the product writes
+  (alphabetical tables/keys, literal `'…'` strings, `[ 'a', 'b' ]`
+  arrays — parity pinned by `tests/golden/`). `json.rs` is the strict
+  JSON parser/serializer (escape-decoded duplicate-key rejection at every
+  level, depth ≤ 64, integer shape preservation, compact dump). `text.rs`
+  is the `publicText` redaction scanner (USERPROFILE masking, ANSI/OSC
+  removal, URI credentials, secret lines, control/format filtering).
+  `proxy.rs` implements strict port parsing and loopback classification
+  with InetPton semantics; `dotenv.rs` the managed-block lexical gate,
+  generated-value validation and splice computation; `discovery.rs` the
+  AppModel record-selection rules behind an injected `FsProbe`;
+  `worker.rs` the activation request/receipt protocol validation.
+- `crates/cpg-windows`: the only crate with `unsafe`. `handles`
+  (RAII OwnedHandle), `cancellation` (manual-reset event + atomic flag),
+  `fsio` (bounded whole-file read/seek-zero write), `paths` (known
+  folders, cleanPath normalization with case folding, final-path
+  canonicalization through held handles, containment), `environment`
+  (ordinal-sorted duplicate-collapsed CreateProcessW blocks),
+  `process` (the bounded owned-process runner: three inheritable
+  duplicates through a PROC_THREAD_ATTRIBUTE_HANDLE_LIST, concurrent
+  stdout/stderr drains with per-stream limits, a cancellable stdin writer
+  thread, hard settle of child and threads before any verdict, the full
+  HELPER_* failure taxonomy and activation outcome-unknown semantics),
+  `txf` (NTFS transactions with commit/rollback proof),
+  `console` (control-handler latch, mode guards, stdin framing probe,
+  run_console_operation), `elevation` (TokenElevation gates),
+  `process_state` (Toolhelp snapshot with the Electron-helper rule),
+  `clipboard` (CF_UNICODETEXT), `appmodel` (native discovery:
+  FindPackagesByPackageFamily → PackageIdFromFullName →
+  GetPackagePathByFullName → IAppxFactory manifest reader) and
+  `activation` (IApplicationActivationManager + held-handle identity
+  observation).
+- `crates/cpg-engine`: `config_store.rs` — held write transactions with
+  expected-content gates and consent-evidence preservation, the launch
+  read lease, `absoluteHome`/`boundHome` scoping, TxF-guarded `.env`
+  prepare/revoke with expected-bytes re-read inside the transaction, and
+  the consent enable/revoke ordering (revoke removes the block before
+  consent is persisted; failures stay retryable). `launch.rs` — proxy
+  plan (Chromium bypass list), Unicode proxy environment, safe CLI
+  resolution (absolute .exe override, explicit CODEX_HOME, known layouts,
+  PATH absolute dirs), exactly-one public daemon stop after preparation,
+  the cross-process startup lock exposed as the injectable
+  `mark_submitted` seam, receipt classification and the shared
+  `launch_with` orchestration used by tests and production alike.
+  `session.rs` — `EngineSession`: the transport-free state machine
+  (typed `SessionView`, single-use CSPRNG confirmation tokens bound to
+  revision + Home + confirmed config, the one-foreground-effect gate that
+  stays busy through `CancellingAfterTimeout` until the worker is reaped,
+  committed-mutation facts that survive refresh failures).
+- `crates/cpg-tui`: `terminal.rs` (capability probe, raw-mode/alternate
+  screen guard with panic-path restore), `app.rs` (Ratatui event loop,
+  modal machine — proxy editor, YES-typed consent/repair, result/help/
+  quit-while-busy — key translation, redacted clipboard diagnostic) and
+  `plain.rs` (the line console fallback). The frontends never decide
+  authorization; they render `SessionView` and forward intents.
+- `app`: `cli.rs` (strict parser + dispatcher + launch), `worker.rs`
+  (bounded stdin framing, schema-v1 validation, COM activation, receipt
+  self-validation), `build_info.rs` (compile-time provenance via
+  `option_env!` — absent values are honestly unknown/dirty), `licenses.rs`
+  (embedded offline notice stream).
 
 ## State and execution
 
-`Action -> candidate validation -> authorization -> commit foreground effect
--> dispatch -> TaskResult` remains the boundary. A session accepts at most
-one foreground effect; busy state gates every destructive key except
+`Action → candidate validation → authorization → commit foreground
+effect → dispatch → TaskResult` remains the boundary. A session accepts at
+most one foreground effect; busy state gates every destructive key except
 Ctrl+C and the busy-quit prompt. When an operation exceeds its
-`SessionBudgets` budget the session cancels it but stays busy — refusing new
-operations — until the effect's future is reaped. A budget overrun is retained
-alongside a known receipt or committed configuration, never substituted for
-those facts. Mutation and refresh errors are separate: a successful commit
-followed by a read failure is not retried as a write. Launch results retain
-PID, instance, activation, backend block and daemon facts; the controller
-schedules at most one read-only refresh after settlement and keeps the receipt.
-Nothing is detached or dropped. Consent proposals bind a
-CSPRNG single-use token, target enable value and revision to the current
-config and the exact Home. The dialog retains and submits the same proposal. Mutation
-transactions compare expected config under a held Windows handle. A launch
-holds an incompatible read lease throughout, preventing stale launches from
-recreating an env block after revocation.
-
-The `.env` adapter preserves bytes outside exactly one known marker pair,
-rejects conflicting variables/edited blocks and commits a filesystem
-transaction after content re-verification. Revocation removes the block
-before committing disabled consent. The user Home is resolved explicitly,
-never inferred from Guard's `CODEX_HOME`.
+`SessionBudgets` budget the session cancels it but stays busy — refusing
+new operations — until the effect's worker is reaped. A budget overrun is
+retained alongside a known receipt or committed configuration, never
+substituted for those facts. Mutation and refresh errors are separate: a
+successful commit followed by a read failure is not retried as a write.
+Launch results retain PID, instance, activation, backend block and daemon
+facts; the frontend schedules at most one read-only refresh after
+settlement and keeps the receipt. Consent proposals bind a CSPRNG
+single-use token, target enable value and revision to the current config
+and the exact Home; any refused or failed submission consumes the
+displayed proposal. Mutation transactions compare expected config under a
+held Windows handle; a launch holds an incompatible read lease
+throughout, preventing stale launches from recreating an env block after
+revocation.
 
 ## Launch
 
 Every launch revalidates configuration/elevation and freshly discovers
-Desktop. A per-user cross-process lock serializes startup and holds a short
-post-submission cooldown. Running or uninspectable Desktop roots block
-launch. Registered targets require a FullTrust manifest entry and dynamic
-AUMID, then use `AO_NONE` through the short-lived activation worker. The
-worker needs no package identity. It observes the returned PID via a held
-process handle and never owns Desktop's lifetime. Failure after submission
-may mean an already-started Desktop; there is no retry or bare-EXE fallback.
-Normal launch never resolves the Codex CLI. Repair first prepares an
-authorized proxy block, then resolves an absolute CLI and performs at most
-one public `app-server daemon stop` (720-second total budget).
+Desktop. A per-user cross-process lock serializes startup (5-second
+cooldown) and is marked at the submission boundary. Running or
+uninspectable Desktop roots block launch. Registered targets require a
+FullTrust manifest entry and dynamic AUMID, then use `AO_NONE` through
+the short-lived activation worker. The worker needs no package identity;
+it observes the returned PID via a held process handle and never owns
+Desktop's lifetime. Failure after submission may mean an already-started
+Desktop; there is no retry or bare-EXE fallback. Normal launch never
+resolves the Codex CLI. Repair first prepares an authorized proxy block,
+then resolves an absolute CLI and performs at most one public
+`app-server daemon stop` (720-second total budget).
 
 Package discovery is a family allowlist (publisher id measured from the
 installed package) resolved through native APIs; a stale allowlist yields
@@ -138,48 +152,32 @@ re-derived from `PackageIdFromFullName` and compared before any launch.
 
 ## Verification
 
-doctest suites cover foundation primitives (text/path/json/process),
-engine core/platform/launch/CLI, TUI state/width/clipping/session, and the
-verifier fixtures (`scripts/tests/test_verify_package.py`). The engine
-platform suite includes the native-discovery parity gate against the frozen
-PowerShell baseline fixture.
-`scripts/test-noqt.ps1` runs every suite;
-`scripts/build-portable.cmd` repeats the release tests, executes the
-packaged EXE's build-info, scans imports, (optionally) signs and verifies,
-and re-verifies every artifact through `scripts/verify-package.py --schema
-static-single` before promotion to `dist/releases/<version>-<commit>`.
-The canonical build holds an exclusive release lock, captures source with
-`git archive` at the fixed commit (including tracked hidden files), and builds
-that snapshot in unique directories under `target`. Plain smoke uses a fresh
-temporary configuration. Signing tools are required only for signed builds.
-Release directories are immutable — the build refuses to overwrite an
-existing version/commit — and the verifier additionally binds the source
-ZIP digest across the sidecar/manifest/SHA256SUMS, rejects build products
-inside it, requires the exact artifact set, re-validates signed releases
-through WinVerifyTrust, and gates the PE on CFG instrumentation (FID table),
-ASLR, NX, high-entropy VA and CET before promotion.
-Rollback to the Qt era is the `qt-gui-v0.6.1-rc.1` tag
-(see `docs/history/QT_GUI_HISTORY.md`).
+`cargo test --workspace` runs 89 tests across the four crates: domain
+contracts (including byte-exact golden roundtrips against the frozen C++
+fixtures in `tests/golden/`), windows adapter (real-machine TxF
+commit/rollback, owned-process budgets, native package reads),
+engine/session (busy gate, single-use tokens, exactly-once daemon stop,
+timeout reap) and CLI parsing parity. `scripts/test-rust.ps1` adds
+`cargo fmt --check`, `clippy -D warnings` and `git diff --check`.
+`scripts/build-portable-rust.ps1` builds from a pinned `git archive`
+snapshot in unique staging directories with the full hardening RUSTFLAGS,
+runs the release-mode tests, records provenance and SHA-256, optionally
+signs, and promotes immutably to `dist/releases/<version>-rust-<commit>`.
+The PE mitigation and import gates use the `verify-package.py` parsing
+core; its zip/manifest schema still targets the retired C++ layout and is
+tracked follow-up work. The full migration record — including which
+matrix rows are machine-verified vs operator-confirmed — is
+`docs/RUST_TUI_MIGRATION_ACCEPTANCE.md`.
 
 ## Filesystem transaction decision
 
 A held Windows reader can exclude writers, but allowing an atomic
 replacement also allows a different editor to rename-save between
 verification and replacement. A second content check does not close that
-window. The `.env` adapter therefore uses an isolated NTFS transaction for
-expected-content comparison and atomic write/delete commit. Unsupported
-filesystems/runtime configurations fail closed; there is no nontransactional
+window. The `.env` adapter therefore uses an isolated NTFS transaction
+for expected-content comparison and atomic write/delete commit.
+Unsupported filesystems/runtime configurations fail closed
+(`BACKEND_PROXY_ENV_ATOMIC_UNAVAILABLE`); there is no nontransactional
 fallback and no change to system policy. If TxF is removed or disabled,
 backend block management must be redesigned or refused; ordinary launches
 without that optional block remain available.
-
-## Native build dependencies
-
-The Ninja build probes `/showIncludes` without code page conversion, preserving
-the compiler's actual dependency-prefix bytes. This avoids stale objects when
-MSVC diagnostics use a different encoding from CMake's AUTO decoding. The
-probe is project-local and does not modify the installed toolchain.
-Release path checks reject outside-target intermediates and junction ancestors
-before creation and promotion. They guard misconfiguration; the release script
-is not a security boundary against a malicious actor with the same filesystem
-permissions replacing directories between a path check and a filesystem call.

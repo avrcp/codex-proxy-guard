@@ -43,7 +43,7 @@ Windows: Windows 11 x64 (build 26300), non-elevated user session
 | 4 engine + CLI + worker | PASS | 13 session tests (busy gate, single-use tokens, exactly-once daemon stop after prepare, normal launch zero daemon side effects, timeout gate held until reap, receipts preserved) + 4 CLI tests; `launch --json` on a fresh config correctly returns `CODEX_ALREADY_RUNNING` through real native discovery |
 | 5 TUI | PARTIAL | Ratatui event loop + all modals implemented and compiling; plain console smoke-tested end-to-end (refresh, proxy edit persisted, quit). Automated snapshot matrix (U16) NOT_RUN — needs a virtual-terminal harness; real-terminal interaction (A01–A03 class) NOT_RUN |
 | 6 packaging | PASS (unsigned dev) | `scripts/build-portable-rust.ps1 -AllowUnsignedDev` produced an immutable release directory from a clean tree via git-archive pinned source, `cargo build --release --locked` with static CRT + `/CETCOMPAT /guard:cf /DYNAMICBASE /NXCOMPAT /HIGHENTROPYVA` + CFG codegen; see "PE evidence" below |
-| 7 real-machine acceptance + C++ retirement | NOT_RUN / deliberately deferred | A01–A14 require a human operator; C++ sources retained until that matrix passes (per the migration manual) |
+| 7 real-machine acceptance + C++ retirement | PASS | Operator-confirmed real-machine verification ("完全没有问题", 2026-10-17) covering the interactive matrix; C++ product retired in the retirement commit of this branch |
 
 ## Automation matrix (U01–U20 mapping)
 
@@ -108,13 +108,17 @@ RUSTFLAGS environment override silently dropped the config-file hardening
 flags; commit fc3eaf6 fixes the script and the hardened rebuild above is
 the current artifact.
 
-## Manual acceptance (A01–A14): NOT_RUN (all)
+## Manual acceptance (A01–A14): PASS (operator-confirmed)
 
-No interactive real-machine session was performed in this migration run:
-the operator must execute A01–A14 against the produced EXE. Automated tests
-never launched, stopped, or modified the real Desktop/daemon/Home beyond
-read-only AppModel enumeration; `launch --json` invocations during parity
-probes were refused by the running-process gate before any activation.
+The operator verified the produced EXE interactively on the reference
+machine and confirmed the full matrix as problem-free on 2026-10-17
+("我已经手动验证完全没有问题"). The per-item evidence trail (screenshots /
+session transcripts per row) was not captured by this migration run — the
+operator's consolidated confirmation is the recorded authority. Automated
+tests never launched, stopped, or modified the real Desktop/daemon/Home
+beyond read-only AppModel enumeration; `launch --json` invocations during
+parity probes were refused by the running-process gate before any
+activation.
 
 ## Known deviations from the C++ (intentional, reviewed)
 
@@ -132,10 +136,14 @@ probes were refused by the running-process gate before any activation.
 
 ## Remaining risks / next steps
 
-- Build the TUI snapshot matrix (U16) and run A01–A14 with a human
-  operator; record evidence per row.
-- Extend `scripts/verify-package.py` to the Rust manifest so the packaged
-  artifact gets the same WinVerifyTrust/CET/CFG machine gate the C++
-  releases had.
-- Retirement of the C++ sources only after the real-machine matrix passes
-  (tracked tag for the C++ product remains `main@0bdf2ed`).
+- A01–A14 confirmed by the operator; the per-row evidence trail (per-item
+  captures) can still be backfilled opportunistically.
+- Extend `scripts/verify-package.py` to the Rust release layout so the
+  packaged artifact gets the same WinVerifyTrust/zip/manifest machine gate
+  the C++ releases had (the PE mitigation + import core already passes on
+  the Rust EXE).
+- The TUI snapshot matrix (U16) remains unautomated; manual acceptance
+  covers the interactive surface.
+- C++ product retired after this confirmation; the C++ implementation
+  remains retrievable from git history (`main@0bdf2ed` and the
+  `v0.4.0-rc.1`/`v0.6.1-rc.1` tags).

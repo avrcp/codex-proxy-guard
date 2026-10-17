@@ -10,7 +10,7 @@ PE 只按 x64/PE32+ 解析且越界即失败。CET 兼容仅以
 二者都不是 CET 证据；记录截断按解析失败处理，不取猜测值。`cet_compat=true`
 只表示映像标记，不表示运行时硬件 shadow stack 已启用；PE 的 CFG 标志证明
 映像级事实，不证明每个对象文件都以 `/guard:cf` 编译——对象级覆盖来自共享
-构建选项。签名事实（publisher、签名者指纹、时间戳、验证策略）来自签名对象
+RUSTFLAGS（作用于每个 crate）。签名事实（publisher、签名者指纹、时间戳、验证策略）来自签名对象
 与独立 `WinVerifyTrust`（VERIFY→CLOSE 配对，仅状态 0 视为有效；清理失败不会
 被当成 Valid），本地化 signtool 文本永不解析。签名不能保证杀软永不拦截，
 SmartScreen 对新签名文件仍可能出现信誉提示。
@@ -21,7 +21,7 @@ The TUI runs the engine in-process through the shared EngineSession: it
 renders the session snapshot (the same view model every frontend consumes)
 and maps keys to typed session requests. It cannot issue arbitrary engine
 operations, edit TOML or `.env` itself, or bypass candidate validation. Backend
-consent and repair each require a YES-typed modal bound to a single-use C++
+consent and repair each require a YES-typed modal bound to a single-use engine
 confirmation token tied to the displayed scope and current configuration.
 The plain line console is the same contract in line form.
 

@@ -1,43 +1,31 @@
 # Third-party notices
 
 Codex Proxy Guard's own code is MIT licensed; see `LICENSE`. The complete
-notice set — this file, `LICENSE`, and the vendored third-party licenses
-below — is embedded in the release executable and can be read offline with
-`CodexProxyGuard.exe licenses`. The 0.6.x Qt-based releases are historical
-(see `docs/history/QT_GUI_HISTORY.md`); this release links no Qt code.
+notice set — `LICENSE` and the third-party licenses below — is embedded
+in the release executable and can be read offline with
+`CodexProxyGuard.exe licenses` (`app/src/licenses.rs` +
+`third-party-licenses/`). Historical C++/Qt dependencies (toml++,
+nlohmann/json, doctest, Qt) are no longer linked; see git history for the
+retired implementations.
 
-## nlohmann/json 3.12.0
+## ratatui (MIT)
 
-The engine uses the vendored nlohmann/json 3.12.0 single-header JSON library
-for every protocol parse/serialize boundary, copyright Niels Lohmann and
-contributors, under MIT. The original license is in
-`backend/third_party/json/LICENSE.MIT`; the upstream URL and the pinned
-SHA-256 of the vendored header are recorded in that directory's README. No
-configure-time download is used anywhere in the build.
+The terminal interface is built on ratatui (widgets, layout, buffer
+rendering). License: `third-party-licenses/ratatui.txt`.
 
-## toml++ 3.4.0
+## crossterm (MIT)
 
-The engine uses the vendored toml++ 3.4.0 single-header TOML parser,
-copyright Mark Gillard and contributors, under MIT. Its original license is
-in `backend/third_party/toml++/LICENSE`; the upstream URL and pinned source
-checksum are recorded in that vendored directory's README.
+Terminal raw mode, events and screen management come from crossterm.
+License: `third-party-licenses/crossterm.txt`.
 
-## doctest 2.4.12 (test binaries only)
+## toml (MIT OR Apache-2.0)
 
-The doctest suites use the vendored doctest 2.4.12 single-header framework,
-copyright Viktor Kirilov, under MIT. Its original license is in
-`tests/third_party/doctest/LICENSE.txt`. It is never linked into the
-production executable or any shipped artifact.
+Configuration parsing uses the toml crate. Both upstream licenses are
+embedded: `third-party-licenses/toml.txt`.
 
-## Microsoft Visual C++ runtime
+## windows-rs (MIT OR Apache-2.0)
 
-The release executable statically links the Visual C++ runtime (/MT); no
-`msvcp140*.dll`, `vcruntime140*.dll` or VC redist installer is required or
-distributed. These components remain subject to Microsoft's license terms;
-they are not covered by this project's MIT license. See
-https://visualstudio.microsoft.com/license-terms/ and
-https://learn.microsoft.com/cpp/windows/redistributing-visual-cpp-files.
-
-This project does not include Telegram Desktop or Desktop App Toolkit code,
-icons, logos, or other assets; those projects are design and architecture
-references only, not shipped dependencies.
+All Win32 and COM bindings (handles, processes, TxF, console, AppModel,
+activation manager, shell known folders) come from the `windows` crate.
+Both upstream licenses are embedded:
+`third-party-licenses/windows-rs.txt`.

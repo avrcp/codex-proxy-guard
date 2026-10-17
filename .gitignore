@@ -1,4 +1,4 @@
-# CMake build outputs and dependency caches
+# Rust/Cargo build outputs and legacy build caches
 /target/
 
 # Portable build artifacts (EXE, SHA, build-info.json, etc.)

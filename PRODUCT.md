@@ -4,12 +4,12 @@
 
 ## Platform
 
-Windows console application (Win32 VT TUI with a plain-console fallback).
+Windows console application (Ratatui VT TUI with a plain-console fallback).
 
 ## Stack
 
-C++20, STL, Windows SDK, MSVC x64, CMake; single executable, in-process
-engine session, static CRT.
+Rust 2024, windows-rs bindings, Ratatui/Crossterm, MSVC x64 toolchain,
+Cargo workspace; single executable, in-process engine session, static CRT.
 
 ## Users and purpose
 
@@ -19,7 +19,8 @@ It does not manage proxy services, measure connectivity or own Desktop's lifecyc
 
 ## Constraints
 
-C++ is the only implementation of system operations. One foreground operation,
+Rust is the only implementation of system operations (all Win32 access
+confined to the cpg-windows crate). One foreground operation,
 explicit consent, bounded cancellation, no network probes, no authentication data.
 An observed activation or prepared configuration is never a network success claim.
 

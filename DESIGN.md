@@ -15,7 +15,7 @@ the only primary action.
   together with console modes, cursor and window title.
 - Line editor with Tab switching, Home/End/Left/Right/Backspace/Delete for
   the proxy host and port; port accepts digits only.
-- Consent dialogs show the exact C++-provided Home, require typing YES, and
+- Consent dialogs show the exact engine-provided Home, require typing YES, and
   default to Cancel (Esc).
 - Busy state shows a spinner plus Ctrl+C cancel; destructive keys are gated
   while a foreground operation is active.
