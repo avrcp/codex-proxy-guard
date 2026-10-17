@@ -1155,6 +1155,16 @@ fn run_loop(guard: &mut TerminalGuard, config_path: &Path) -> Result<i32> {
         let mut model = Model::new(session);
         model.session.request_refresh();
         model.synchronize();
+        // Event-driven rendering: draw once, then only when input, engine
+        // events, resize or a state transition changed something. A busy
+        // spinner animates at a bounded frame rate instead of the old fixed
+        // ~50 fps redraw, and an idle session performs no draws at all.
+        const SPINNER_FRAME_INTERVAL: Duration = Duration::from_millis(125);
+        let mut dirty = true;
+        let mut last_spinner_frame = std::time::Instant::now();
+        let mut last_busy = model.session.busy();
+        let mut last_cancelling = model.session.cancelling_after_timeout();
+        let mut last_viewport = model.viewport;
         loop {
             if controls.take_close() {
                 model.exit_requested = true;
@@ -1169,13 +1179,28 @@ fn run_loop(guard: &mut TerminalGuard, config_path: &Path) -> Result<i32> {
             if let Ok(size) = guard.terminal_mut().size() {
                 model.viewport = (size.width, size.height);
             }
-            let frame_result = guard.terminal_mut().draw(|frame| render(frame, &model));
-            if frame_result.is_err() {
-                return Err(Error::new(
-                    "CONSOLE_OUTPUT_FAILED",
-                    "Cannot render the console interface.",
-                ));
+            if model.viewport != last_viewport {
+                last_viewport = model.viewport;
+                dirty = true;
             }
+            let busy = model.session.busy();
+            let cancelling = model.session.cancelling_after_timeout();
+            if busy != last_busy || cancelling != last_cancelling {
+                dirty = true;
+            }
+            if dirty || (busy && last_spinner_frame.elapsed() >= SPINNER_FRAME_INTERVAL) {
+                let frame_result = guard.terminal_mut().draw(|frame| render(frame, &model));
+                if frame_result.is_err() {
+                    return Err(Error::new(
+                        "CONSOLE_OUTPUT_FAILED",
+                        "Cannot render the console interface.",
+                    ));
+                }
+                dirty = false;
+                last_spinner_frame = std::time::Instant::now();
+            }
+            last_busy = busy;
+            last_cancelling = cancelling;
             // Poll the session and input with short slices so busy states and
             // timeouts progress.
             if crossterm::event::poll(Duration::from_millis(20)).unwrap_or(false) {
@@ -1183,11 +1208,14 @@ fn run_loop(guard: &mut TerminalGuard, config_path: &Path) -> Result<i32> {
                     Some(Event::Key(key)) => {
                         let action = model.key(key);
                         apply_action(&mut model, action)?;
+                        dirty = true;
                     }
-                    Some(Event::Paste(text)) => model.editor_paste(&text),
-                    // Resize (or any other event) forces the next draw; the
-                    // event itself is consumed by the size probe above.
-                    Some(_) => {}
+                    Some(Event::Paste(text)) => {
+                        model.editor_paste(&text);
+                        dirty = true;
+                    }
+                    // Any other event (resize, focus) still forces a redraw.
+                    Some(_) => dirty = true,
                     None => {}
                 }
             }
@@ -1195,6 +1223,7 @@ fn run_loop(guard: &mut TerminalGuard, config_path: &Path) -> Result<i32> {
             let event = model.session.poll();
             if event != cpg_engine::session::Event::None {
                 model.synchronize();
+                dirty = true;
             }
             handle_event(&mut model, event)?;
             model.synchronize();
