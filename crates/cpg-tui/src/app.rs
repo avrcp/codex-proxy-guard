@@ -58,6 +58,8 @@ struct Model {
     editor_field: u8, // 0 = host, 1 = port
     editor_host: String,
     editor_port: String,
+    editor_host_cursor: usize, // char index into `editor_host`
+    editor_port_cursor: usize, // char index into `editor_port`
     editor_error: Option<String>,
     saving_operation: Option<i64>,
     confirm_buffer: String,
@@ -87,6 +89,8 @@ impl Model {
             editor_field: 0,
             editor_host: String::new(),
             editor_port: String::new(),
+            editor_host_cursor: 0,
+            editor_port_cursor: 0,
             editor_error: None,
             saving_operation: None,
             confirm_buffer: String::new(),
@@ -341,6 +345,54 @@ impl Model {
         }
     }
 
+    /// Inserts one accepted character at the active field's cursor.
+    fn editor_insert(&mut self, character: char) {
+        let port_field = self.editor_field == 1;
+        let limit = if port_field { 5 } else { 255 };
+        if port_field && !character.is_ascii_digit() {
+            return;
+        }
+        if self.active_editor_text().chars().count() >= limit {
+            return;
+        }
+        let (field, cursor) = self.active_editor_parts_mut();
+        let byte = char_index_to_byte(field, *cursor);
+        field.insert(byte, character);
+        *cursor += 1;
+        self.editor_error = None;
+    }
+
+    /// Accepts a single-line paste into the proxy editor only; the consent
+    /// and repair confirmations never accept pasted input, and a paste that
+    /// carries line breaks or control characters is refused whole.
+    fn editor_paste(&mut self, text: &str) {
+        if self.modal != Modal::ProxyEditor || self.session.busy() {
+            return;
+        }
+        if text.chars().any(|character| character.is_control()) {
+            return;
+        }
+        for character in text.chars() {
+            self.editor_insert(character);
+        }
+    }
+
+    fn active_editor_text(&self) -> &str {
+        if self.editor_field == 0 {
+            &self.editor_host
+        } else {
+            &self.editor_port
+        }
+    }
+
+    fn active_editor_parts_mut(&mut self) -> (&mut String, &mut usize) {
+        if self.editor_field == 0 {
+            (&mut self.editor_host, &mut self.editor_host_cursor)
+        } else {
+            (&mut self.editor_port, &mut self.editor_port_cursor)
+        }
+    }
+
     fn editor_key(&mut self, key: KeyEvent) -> Action {
         match key.code {
             KeyCode::Esc => {
@@ -349,6 +401,8 @@ impl Model {
             }
             KeyCode::Tab | KeyCode::BackTab => {
                 self.editor_field = 1 - self.editor_field;
+                let (field, cursor) = self.active_editor_parts_mut();
+                *cursor = field.chars().count();
                 Action::None
             }
             KeyCode::Enter => {
@@ -356,6 +410,7 @@ impl Model {
                     Ok(port) => port as i64,
                     Err(_) => {
                         self.editor_field = 1;
+                        self.editor_port_cursor = self.editor_port.chars().count();
                         self.editor_error =
                             Some("Port must be a number between 1 and 65535.".into());
                         return Action::None;
@@ -367,38 +422,51 @@ impl Model {
                 }
             }
             KeyCode::Left => {
-                // Cluster-safe editing is delegated to the line buffer.
+                let (_, cursor) = self.active_editor_parts_mut();
+                *cursor = cursor.saturating_sub(1);
+                Action::None
+            }
+            KeyCode::Right => {
+                let (field, cursor) = self.active_editor_parts_mut();
+                if *cursor < field.chars().count() {
+                    *cursor += 1;
+                }
+                Action::None
+            }
+            KeyCode::Home => {
+                let (_, cursor) = self.active_editor_parts_mut();
+                *cursor = 0;
+                Action::None
+            }
+            KeyCode::End => {
+                let (field, cursor) = self.active_editor_parts_mut();
+                *cursor = field.chars().count();
                 Action::None
             }
             KeyCode::Backspace => {
-                let field = self.active_editor_field_mut();
-                field.pop();
-                Action::None
-            }
-            KeyCode::Delete => Action::None,
-            KeyCode::Home | KeyCode::End => Action::None,
-            KeyCode::Char(character) => {
-                let port_field = self.editor_field == 1;
-                let limit = if port_field { 5 } else { 255 };
-                if port_field && !character.is_ascii_digit() {
-                    return Action::None;
-                }
-                let field = self.active_editor_field_mut();
-                if field.chars().count() < limit {
-                    field.push(character);
+                let (field, cursor) = self.active_editor_parts_mut();
+                if *cursor > 0 {
+                    let byte = char_index_to_byte(field, *cursor - 1);
+                    field.remove(byte);
+                    *cursor -= 1;
                     self.editor_error = None;
                 }
                 Action::None
             }
+            KeyCode::Delete => {
+                let (field, cursor) = self.active_editor_parts_mut();
+                if *cursor < field.chars().count() {
+                    let byte = char_index_to_byte(field, *cursor);
+                    field.remove(byte);
+                    self.editor_error = None;
+                }
+                Action::None
+            }
+            KeyCode::Char(character) => {
+                self.editor_insert(character);
+                Action::None
+            }
             _ => Action::None,
-        }
-    }
-
-    fn active_editor_field_mut(&mut self) -> &mut String {
-        if self.editor_field == 0 {
-            &mut self.editor_host
-        } else {
-            &mut self.editor_port
         }
     }
 
@@ -482,6 +550,15 @@ impl Model {
         ));
         public_text(&text, 4096)
     }
+}
+
+/// Byte offset of a character index (cursor math is per character, never
+/// per byte, so multi-byte host input cannot split a code point).
+fn char_index_to_byte(text: &str, char_index: usize) -> usize {
+    text.char_indices()
+        .nth(char_index)
+        .map(|(byte, _)| byte)
+        .unwrap_or(text.len())
 }
 
 fn state_style(state: &str) -> Color {
@@ -846,17 +923,32 @@ fn render_modal(frame: &mut Frame, model: &Model, area: Rect) {
                 vertical: 1,
                 horizontal: 2,
             });
+            let caret_field = |text: &str, cursor: usize, active: bool| -> String {
+                if !active {
+                    return text.to_owned();
+                }
+                let chars: Vec<char> = text.chars().collect();
+                let head: String = chars.iter().take(cursor).collect();
+                let tail: String = chars.iter().skip(cursor).collect();
+                format!("{head}▌{tail}")
+            };
             let mut lines = vec![
                 Line::from(format!(
-                    "Host [{}] {}",
-                    model.editor_host,
-                    if model.editor_field == 0 { "◄" } else { "" }
+                    "Host [{}]",
+                    caret_field(
+                        &model.editor_host,
+                        model.editor_host_cursor,
+                        model.editor_field == 0
+                    )
                 )),
                 Line::from(""),
                 Line::from(format!(
-                    "Port [{}] {}",
-                    model.editor_port,
-                    if model.editor_field == 1 { "◄" } else { "" }
+                    "Port [{}]",
+                    caret_field(
+                        &model.editor_port,
+                        model.editor_port_cursor,
+                        model.editor_field == 1
+                    )
                 )),
             ];
             if let Some(error) = &model.editor_error {
@@ -1087,13 +1179,16 @@ fn run_loop(guard: &mut TerminalGuard, config_path: &Path) -> Result<i32> {
             // Poll the session and input with short slices so busy states and
             // timeouts progress.
             if crossterm::event::poll(Duration::from_millis(20)).unwrap_or(false) {
-                let key = crossterm::event::read().ok().and_then(|event| match event {
-                    Event::Key(key) => Some(key),
-                    _ => None,
-                });
-                if let Some(key) = key {
-                    let action = model.key(key);
-                    apply_action(&mut model, action)?;
+                match crossterm::event::read().ok() {
+                    Some(Event::Key(key)) => {
+                        let action = model.key(key);
+                        apply_action(&mut model, action)?;
+                    }
+                    Some(Event::Paste(text)) => model.editor_paste(&text),
+                    // Resize (or any other event) forces the next draw; the
+                    // event itself is consumed by the size probe above.
+                    Some(_) => {}
+                    None => {}
                 }
             }
             // Drive the engine state machine.
@@ -1203,6 +1298,8 @@ fn apply_action(model: &mut Model, action: Action) -> Result<()> {
             model.editor_field = 0;
             model.editor_host = view.proxy.host.clone();
             model.editor_port = view.proxy.port.to_string();
+            model.editor_host_cursor = model.editor_host.chars().count();
+            model.editor_port_cursor = model.editor_port.chars().count();
             model.editor_error = None;
             model.saving_operation = None;
             model.modal = Modal::ProxyEditor;
@@ -1388,6 +1485,57 @@ mod tests {
         model.viewport = (100, 30);
         let action = model.key(KeyEvent::from(KeyCode::Enter));
         assert!(matches!(action, Action::ConfirmConsent(_)));
+    }
+
+    #[test]
+    fn editor_supports_cursor_editing() {
+        let mut model = model_with_consent("editor");
+        model.modal = Modal::ProxyEditor;
+        model.editor_field = 0;
+        model.editor_host.clear();
+        model.editor_host_cursor = 0;
+        for character in "localhost".chars() {
+            model.key(KeyEvent::from(KeyCode::Char(character)));
+        }
+        assert_eq!(model.editor_host, "localhost");
+        // Left x2 positions the cursor over 't'; typing inserts there.
+        model.key(KeyEvent::from(KeyCode::Left));
+        model.key(KeyEvent::from(KeyCode::Left));
+        model.key(KeyEvent::from(KeyCode::Char('X')));
+        assert_eq!(model.editor_host, "localhoXst");
+        // Home/Delete removes the first character; End+Backspace the last.
+        model.key(KeyEvent::from(KeyCode::Home));
+        model.key(KeyEvent::from(KeyCode::Delete));
+        assert_eq!(model.editor_host, "ocalhoXst");
+        model.key(KeyEvent::from(KeyCode::End));
+        model.key(KeyEvent::from(KeyCode::Backspace));
+        assert_eq!(model.editor_host, "ocalhoXs");
+    }
+
+    #[test]
+    fn editor_paste_is_single_line_and_gate_aware() {
+        let mut model = model_with_consent("paste");
+        model.modal = Modal::ProxyEditor;
+        model.editor_field = 1;
+        model.editor_port.clear();
+        model.editor_port_cursor = 0;
+        model.editor_paste(
+            "1080
+8080",
+        );
+        assert!(
+            model.editor_port.is_empty(),
+            "multi-line paste is refused whole"
+        );
+        model.editor_paste("10808");
+        assert_eq!(model.editor_port, "10808");
+        model.editor_paste("abc");
+        assert_eq!(model.editor_port, "10808", "non-digits never paste");
+        // The confirmation dialog never accepts pasted text.
+        model.modal = Modal::Consent;
+        model.confirm_buffer.clear();
+        model.editor_paste("YES");
+        assert!(model.confirm_buffer.is_empty());
     }
 
     #[test]
