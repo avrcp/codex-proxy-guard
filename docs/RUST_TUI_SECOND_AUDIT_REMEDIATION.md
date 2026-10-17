@@ -96,10 +96,20 @@ doc transcription error, not a provenance defect; the doc is corrected.
 - `python scripts/test-verify-package-rust.py`: 11/11 (intact + 10
   negatives).
 - `.\scripts\test-rust.ps1`: ALL RUST GATES PASSED (final run).
-- Canonical unsigned dev build from the clean pushed branch:
-  `dist/releases/CodexProxyGuard-0.8.0-rc.1-rust-<newcommit>/` —
-  verifier output recorded in the build log; promotion only after the
-  verifier passed.
+- Canonical unsigned dev build from the clean pushed branch
+  (`4141a07d`): produced
+  `dist/releases/CodexProxyGuard-0.8.0-rc.1-rust-4141a07d/` —
+  EXE SHA256 `4909dd75861a1c5a2465c832395fb27c3cf2f1ad6f0056229cb8cc4968704a63`
+  (1,217,024 bytes), promotion happened only after the
+  `rust-static-single` verifier passed, and the promoted immutable
+  directory re-verifies independently (PE mitigations, provenance
+  `4141a07d…` clean/Rust, source binding, sums, CLI smoke).
+  Two verifier findings surfaced during the build runs and were fixed
+  before any promotion: the retired C++ license-marker spelling (would
+  have failed every real licenses smoke) and the missing
+  `BCRYPTPRIMITIVES.DLL` system-import allowlist entry — the latter also
+  proves the old fc3eaf62 artifact would not have passed this gate as
+  shipped, which the earlier manual import scan had not caught.
 
 Manual/`MANUAL_REQUIRED` items (real WM_CLOSE, Windows Terminal live
 matrix, narrow-window visual check) were exercised as live smoke by the
