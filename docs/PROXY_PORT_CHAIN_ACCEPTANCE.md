@@ -293,3 +293,28 @@ Executed against this packaged EXE:
 | Valid read, then the file corrupted mid-session, then `R` | `Proxy: http://127.0.0.1:10809 [last good read] \| Plan: unknown - \| Coverage: unknown` plus the `CONFIG_INVALID` line — the retained endpoint is never relabelled `invalid` |
 | TUI keystroke round trip in the editor | **NOT RUN** — ConPTY harness still blocked (`RUST_TUI_MIGRATION_ACCEPTANCE.md`) |
 | Real Desktop A→B launch, backend adoption | **NOT RUN** — would activate the installed Desktop package on this machine |
+
+### Rebuilt and re-smoked at `b611435c` (same product code)
+
+The only change between `f0f1c8fa` and `b611435c` is committed documentation,
+so no source was edited for this build. The canonical script produced a new
+immutable directory from the clean tree and the checks above were re-run
+against that binary on this machine:
+
+```text
+Artifact: dist/releases/CodexProxyGuard-0.8.0-rc.1-rust-b611435c/CodexProxyGuard.exe
+Commit:   b611435c618a707b968f942f696e7aa1514f804b   dirty: false
+SHA256:   46B1A836EFB99306A51ACE75DEAA159415F917BCD0B00B725903A15A1ED167B1
+          (matches the shipped SHA256SUMS sidecar)
+Size:     1,226,752 bytes   Signature: UNSIGNED DEVELOPMENT BUILD
+PE facts: all seven mitigation flags true; console subsystem; 14 import
+          descriptors; no shell import; no Qt/CRT import; the same
+          BCRYPTPRIMITIVES.DLL allowlist gap as above
+```
+
+`--version`, `build-info`, `licenses` (527 lines), `init-config --proxy-port 10809`,
+the read state, the editor prefill, `- [not read yet]` with both prompts empty
+and the directory left untouched, `- [stored file not usable]` with the refusal
+naming the save-repair, and the mid-session `[last good read]` retention — all
+PASS against this artifact. Real Desktop A→B activation, backend adoption and
+the TUI keystroke round trip remain **NOT RUN**.
