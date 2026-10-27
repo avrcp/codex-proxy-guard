@@ -49,7 +49,13 @@ ALLOWED_IMPORT_PREFIXES = (
 FORBIDDEN_SOURCE_SUFFIXES = (
     '.obj', '.exe', '.dll', '.pdb', '.lib', '.ilk', '.zip', '.7z', '.pfx', '.key',
 )
-FORBIDDEN_SOURCE_SEGMENTS = ('target', 'dist', '.git', '__pycache__')
+# Repository-local build caches and machine-local tooling state are not release
+# inputs; `git archive` ships tracked files, so a committed plan or index has to
+# be refused here rather than caught in review.
+FORBIDDEN_SOURCE_SEGMENTS = (
+    'target', 'dist', '.git', '__pycache__',
+    '.qoder', '.workbuddy', '.codegraph',
+)
 
 
 def digest(data: bytes) -> str:

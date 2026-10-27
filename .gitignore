@@ -16,6 +16,9 @@ docs/tmp/
 # Machine-local review notes and assistant memory (not release inputs)
 docs/UI_UX_AUDIT_2026-10-03.md
 .workbuddy/
+# Qoder session plans live beside the tree; `git archive` ships whatever is
+# tracked, so a committed plan would enter every release snapshot.
+.qoder/
 
 # Windows / OS generated files
 # (All project EXEs live under /target or /dist; do not add binary fixtures

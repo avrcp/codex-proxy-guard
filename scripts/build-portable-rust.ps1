@@ -47,6 +47,19 @@ try {
     $Archive = Join-Path $Staging "source.zip"
     git archive --format=zip --output=$Archive $commit
     if ($LASTEXITCODE -ne 0) { Fail "git archive failed." }
+    # The snapshot is `git archive`, i.e. exactly the tracked files, so
+    # machine-local tooling state that was committed by mistake would ride into
+    # every release. Refuse it here instead of relying on review.
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $bundle = [System.IO.Compression.ZipFile]::OpenRead($Archive)
+    try {
+        $leaked = @($bundle.Entries | Where-Object { $_.FullName -match '(^|/)(\.qoder|\.workbuddy|\.codegraph)/' })
+    } finally {
+        $bundle.Dispose()
+    }
+    if ($leaked.Count -gt 0) {
+        Fail "Source snapshot carries machine-local tooling state: $($leaked[0].FullName)"
+    }
 
     # 3. Build from the archived tree, never from the working copy.
     $BuildTree = Join-Path $Staging "src"
