@@ -254,3 +254,42 @@ git diff --check                               clean
 ```
 
 The 3 ignored tests remain the ConPTY TUI harness cases; they are not a pass.
+
+## Third-pass package smoke
+
+Two intermediate packages were built in this session from `d763c1e3` and
+`68b79d6b`; the checks below ran against the final one, built by the canonical
+script from the committed, clean tree, and every command touched only a
+throwaway `--config` path under the temp directory. No real Codex Home, no
+Desktop activation, no daemon command, no system proxy change.
+
+```text
+Artifact: dist/releases/CodexProxyGuard-0.8.0-rc.1-rust-f0f1c8fa/CodexProxyGuard.exe
+Commit:   f0f1c8fae79e1fb230c4168b2f9944e572e795a5   dirty: false
+SHA256:   93D8C35DFA3FDF19DEEB22260EBCE82EE43CF5338632C6342D6FDE3C4C463AFC
+          (matches the shipped SHA256SUMS sidecar)
+Size:     1,226,752 bytes   Signature: UNSIGNED DEVELOPMENT BUILD
+PE facts: dynamic_base, high_entropy_va, nx_compat, guard_cf, cf_instrumented,
+          cf_function_table_present, cet_compat — all true
+Subsystem: 3 (console)     Imports: 14 descriptors, no powershell/cmd shell import
+```
+
+The import scan flags `BCRYPTPRIMITIVES.DLL` as outside the verifier's
+allowlist. It is a Windows system DLL (present in all three Rust packages built
+this session, not introduced by this pass), and the gap is in the allowlist
+that still belongs to the retired C++ package schema — recorded here as the
+same tracked follow-up, with no script changed.
+
+Executed against this packaged EXE:
+
+| Check | Result |
+| --- | --- |
+| `--version`, `build-info`, `licenses` (527 lines, offline) | PASS |
+| `init-config --proxy-port 10809` writes `port = 10809` | PASS |
+| Plain console over a configuration it read | `Proxy: http://127.0.0.1:10809 \| Plan: available http://127.0.0.1:10809` |
+| Editor after a real read (`E`, two Enters keeping the draft) | prompts prefilled `[127.0.0.1]` / `[10809]`; stored file unchanged, still 10809 |
+| `--config` pointing at a directory (read fails on the first attempt) | `Proxy: - [not read yet] \| Plan: unknown -`, `CONFIG_READ_FAILED`; editor prompts both empty and an empty draft is refused with "Host and port are required - Guard has read no configuration to reuse."; the directory stayed empty — nothing was written |
+| Stored bytes Guard cannot parse | `Proxy: - [stored file not usable]`, `CONFIG_INVALID: Configuration is not valid TOML.`, and `L` refuses with the view's own repair sentence: `CONFIG_INVALID: The stored configuration is not usable; set the proxy again to repair it.` |
+| Valid read, then the file corrupted mid-session, then `R` | `Proxy: http://127.0.0.1:10809 [last good read] \| Plan: unknown - \| Coverage: unknown` plus the `CONFIG_INVALID` line — the retained endpoint is never relabelled `invalid` |
+| TUI keystroke round trip in the editor | **NOT RUN** — ConPTY harness still blocked (`RUST_TUI_MIGRATION_ACCEPTANCE.md`) |
+| Real Desktop A→B launch, backend adoption | **NOT RUN** — would activate the installed Desktop package on this machine |
