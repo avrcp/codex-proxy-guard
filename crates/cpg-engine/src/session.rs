@@ -878,9 +878,17 @@ impl EngineSession {
             ));
         }
         if !self.state.ready {
+            // The same repair the view states, in the same words: bytes proven
+            // unusable are repaired by saving, a file that could not be read at
+            // all by refreshing. Telling an unusable-file user to refresh sends
+            // them to an operation that reports the same bytes.
             return Err(Error::new(
                 "CONFIG_INVALID",
-                "Refresh and repair the configuration first.",
+                if self.state.config_invalid {
+                    "The stored configuration is not usable; set the proxy again to repair it."
+                } else {
+                    "Refresh and repair the configuration first."
+                },
             ));
         }
         // A registered target is activated only with arguments Guard can

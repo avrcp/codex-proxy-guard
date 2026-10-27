@@ -918,6 +918,14 @@ fn a_session_that_never_read_a_file_shows_no_endpoint() {
         "no endpoint is invented for a file Guard never read: {:?}",
         view.proxy
     );
+    let refusal = session
+        .request_launch(false, "")
+        .expect_err("a session that read nothing cannot launch");
+    assert!(
+        refusal.message.contains("Refresh"),
+        "a file Guard could not read is repaired by refreshing: {}",
+        refusal.message
+    );
 
     // A real read restores the endpoint without needing a default.
     let path = directory.join("config.toml");
@@ -965,6 +973,11 @@ fn an_unusable_stored_file_states_itself_instead_of_a_missing_read() {
         "{}",
         view.actions.blocked_reason
     );
+    let refusal = session
+        .request_launch(false, "")
+        .expect_err("unusable stored bytes cannot launch");
+    assert_eq!(refusal.code, "CONFIG_INVALID");
+    assert_eq!(refusal.message, view.actions.blocked_reason);
 
     // A read that succeeded earlier outranks the later failure: the last good
     // endpoint stays on screen, labelled as the last good read.
