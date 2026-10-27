@@ -9,6 +9,27 @@ refresh (`R`) before editing or confirming again. `CONFIG_LOCK_FAILED` can
 mean a launch still holds its config lease; finish/cancel it before a
 mutation.
 
+The PROXY row shows the endpoint of the last configuration read that
+succeeded (or the value Guard just committed, labelled `saved, not re-read`).
+When a refresh cannot read the file, that endpoint stays on screen, labelled
+`last good read`, next to the error and the `BLOCKED` status: the displayed
+port does not fall back to the built-in default. Fix the file and press `R`.
+A read failure by itself never licenses Guard to overwrite the path — saving
+then fails (`CONFIG_LOCK_FAILED`, `CONFIG_CHANGED`) and nothing is written.
+Replacing unusable stored bytes needs the positive `CONFIG_INVALID` evidence
+Guard only has after actually reading bytes it cannot use; a file containing
+authorization fields is still refused with `CONFIG_CONSENT_REPAIR_REQUIRED`.
+
+`PLAN not buildable · PROXY_BYPASS_UNSUPPORTED` means a stored `no_proxy`
+entry has no Chromium equivalent: the activation bypass list accepts
+`localhost` and loopback IPv4/IPv6 only. The configuration itself is valid
+and stays saved, but a registered launch is refused before the config lease
+and before any process side effect, and the `L` action reports the same
+reason. Narrowing the list is the only fix, and note it is the same list that
+is written into the authorized Codex Home block. The native (non-registered)
+path delivers `NO_PROXY` through the process environment instead and is not
+affected — the PLAN row then reads `via process environment`.
+
 ## Backend proxy block
 
 "Not authorized" is the default. Use `B` and type `YES` against the exact

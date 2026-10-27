@@ -96,7 +96,9 @@ confirmed repair path, the official Codex CLI running the public
   (typed `SessionView`, single-use CSPRNG confirmation tokens bound to
   revision + Home + confirmed config, the one-foreground-effect gate that
   stays busy through `CancellingAfterTimeout` until the worker is reaped,
-  committed-mutation facts that survive refresh failures).
+  committed-mutation facts that survive refresh failures, and the
+  configuration-source and launch-plan facts the frontends render instead
+  of recomputing).
 - `crates/cpg-tui`: `terminal.rs` (capability probe, raw-mode/alternate
   screen guard with panic-path restore), `app.rs` (Ratatui event loop,
   modal machine — proxy editor, YES-typed consent/repair, result/help/

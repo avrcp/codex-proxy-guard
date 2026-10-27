@@ -229,16 +229,32 @@ impl Model {
             outcome.activation_state, outcome.backend_proxy_config, outcome.daemon_preparation
         );
         if let Some(receipt) = &outcome.receipt {
+            let configured = self.view.proxy.url.clone();
+            let submitted = receipt.proxy_endpoint.clone().unwrap_or_default();
             self.outcome_facts.push_str(&format!(
-                "\nPID: {}\nInstance: {}\nProxy delivery: {}",
+                "\nPID: {}\nInstance: {}\nMethod: {}\nProxy delivery: {}\nConfigured: {}\nSubmitted: {}",
                 receipt
                     .pid
                     .map(|pid| pid.to_string())
                     .unwrap_or_else(|| "unknown".into()),
                 receipt.instance,
-                receipt.proxy_delivery
+                receipt.launch_method,
+                receipt.proxy_delivery,
+                configured,
+                if submitted.is_empty() {
+                    "-"
+                } else {
+                    &submitted
+                }
             ));
-            self.outcome_warning = receipt.instance != "created";
+            if !submitted.is_empty() && submitted != configured {
+                // The receipt is a past fact and the view is a present fact:
+                // saying so is the only honest way to show both.
+                self.outcome_facts
+                    .push_str("\nSubmitted endpoint differs from the current configuration.");
+                self.outcome_warning = true;
+            }
+            self.outcome_warning |= receipt.instance != "created";
             if receipt.instance == "reused" {
                 self.outcome_message.push_str(
                     " An existing instance was returned. Adoption of this proxy is unconfirmed.",
@@ -248,15 +264,34 @@ impl Model {
                     " Instance creation is unknown. Refresh status; do not automatically retry.",
                 );
             } else if outcome.error.is_none() {
-                self.outcome_message = "Desktop activation returned a new instance.".to_owned();
+                self.outcome_message = if receipt.launch_method == "native_process" {
+                    format!(
+                        "Desktop process created with the proxy in its environment ({}).",
+                        if submitted.is_empty() {
+                            "unknown"
+                        } else {
+                            &submitted
+                        }
+                    )
+                } else {
+                    format!(
+                        "Desktop activation returned a new instance with the proxy arguments{}.",
+                        if submitted.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" ({submitted})")
+                        }
+                    )
+                };
             }
         }
         if outcome.exceeded_budget {
             self.outcome_facts
                 .push_str("\nSession budget exceeded; returned facts are preserved.");
         }
-        self.outcome_facts
-            .push_str("\nPrepared configuration is not a network verification.");
+        self.outcome_facts.push_str(
+            "\nGuard verifies these delivery facts only: Desktop adoption and network use are not verified.",
+        );
     }
 
     /// Keeps the editor open with the draft and shows the refusal inline,
@@ -326,6 +361,12 @@ impl Model {
     }
 
     fn key(&mut self, key: KeyEvent) -> Action {
+        // Windows reports both press and release for one physical key. Ignore
+        // releases before any state change, including across modal transitions;
+        // keep press/repeat events for normal typing and held-key editing.
+        if key.kind.is_release() {
+            return Action::None;
+        }
         // Any key supersedes the last inline notice; handlers below may set a
         // fresh one for the refused action.
         self.notice = None;
@@ -606,7 +647,13 @@ impl Model {
             ));
         }
         text.push_str(&format!(
-            "\ndesktop: {}\nentry: {}\ncoverage: {}\n{}",
+            "\nconfig: {}\nproxy: {} ({})\nplan: {} {}\nlaunch: {}\ndesktop: {}\nentry: {}\ncoverage: {}\n{}",
+            self.session.config_path().display(),
+            self.view.proxy.url,
+            self.view.proxy.state,
+            self.view.plan.state,
+            self.view.plan.endpoint,
+            self.view.launch_method,
             self.view.desktop.display_name,
             self.view.desktop.application_id.as_deref().unwrap_or("-"),
             self.view.coverage.state,
@@ -614,6 +661,38 @@ impl Model {
         ));
         public_text(&text, 4096)
     }
+}
+
+/// The engine's own statement about how the displayed endpoint would be
+/// delivered, so a configuration that cannot produce activation arguments is
+/// visible before a launch is attempted.
+fn plan_row(view: &SessionView) -> Line<'static> {
+    let (detail, color) = match view.plan.state {
+        "available" => (
+            format!("via activation arguments · {}", view.plan.endpoint),
+            Color::Green,
+        ),
+        "environment" => (
+            format!("via process environment · {}", view.plan.endpoint),
+            Color::Green,
+        ),
+        "unavailable" => (
+            format!(
+                "not buildable · {}",
+                view.plan
+                    .error
+                    .as_ref()
+                    .map(|error| error.code.clone())
+                    .unwrap_or_else(|| "unknown".to_owned())
+            ),
+            Color::Red,
+        ),
+        _ => ("not confirmed · press R".to_owned(), Color::DarkGray),
+    };
+    Line::from(vec![
+        Span::styled("PLAN     ", Style::default().fg(Color::DarkGray)),
+        Span::styled(detail, Style::default().fg(color)),
+    ])
 }
 
 fn state_style(state: &str) -> Color {
@@ -754,10 +833,20 @@ fn render(frame: &mut Frame, model: &Model) {
     frame.render_widget(left_paragraph, columns[0]);
 
     if let Some(right) = columns.get(1) {
-        let mut right_rows: Vec<Line> = vec![Line::from(vec![
+        let proxy_row = Line::from(vec![
             Span::styled("PROXY    ", Style::default().fg(Color::DarkGray)),
             Span::raw(model.view.proxy.url.clone()),
-        ])];
+            Span::styled(
+                match model.view.proxy.state {
+                    "read" => String::new(),
+                    "committed" => " · saved, not re-read".to_owned(),
+                    "retained" => " · last good read".to_owned(),
+                    other => format!(" · {other}"),
+                },
+                Style::default().fg(Color::Yellow),
+            ),
+        ]);
+        let mut right_rows: Vec<Line> = vec![proxy_row, plan_row(&model.view)];
         right_rows.push(Line::from(vec![
             Span::styled("COVERAGE ", Style::default().fg(Color::DarkGray)),
             Span::styled(
@@ -1277,7 +1366,7 @@ fn sink(_value: Result<Vec<u16>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyCode, KeyModifiers};
+    use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 
     /// A model with the editor open; the session is never driven, so no
     /// filesystem or discovery work happens.
@@ -1299,6 +1388,125 @@ mod tests {
 
     fn with_modifier(code: KeyCode, modifier: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, modifier)
+    }
+
+    fn tap(model: &mut Model, code: KeyCode) {
+        for kind in [KeyEventKind::Press, KeyEventKind::Release] {
+            assert!(matches!(
+                model.key(KeyEvent::new_with_kind(code, KeyModifiers::NONE, kind)),
+                Action::None
+            ));
+        }
+    }
+
+    #[test]
+    fn opening_editor_does_not_insert_the_shortcut_on_release() {
+        let mut model = editor_model();
+        model.modal = Modal::None;
+        let action = model.key(plain(KeyCode::Char('e')));
+        assert!(matches!(action, Action::OpenEditor));
+        apply_action(&mut model, action).expect("open editor");
+        let host = model.editor_host.text.clone();
+        let cursor = model.editor_host.cursor;
+
+        assert!(matches!(
+            model.key(KeyEvent::new_with_kind(
+                KeyCode::Char('e'),
+                KeyModifiers::NONE,
+                KeyEventKind::Release
+            )),
+            Action::None
+        ));
+        assert_eq!(model.editor_host.text, host);
+        assert_eq!(model.editor_host.cursor, cursor);
+    }
+
+    #[test]
+    fn editor_key_taps_edit_once_and_tab_reaches_the_port() {
+        let mut model = editor_model();
+        model.editor_host.set("abcd");
+        tap(&mut model, KeyCode::Char('X'));
+        assert_eq!(model.editor_host.text, "abcdX");
+        tap(&mut model, KeyCode::Backspace);
+        assert_eq!(model.editor_host.text, "abcd");
+        tap(&mut model, KeyCode::Left);
+        assert_eq!(model.editor_host.cursor, 3);
+        tap(&mut model, KeyCode::Delete);
+        assert_eq!(model.editor_host.text, "abc");
+
+        tap(&mut model, KeyCode::Tab);
+        assert_eq!(model.editor_field, 1);
+        model.editor_port.set("");
+        tap(&mut model, KeyCode::Char('8'));
+        tap(&mut model, KeyCode::Char('0'));
+        assert_eq!(model.editor_port.text, "80");
+        tap(&mut model, KeyCode::BackTab);
+        assert_eq!(model.editor_field, 0);
+        assert_eq!(model.editor_host.text, "abc");
+    }
+
+    #[test]
+    fn releases_never_submit_dismiss_or_clear_feedback() {
+        let mut model = editor_model();
+        for modal in [
+            Modal::None,
+            Modal::ProxyEditor,
+            Modal::Consent,
+            Modal::Repair,
+            Modal::LaunchResult,
+            Modal::ErrorResult,
+            Modal::Help,
+            Modal::QuitWhileBusy,
+        ] {
+            model.modal = modal;
+            model.notice = Some("Proxy saved.".into());
+            model.confirm_buffer = "YES".into();
+            for code in [
+                KeyCode::Enter,
+                KeyCode::Esc,
+                KeyCode::Char('q'),
+                KeyCode::Char('l'),
+                KeyCode::Char('y'),
+            ] {
+                assert!(matches!(
+                    model.key(KeyEvent::new_with_kind(
+                        code,
+                        KeyModifiers::NONE,
+                        KeyEventKind::Release
+                    )),
+                    Action::None
+                ));
+                assert_eq!(model.modal, modal);
+                assert_eq!(model.notice.as_deref(), Some("Proxy saved."));
+                assert_eq!(model.confirm_buffer, "YES");
+            }
+        }
+    }
+
+    #[test]
+    fn editor_retains_key_repeat_for_typing_and_cursor_editing() {
+        let mut model = editor_model();
+        model.editor_host.set("");
+        model.key(plain(KeyCode::Char('a')));
+        for code in [KeyCode::Char('a'), KeyCode::Char('a'), KeyCode::Left] {
+            assert!(matches!(
+                model.key(KeyEvent::new_with_kind(
+                    code,
+                    KeyModifiers::NONE,
+                    KeyEventKind::Repeat
+                )),
+                Action::None
+            ));
+        }
+        assert_eq!(model.editor_host.text, "aaa");
+        assert_eq!(model.editor_host.cursor, 2);
+        model.key(KeyEvent::new_with_kind(
+            KeyCode::Backspace,
+            KeyModifiers::NONE,
+            KeyEventKind::Repeat,
+        ));
+        assert_eq!(model.editor_host.text, "aa");
+        assert_eq!(model.editor_host.cursor, 1);
     }
 
     #[test]
@@ -1398,9 +1606,9 @@ mod tests {
     #[test]
     fn tab_switches_between_fields() {
         let mut model = editor_model();
-        model.key(plain(KeyCode::Tab));
+        tap(&mut model, KeyCode::Tab);
         assert_eq!(model.editor_field, 1);
-        model.key(plain(KeyCode::BackTab));
+        tap(&mut model, KeyCode::BackTab);
         assert_eq!(model.editor_field, 0);
     }
 
@@ -1460,5 +1668,225 @@ mod tests {
         model.notice = Some("Proxy saved.".to_owned());
         model.key(plain(KeyCode::Char('q')));
         assert!(model.notice.is_none());
+    }
+
+    fn launched_outcome(method: &str, delivery: &str, endpoint: &str) -> LaunchOutcome {
+        LaunchOutcome {
+            operation_id: 7,
+            receipt: Some(cpg_engine::LaunchReceipt {
+                pid: Some(4242),
+                launch_method: method.to_owned(),
+                activation_state: "activated".to_owned(),
+                instance: "created".to_owned(),
+                proxy_delivery: delivery.to_owned(),
+                backend_proxy_config: "not_authorized".to_owned(),
+                daemon_preparation: "not_requested".to_owned(),
+                proxy_endpoint: Some(endpoint.to_owned()),
+                target_elevation: Some(false),
+            }),
+            ..LaunchOutcome::default()
+        }
+    }
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    #[test]
+    fn the_result_modal_separates_the_submitted_endpoint_from_the_current_one() {
+        let mut model = editor_model();
+        model.view.proxy.url = "http://127.0.0.1:10809".to_owned();
+        model.set_launch_outcome(&launched_outcome(
+            "appmodel_activation",
+            "activation_arguments",
+            "http://127.0.0.1:10809",
+        ));
+        assert!(
+            model
+                .outcome_facts
+                .contains("Configured: http://127.0.0.1:10809\nSubmitted: http://127.0.0.1:10809"),
+            "{}",
+            model.outcome_facts
+        );
+        assert!(model.outcome_facts.contains("Method: appmodel_activation"));
+        assert!(
+            model.outcome_facts.contains("PID: 4242\nInstance: created"),
+            "{}",
+            model.outcome_facts
+        );
+        assert!(
+            !model.outcome_warning,
+            "the receipt matches the current view"
+        );
+        assert_eq!(
+            model.outcome_message,
+            "Desktop activation returned a new instance with the proxy arguments (http://127.0.0.1:10809)."
+        );
+
+        // A later edit makes the retained receipt a past fact: it stays
+        // visible, but the divergence is stated instead of hidden.
+        model.view.proxy.url = "http://127.0.0.1:10810".to_owned();
+        model.set_launch_outcome(&launched_outcome(
+            "appmodel_activation",
+            "activation_arguments",
+            "http://127.0.0.1:10809",
+        ));
+        assert!(model.outcome_warning);
+        assert!(
+            model
+                .outcome_facts
+                .contains("Submitted endpoint differs from the current configuration."),
+            "{}",
+            model.outcome_facts
+        );
+    }
+
+    #[test]
+    fn a_reused_or_unknown_instance_is_never_reported_as_adoption() {
+        for (instance, expected) in [
+            (
+                "reused",
+                "An existing instance was returned. Adoption of this proxy is unconfirmed.",
+            ),
+            (
+                "unknown",
+                "Instance creation is unknown. Refresh status; do not automatically retry.",
+            ),
+        ] {
+            let mut model = editor_model();
+            let mut outcome = launched_outcome(
+                "appmodel_activation",
+                "activation_arguments",
+                "http://127.0.0.1:10809",
+            );
+            outcome.receipt.as_mut().expect("receipt").instance = instance.to_owned();
+            model.set_launch_outcome(&outcome);
+            assert!(model.outcome_warning, "{instance} reads as a warning");
+            assert!(
+                model.outcome_message.contains(expected),
+                "{}",
+                model.outcome_message
+            );
+            assert!(
+                !model
+                    .outcome_message
+                    .contains("returned a new instance with the proxy arguments"),
+                "{}",
+                model.outcome_message
+            );
+        }
+    }
+
+    #[test]
+    fn the_native_receipt_is_not_described_as_an_activation() {
+        let mut model = editor_model();
+        model.view.proxy.url = "http://127.0.0.1:10809".to_owned();
+        model.set_launch_outcome(&launched_outcome(
+            "native_process",
+            "process_environment",
+            "http://127.0.0.1:10809",
+        ));
+        assert_eq!(
+            model.outcome_message,
+            "Desktop process created with the proxy in its environment (http://127.0.0.1:10809)."
+        );
+        assert!(
+            model
+                .outcome_facts
+                .contains("Guard verifies these delivery facts only"),
+            "{}",
+            model.outcome_facts
+        );
+    }
+
+    #[test]
+    fn the_plan_row_states_the_channel_or_the_refusal() {
+        let mut view = SessionView::default();
+        assert_eq!(
+            line_text(&plan_row(&view)),
+            "PLAN     not confirmed · press R"
+        );
+        view.plan = cpg_engine::session::LaunchPlanView {
+            state: "available",
+            endpoint: "http://127.0.0.1:10809".to_owned(),
+            error: None,
+        };
+        assert_eq!(
+            line_text(&plan_row(&view)),
+            "PLAN     via activation arguments · http://127.0.0.1:10809"
+        );
+        view.plan = cpg_engine::session::LaunchPlanView {
+            state: "environment",
+            endpoint: "http://127.0.0.1:10809".to_owned(),
+            error: None,
+        };
+        assert_eq!(
+            line_text(&plan_row(&view)),
+            "PLAN     via process environment · http://127.0.0.1:10809"
+        );
+        view.plan = cpg_engine::session::LaunchPlanView {
+            state: "unavailable",
+            endpoint: String::new(),
+            error: Some(Error::new("PROXY_BYPASS_UNSUPPORTED", "no bypass spelling")),
+        };
+        assert_eq!(
+            line_text(&plan_row(&view)),
+            "PLAN     not buildable · PROXY_BYPASS_UNSUPPORTED"
+        );
+    }
+
+    #[test]
+    fn a_wide_terminal_renders_the_plan_row() {
+        let mut model = editor_model();
+        model.modal = Modal::None;
+        model.view.proxy.url = "http://127.0.0.1:10809".to_owned();
+        model.view.plan = cpg_engine::session::LaunchPlanView {
+            state: "available",
+            endpoint: "http://127.0.0.1:10809".to_owned(),
+            error: None,
+        };
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).expect("terminal");
+        terminal.draw(|frame| render(frame, &model)).expect("draw");
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol().to_owned())
+            .collect();
+        assert!(
+            rendered.contains("PLAN") && rendered.contains("via activation arguments"),
+            "plan row visible: {rendered}"
+        );
+    }
+
+    #[test]
+    fn the_copied_diagnostic_names_the_file_the_endpoint_and_the_plan() {
+        let mut model = editor_model();
+        model.view.proxy = cpg_engine::session::ProxyView {
+            url: "http://127.0.0.1:10809".to_owned(),
+            host: "127.0.0.1".to_owned(),
+            port: 10809,
+            state: "retained",
+        };
+        model.view.plan = cpg_engine::session::LaunchPlanView {
+            state: "unknown",
+            endpoint: String::new(),
+            error: None,
+        };
+        let text = model.diagnostic_text();
+        assert!(
+            text.contains(r"config: C:\cpg-tui-tests\config.toml"),
+            "{text}"
+        );
+        assert!(
+            text.contains("proxy: http://127.0.0.1:10809 (retained)"),
+            "{text}"
+        );
+        assert!(text.contains("plan: unknown "), "{text}");
     }
 }

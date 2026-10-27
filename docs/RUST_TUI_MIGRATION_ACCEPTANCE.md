@@ -198,3 +198,68 @@ Home/Desktop/daemon）。
 `#[ignore]`（可 `cargo test -- --ignored` 复跑），待排查 conhost 输出直通
 后启用。**下次公开发布前，编辑器相关项（粘贴、Ctrl 键、光标编辑、
 `alternate_screen=never`）仍需在 Windows Terminal 中人工复验。**
+
+### Windows key-release regression fix (2026-10-27)
+
+The input dispatcher previously treated `KeyEventKind::Release` as another
+keypress. A physical character key inserted twice, and Tab switched to the
+port and immediately back. Releasing E after opening the editor also inserted
+an unwanted `e` into the host. `Model::key` now ignores releases before any
+notice, shortcut, busy-state or modal handling; presses and repeats retain
+their existing behavior.
+
+Four new regression tests cover the opening-key release, full press/release
+editing sequences, release-only events across every modal, and held-key
+typing/cursor/deletion. The existing Tab/BackTab test now exercises complete
+press/release pairs. Before the fix, the new tests reproduced `abcdXX`
+instead of `abcdX` and `127.0.0.1e` after opening the editor. After the fix,
+`scripts/test-rust.ps1` passed fmt, Clippy `-D warnings`, 103 tests and the
+diff check. The three existing ConPTY integration tests remain ignored.
+
+A separate smoke run drove the actual debug EXE through the execution host's
+Windows pseudo-terminal with a dedicated `target/input-fix-smoke.toml`:
+E opened a clean host field; one `x` inserted once and Backspace removed it;
+Tab focused the port; five Backspaces followed by `8a080` produced `8080`;
+Shift+Tab returned to the host; Enter saved `127.0.0.1:8080`; Q exited with
+code 0 and restored the alternate screen. Only the temporary Guard config
+was written. No Desktop activation, daemon command or Codex Home write was
+requested. This synthesized terminal smoke does not replace physical-keyboard
+Windows Terminal acceptance or resolve the ignored integration harness.
+
+The canonical Rust release script also built an unsigned development package
+from a clean, isolated source snapshot (the main working tree remains
+uncommitted):
+
+```text
+Artifact: dist/releases/CodexProxyGuard-0.8.0-rc.1-rust-cddb2776/CodexProxyGuard.exe
+Snapshot: cddb2776f51abcbc0aa7b49670652a56c0c49931
+SHA256: A959C4DB7786925994A56F781D60EA3079F0379F5165845A80EB124AB51564D1
+Size: 1,199,104 bytes
+Signature: NotSigned (UNSIGNED DEVELOPMENT BUILD)
+```
+
+Release-profile tests passed the same 103 tests. The delivered EXE repeated
+the terminal smoke above, saved port `8081` to a second temporary Guard
+configuration, and exited with code 0. SHA/build-info matched, changed text
+sources matched the snapshot after normal text EOL conversion, frozen golden
+fixtures matched byte-for-byte, and all seven PE mitigation facts were true.
+The import scan used the existing verifier's parsing core and system-DLL
+allowlist plus `BCRYPTPRIMITIVES.DLL` (already present in the earlier Rust
+release; its System32 copy has a valid Microsoft Windows signature). This
+does not claim that the legacy C++ package schema verifier supports Rust.
+The `.cmd` wrapper's Windows PowerShell could not resolve `Get-FileHash` on
+this host; rerunning the unchanged canonical `.ps1` with PowerShell 7 completed
+the package. No release-script or verifier behavior was changed for this fix.
+
+### Port-chain review follow-up (2026-10-27)
+
+The "edited port does not take effect" review is recorded in
+[PROXY_PORT_CHAIN_ACCEPTANCE.md](PROXY_PORT_CHAIN_ACCEPTANCE.md): two
+state-machine defects (a failed configuration read reset the displayed endpoint
+to the built-in default; `!ready` authorized a recovery rewrite of a path Guard
+could not read at all), the launch plan promoted to a typed `SessionView` fact
+with early gating for registered targets only, and delivery-versus-adoption
+wording in both frontends plus the copied diagnostic. 21 new hermetic tests
+bring the workspace to 124 passing, 3 ignored. The real-machine A→B scenario,
+Desktop argument adoption and the backend reload checks stay explicitly
+**NOT RUN**; the ConPTY harness limitation above is unchanged.

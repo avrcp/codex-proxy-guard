@@ -79,9 +79,22 @@ fn interact(
     let mut reported_mutation: Option<i64> = None;
     loop {
         let view = session.view();
+        let configured = if view.proxy.state == "read" {
+            view.proxy.url.clone()
+        } else {
+            format!("{} [{}]", view.proxy.url, view.proxy.state)
+        };
         prompt(&format!(
-            "Proxy: {} | Process: {} | Coverage: {}",
-            view.proxy.url, view.process.state, view.coverage.state
+            "Proxy: {} | Plan: {}{} | Process: {} | Coverage: {}",
+            configured,
+            view.plan.state,
+            if view.plan.endpoint.is_empty() {
+                String::new()
+            } else {
+                format!(" {}", view.plan.endpoint)
+            },
+            view.process.state,
+            view.coverage.state
         ));
         if let Some(error) = &view.error {
             prompt(&format!("{}: {}", error.code, error.message));
@@ -217,16 +230,25 @@ fn interact(
                 prompt(&format!("{}: {}", error.code, error.message));
             } else if let Some(receipt) = &outcome.receipt {
                 prompt(&format!(
-                    "Desktop activation: PID {}; instance={}; proxy={}",
+                    "Launched: method={} PID={} instance={}",
+                    receipt.launch_method,
                     receipt
                         .pid
                         .map(|pid| pid.to_string())
                         .unwrap_or_else(|| "unknown".into()),
-                    receipt.instance,
-                    receipt.proxy_delivery
+                    receipt.instance
+                ));
+                prompt(&format!(
+                    "Proxy delivery: {} endpoint={}",
+                    receipt.proxy_delivery,
+                    receipt.proxy_endpoint.as_deref().unwrap_or("-")
+                ));
+                prompt(&format!(
+                    "Backend config: {} daemon={}",
+                    receipt.backend_proxy_config, receipt.daemon_preparation
                 ));
             }
-            prompt("Prepared configuration is not a network verification.");
+            prompt("Delivery facts only: Desktop adoption and network use are not verified.");
         }
         if let Some(MutationOutcome {
             operation_id,

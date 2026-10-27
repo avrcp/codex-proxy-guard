@@ -36,7 +36,9 @@ runtime dependency in the product, no PowerShell for package discovery.
   receipt classification) and the `EngineSession` state machine (single
   foreground gate, single-use revision-bound tokens,
   `CancellingAfterTimeout` until reaped, receipts preserved over refresh
-  errors).
+  errors, and a failed configuration read retaining the last known-good
+  endpoint for display while gating launch and recovery writes — recovery
+  writes need positive `CONFIG_INVALID` evidence, never a read failure).
 - `crates/cpg-tui/`: Ratatui/Crossterm console and the plain line console.
   The TUI never recomputes engine business rules; it renders the typed
   `SessionView` and forwards intents to the session.

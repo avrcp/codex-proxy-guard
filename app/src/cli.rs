@@ -346,13 +346,16 @@ fn run_launch(command: &ParsedCommand, config_path: &Path) -> Result<i32> {
         print_json(&receipt);
     } else {
         let pid = receipt.at("pid").as_u64().unwrap_or(0);
+        let endpoint = receipt.string_at("proxy_endpoint");
         print(&format!(
-            "Desktop activation: PID {pid}; instance={}; proxy={}; backend config={}; daemon={}",
+            "Desktop activation: PID {pid}; instance={}; proxy={} endpoint={}; backend config={}; daemon={}",
             receipt.string_at("instance"),
             receipt.string_at("proxy_delivery"),
+            if endpoint.is_empty() { "-" } else { &endpoint },
             receipt.string_at("backend_proxy_config"),
             receipt.string_at("daemon_preparation"),
         ));
+        print("Delivery facts only: Desktop adoption and network use are not verified.");
     }
     Ok(0)
 }

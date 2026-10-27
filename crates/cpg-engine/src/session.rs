@@ -51,6 +51,30 @@ pub struct ProxyView {
     pub url: String,
     pub host: String,
     pub port: i64,
+    /// Where the displayed endpoint came from: `read` from the configuration
+    /// file, `committed` by Guard's own last save, `retained` from the last
+    /// good read while a later read failed, or `unconfirmed` before Guard has
+    /// read a configuration at all.
+    pub state: &'static str,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct LaunchPlanView {
+    /// `available`: activation arguments can be built and carry `endpoint`;
+    /// `environment`: the native path delivers `endpoint` through the process
+    /// environment instead; `unavailable`: this configuration cannot produce a
+    /// launch plan and `error` says why; `unknown`: no confirmed configuration
+    /// read backs the displayed endpoint, so no plan is claimed.
+    pub state: &'static str,
+    pub endpoint: String,
+    pub error: Option<Error>,
+}
+
+fn unknown_plan() -> LaunchPlanView {
+    LaunchPlanView {
+        state: "unknown",
+        ..LaunchPlanView::default()
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -96,6 +120,7 @@ pub struct SessionView {
     pub ready: bool,
     pub busy: bool,
     pub proxy: ProxyView,
+    pub plan: LaunchPlanView,
     pub desktop: DesktopView,
     pub process: ProcessObservation,
     pub coverage: CoverageView,
@@ -130,6 +155,22 @@ impl SessionView {
                     ("url", Json::from(self.proxy.url.as_str())),
                     ("host", Json::from(self.proxy.host.as_str())),
                     ("port", Json::from(self.proxy.port)),
+                    ("source", Json::from(self.proxy.state)),
+                ]),
+            ),
+            (
+                "launch_plan",
+                Json::object_from([
+                    ("state", Json::from(self.plan.state)),
+                    ("endpoint", Json::from(self.plan.endpoint.as_str())),
+                    (
+                        "error",
+                        self.plan
+                            .error
+                            .as_ref()
+                            .map(|error| error.json())
+                            .unwrap_or(Json::Null),
+                    ),
                 ]),
             ),
             (
@@ -357,6 +398,14 @@ struct TaskResult {
     config: Config,
     ready: bool,
     snapshot: bool,
+    /// The stored bytes were read and Guard can prove they are unusable
+    /// (`CONFIG_INVALID`). Only this positive evidence authorizes a recovery
+    /// write; an unreadable path never does.
+    config_invalid: bool,
+    /// Truthfulness of the displayed endpoint: `read` after a successful
+    /// configuration read, `retained` while the last known-good endpoint is
+    /// shown next to a read failure, `unconfirmed` before any read succeeded.
+    config_source: &'static str,
     desktop: Option<Desktop>,
     process: cpg_windows::process_state::ProcessState,
     coverage: &'static str,
@@ -372,6 +421,8 @@ impl Default for TaskResult {
             config: Config::default(),
             ready: false,
             snapshot: false,
+            config_invalid: false,
+            config_source: "unconfirmed",
             desktop: None,
             process: cpg_windows::process_state::ProcessState {
                 state: "unknown",
@@ -471,6 +522,8 @@ impl Task {
                         if !result.ready {
                             result.config = updated;
                             result.ready = true;
+                            result.config_invalid = false;
+                            result.config_source = "committed";
                         }
                         result.mutation = Some(mutation);
                         result
@@ -503,6 +556,8 @@ impl Task {
                         if !result.ready {
                             result.config = updated;
                             result.ready = true;
+                            result.config_invalid = false;
+                            result.config_source = "committed";
                         }
                         result
                     }
@@ -570,7 +625,16 @@ fn refresh(path: &Path, services: &SessionServices, cancel: &Cancellation) -> Ta
     };
     let outcome = (|| -> Result<()> {
         cancel.check()?;
-        result.config = config_store::load_or_create_config(path)?;
+        match config_store::load_or_create_config(path) {
+            Ok(config) => result.config = config,
+            Err(error) => {
+                // `CONFIG_INVALID` means Guard read the bytes and proved they
+                // cannot be used: the only evidence that authorizes a
+                // recovery write. Any other failure left the file unread.
+                result.config_invalid = error.code == "CONFIG_INVALID";
+                return Err(error);
+            }
+        }
         result.ready = true;
         cancel.check()?;
         result.desktop = Some((services.discover)(&result.config, cancel)?);
@@ -606,6 +670,10 @@ pub struct EngineSession {
     consent: Option<ConsentProposal>,
     repair: Option<RepairProposal>,
     confirmed_config: Config,
+    /// The last configuration Guard actually read (or committed), kept so a
+    /// failed refresh can still show the stored endpoint instead of silently
+    /// reverting the display to the built-in defaults.
+    known_good: Option<Config>,
     mutation_error: Option<Error>,
     mutation_outcome: Option<MutationOutcome>,
     launch_outcome: Option<LaunchOutcome>,
@@ -656,6 +724,7 @@ impl EngineSession {
             consent: None,
             repair: None,
             confirmed_config: Config::default(),
+            known_good: None,
             mutation_error: None,
             mutation_outcome: None,
             launch_outcome: None,
@@ -686,7 +755,10 @@ impl EngineSession {
         candidate.host = host.to_owned();
         candidate.port = port;
         candidate.validate()?;
-        let invalid = !self.state.ready;
+        // Recovery writes are authorized only by positive evidence that the
+        // stored bytes are unusable. A read failure alone never licenses
+        // overwriting whatever occupies the path.
+        let invalid = self.state.config_invalid;
         self.invalidate();
         self.dispatch(
             false,
@@ -770,6 +842,18 @@ impl EngineSession {
                 "CONFIG_INVALID",
                 "Refresh and repair the configuration first.",
             ));
+        }
+        // A registered target is activated only with arguments Guard can
+        // actually build, so an unsatisfiable plan is refused here — before the
+        // config lease and every side effect — with the same error the view
+        // already reports.
+        if self
+            .state
+            .desktop
+            .as_ref()
+            .is_some_and(|desktop| desktop.registered)
+        {
+            launch::proxy_plan(&self.state.config)?;
         }
         let expected = self.state.config.clone();
         if config_store::load_config(&self.shared.path) != Ok(expected.clone()) {
@@ -871,7 +955,7 @@ impl EngineSession {
             mutation.exceeded_budget = exceeded;
             self.mutation_outcome = Some(mutation.clone());
             if mutation.committed {
-                self.state = result;
+                self.publish(result);
                 self.confirmations();
             } else {
                 self.mutation_error = mutation.mutation_error.clone();
@@ -880,7 +964,7 @@ impl EngineSession {
             return Event::MutationFinished;
         }
         if result.snapshot {
-            self.state = result;
+            self.publish(result);
         } else if let Some(error) = result.error.clone() {
             self.state.error = Some(error);
         }
@@ -891,6 +975,24 @@ impl EngineSession {
         }
         self.confirmations();
         Event::SnapshotArrived
+    }
+
+    /// Publishes a finished result as the displayed state. A result whose
+    /// configuration read failed keeps the last endpoint Guard actually read:
+    /// readiness, discovery facts and the error still come from the failed
+    /// attempt, so launch stays gated and the failure stays visible while the
+    /// stored port is no longer displayed as the built-in default.
+    fn publish(&mut self, mut result: TaskResult) {
+        if result.ready {
+            if result.config_source == "unconfirmed" {
+                result.config_source = "read";
+            }
+            self.known_good = Some(result.config.clone());
+        } else if let Some(known_good) = self.known_good.clone() {
+            result.config = known_good;
+            result.config_source = "retained";
+        }
+        self.state = result;
     }
 
     fn confirmations(&mut self) {
@@ -936,6 +1038,34 @@ impl EngineSession {
             url: self.state.config.proxy_url(),
             host: self.state.config.host.clone(),
             port: self.state.config.port,
+            state: self.state.config_source,
+        };
+        // The launch plan is stated only for what this refresh actually
+        // established: an unread configuration and an undiscovered target
+        // produce no delivery claim.
+        result.plan = if !self.state.ready {
+            unknown_plan()
+        } else {
+            match self.state.desktop.as_ref() {
+                None => unknown_plan(),
+                Some(desktop) if !desktop.registered => LaunchPlanView {
+                    state: "environment",
+                    endpoint: self.state.config.proxy_url(),
+                    error: None,
+                },
+                Some(_) => match launch::proxy_plan(&self.state.config) {
+                    Ok(plan) => LaunchPlanView {
+                        state: "available",
+                        endpoint: plan.endpoint,
+                        error: None,
+                    },
+                    Err(error) => LaunchPlanView {
+                        state: "unavailable",
+                        endpoint: String::new(),
+                        error: Some(error),
+                    },
+                },
+            }
         };
         result.process.state = self.state.process.state;
         result.process.pid = match self.state.process.pid {
@@ -988,11 +1118,24 @@ impl EngineSession {
         if self.pending {
             result.actions.blocked_reason = "Another foreground operation is active.".to_owned();
         } else if !self.state.ready {
-            result.actions.blocked_reason =
-                "Repair the proxy configuration before launch.".to_owned();
+            result.actions.blocked_reason = if self.state.config_source == "retained" {
+                "Guard could not read the configuration; refresh before launching.".to_owned()
+            } else {
+                "Repair the proxy configuration before launch.".to_owned()
+            };
         } else if result.elevation != "not_elevated" {
             result.actions.blocked_reason =
                 "Run Guard as a normal user; elevation must be verifiable.".to_owned();
+        } else if result.plan.state == "unavailable" {
+            // A registered target is launched only with activation arguments
+            // that Guard can actually build, so an unsatisfiable bypass entry
+            // is refused here rather than late in the launch.
+            result.actions.blocked_reason = result
+                .plan
+                .error
+                .as_ref()
+                .map(|error| error.message.clone())
+                .unwrap_or_else(|| "The launch plan could not be built.".to_owned());
         } else if self.state.desktop.is_none() {
             result.actions.blocked_reason = self
                 .state
@@ -1020,6 +1163,8 @@ impl EngineSession {
                 "ELEVATION_NOT_ALLOWED",
                 "Run Guard as a normal user; elevation must be verifiable.",
             ));
+        } else if let Some(error) = result.plan.error.clone() {
+            result.error = Some(error);
         }
         result
     }
