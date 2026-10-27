@@ -51,10 +51,16 @@ pub struct ProxyView {
     pub url: String,
     pub host: String,
     pub port: i64,
+    /// False when Guard holds no endpoint fact to show, in which case `url`,
+    /// `host` and `port` above are empty rather than defaulted. Frontends read
+    /// this instead of guessing from a state string, so no console can invent
+    /// a prefill for an endpoint the engine never published.
+    pub endpoint_known: bool,
     /// Where the displayed endpoint came from: `read` from the configuration
     /// file, `committed` by Guard's own last save, `retained` from the last
-    /// good read while a later read failed, or `unconfirmed` before Guard has
-    /// read a configuration at all.
+    /// good read while a later read failed, `invalid` when Guard read bytes it
+    /// cannot use, or `unconfirmed` before Guard has read a configuration at
+    /// all.
     pub state: &'static str,
 }
 
@@ -64,6 +70,7 @@ impl Default for ProxyView {
             url: String::new(),
             host: String::new(),
             port: 0,
+            endpoint_known: false,
             state: "unconfirmed",
         }
     }
@@ -1024,6 +1031,11 @@ impl EngineSession {
         } else if let Some(known_good) = self.known_good.clone() {
             result.config = known_good;
             result.config_source = "retained";
+        } else if result.config_invalid {
+            // Distinguished from "unconfirmed": Guard did read the file, and
+            // what it read cannot be used. "not read yet" would send the user
+            // to refresh, which reports the same bytes again.
+            result.config_source = "invalid";
         }
         self.state = result;
     }
@@ -1071,7 +1083,7 @@ impl EngineSession {
         // (or a committed save) Guard holds no such fact, so the row stays
         // empty; publishing the built-in default there reads as "my port was
         // reset to 10808", which is the confusion this display must never add.
-        let endpoint_known = self.state.config_source != "unconfirmed";
+        let endpoint_known = matches!(self.state.config_source, "read" | "committed" | "retained");
         result.proxy = ProxyView {
             url: if endpoint_known {
                 self.state.config.proxy_url()
@@ -1088,6 +1100,7 @@ impl EngineSession {
             } else {
                 0
             },
+            endpoint_known,
             state: self.state.config_source,
         };
         // The launch plan is stated only for what this refresh actually

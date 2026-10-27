@@ -229,11 +229,13 @@ original complaint was about.
 | --- | --- | --- | --- |
 | 1 | `view().proxy` published the built-in endpoint (`http://127.0.0.1:10808`) for a session that had read no file at all. A wrong `--config` path or an unreadable file therefore showed the default port with no qualification — the "my port is back to 10808" reading, manufactured by Guard rather than by the user's file | the engine publishes an endpoint only for a configuration it read, committed or retained; before that the row is empty and the state says `not read yet`. `public_json` reports the same empty endpoint with `source: "unconfirmed"` | `a_session_that_never_read_a_file_shows_no_endpoint` (unread path shows nothing, a real read then shows 10809 with no default involved) |
 | 2 | The proxy editor prefilled that invented endpoint, so Enter could save a port the user never typed | the editor opens blank while no endpoint is published | `the_editor_prefills_no_endpoint_that_was_never_read` |
-| 3 | The line console prompted `Port [0]` — the zero standing for "unknown" rendered as a digit, and Enter would have submitted it | both prompts stay empty until the engine publishes an endpoint, and an empty draft is refused with the reason instead of a `CONFIG_INVALID` about `0` | `endpoint_is_published` shared with the TUI; keystroke round trip NOT RUN (ConPTY harness still blocked — see `RUST_TUI_MIGRATION_ACCEPTANCE.md`), checked against the packaged EXE below |
+| 3 | The line console prompted `Port [0]` — the zero standing for "unknown" rendered as a digit, and Enter would have submitted it | both prompts stay empty until the engine publishes an endpoint, and an empty draft is refused with the reason instead of a `CONFIG_INVALID` about `0` | keystroke round trip NOT RUN (ConPTY harness still blocked — see `RUST_TUI_MIGRATION_ACCEPTANCE.md`); verified against the packaged EXE in the third-pass smoke below |
+| 4 | The consoles decided "is there an endpoint to prefill?" by matching the published state string, so a new state would silently publish a default again | `ProxyView.endpoint_known` is the engine's own fact — published only for `read`, `committed` or `retained` — and both consoles read that field instead of interpreting a label | `the_proxy_row_words_every_published_endpoint_state`, `the_editor_prefills_no_endpoint_that_was_never_read` |
+| 5 | A stored file Guard read and could not parse was displayed as `not read yet`, pointing the user at a refresh that reports the same bytes again | a fifth published state `invalid`, worded `stored file not usable`, with no endpoint; a previously read endpoint still wins and stays `last good read` | `an_unusable_stored_file_states_itself_instead_of_a_missing_read` |
 
-The gate is the engine's published state, not a frontend guess: both consoles ask
-`endpoint_is_published(view.proxy.state)` rather than testing the port for zero,
-so "no endpoint" stays one engine fact with one wording in three places.
+The gate is the engine's published fact, not a frontend guess: both consoles ask
+`view.proxy.endpoint_known` rather than testing the port for zero, so "no
+endpoint" stays one engine fact with one wording in three places.
 
 Not changed in this pass, deliberately: the retained-after-failure endpoint (a
 read fact, correctly labelled `last good read`), the `saved, not re-read` fact,
@@ -245,7 +247,7 @@ launch, and this pass only stopped the display from implying otherwise.
 ```text
 cargo fmt --all -- --check                     clean (after cargo fmt)
 cargo clippy --workspace --all-targets -- -D warnings   clean
-cargo test --workspace --locked                135 passed; 0 failed; 3 ignored
+cargo test --workspace --locked                137 passed; 0 failed; 3 ignored
 git diff --check                               clean
 .\scripts\test-rust.ps1                        ALL RUST GATES PASSED
 ```

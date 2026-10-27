@@ -937,3 +937,60 @@ fn a_session_that_never_read_a_file_shows_no_endpoint() {
     assert_eq!(view.proxy.url, "http://127.0.0.1:10809");
     assert_eq!(view.proxy.state, "read");
 }
+
+#[test]
+fn an_unusable_stored_file_states_itself_instead_of_a_missing_read() {
+    // "not read yet" would send the user to refresh, and a refresh reports the
+    // same unusable bytes. Guard read the file and proved it cannot be used,
+    // so the published state says exactly that and offers the repair.
+    let directory = temp_dir("invalid-source");
+    let path = directory.join("config.toml");
+    std::fs::write(&path, b"this is not the Guard configuration\n").expect("write");
+    let mut session = harness_session(&path);
+    session.request_refresh();
+    settled(&mut session);
+    let view = session.view();
+    assert_eq!(
+        view.error.as_ref().map(|error| error.code.as_str()),
+        Some("CONFIG_INVALID")
+    );
+    assert_eq!(view.proxy.state, "invalid");
+    assert!(
+        !view.proxy.endpoint_known && view.proxy.url.is_empty(),
+        "bytes Guard could not parse publish no endpoint: {:?}",
+        view.proxy
+    );
+    assert!(
+        view.actions.blocked_reason.contains("not usable"),
+        "{}",
+        view.actions.blocked_reason
+    );
+
+    // A read that succeeded earlier outranks the later failure: the last good
+    // endpoint stays on screen, labelled as the last good read.
+    let path = directory.join("kept.toml");
+    initialize_config(
+        &path,
+        &Config {
+            port: 10809,
+            ..Config::default()
+        },
+        false,
+    )
+    .expect("seed");
+    let mut session = harness_session(&path);
+    session.request_refresh();
+    settled(&mut session);
+    assert_eq!(session.view().proxy.state, "read");
+    std::fs::write(&path, b"this is not the Guard configuration\n").expect("corrupt");
+    session.request_refresh();
+    settled(&mut session);
+    let view = session.view();
+    assert_eq!(view.proxy.state, "retained");
+    assert!(view.proxy.endpoint_known);
+    assert_eq!(view.proxy.url, "http://127.0.0.1:10809");
+    assert_eq!(
+        view.error.as_ref().map(|error| error.code.as_str()),
+        Some("CONFIG_INVALID")
+    );
+}

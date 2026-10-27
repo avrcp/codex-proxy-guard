@@ -734,15 +734,10 @@ pub fn proxy_source_label(state: &str) -> String {
         "read" => String::new(),
         "committed" => "saved, not re-read".to_owned(),
         "retained" => "last good read".to_owned(),
+        "invalid" => "stored file not usable".to_owned(),
         "unconfirmed" => "not read yet".to_owned(),
         other => format!("source: {other}"),
     }
-}
-
-/// The engine publishes an endpoint only for a configuration it actually read
-/// or committed; until then no frontend may show, prefill or reuse a port.
-pub fn endpoint_is_published(state: &str) -> bool {
-    state != "unconfirmed"
 }
 
 /// The engine facts shown beside the target: the endpoint and its source, the
@@ -1466,11 +1461,7 @@ fn apply_action(model: &mut Model, action: Action) -> Result<()> {
             model.editor_host.set(&view.proxy.host);
             model
                 .editor_port
-                .set(if endpoint_is_published(view.proxy.state) {
-                    &port
-                } else {
-                    ""
-                });
+                .set(if view.proxy.endpoint_known { &port } else { "" });
             model.editor_error = None;
             model.saving_operation = None;
             model.modal = Modal::ProxyEditor;
@@ -1596,6 +1587,43 @@ mod tests {
         // offering the built-in default as if it came from the configuration.
         assert_eq!(model.editor_host.text, "");
         assert_eq!(model.editor_port.text, "");
+    }
+
+    #[test]
+    fn the_proxy_row_words_every_published_endpoint_state() {
+        let mut model = editor_model();
+        model.modal = Modal::None;
+        for (state, wording) in [
+            ("read", ""),
+            ("committed", "saved, not re-read"),
+            ("retained", "last good read"),
+            ("invalid", "stored file not usable"),
+            ("unconfirmed", "not read yet"),
+        ] {
+            let published = matches!(state, "read" | "committed" | "retained");
+            model.view.proxy = cpg_engine::session::ProxyView {
+                url: if published {
+                    "http://127.0.0.1:10809".to_owned()
+                } else {
+                    String::new()
+                },
+                host: if published {
+                    "127.0.0.1".to_owned()
+                } else {
+                    String::new()
+                },
+                port: if published { 10809 } else { 0 },
+                endpoint_known: published,
+                state,
+            };
+            let text: String = status_rows(&model)
+                .remove(0)
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect();
+            assert!(text.contains(wording), "{state} renders {text:?}");
+        }
     }
 
     #[test]
@@ -2119,6 +2147,7 @@ mod tests {
             url: "http://127.0.0.1:10809".to_owned(),
             host: "127.0.0.1".to_owned(),
             port: 10809,
+            endpoint_known: true,
             state: "retained",
         };
         model.view.plan = cpg_engine::session::LaunchPlanView {
@@ -2208,6 +2237,7 @@ mod tests {
             url: "http://127.0.0.1:10809".to_owned(),
             host: "127.0.0.1".to_owned(),
             port: 10809,
+            endpoint_known: true,
             state: "retained",
         };
         model.view.plan = cpg_engine::session::LaunchPlanView {

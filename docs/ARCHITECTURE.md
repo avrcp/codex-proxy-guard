@@ -106,7 +106,9 @@ confirmed repair path, the official Codex CLI running the public
   configuration-source, coverage, launch-plan and delivery facts —
   configured endpoint, submitted endpoint, divergence — that the frontends
   render instead of recomputing; the endpoint itself is published only for a
-  configuration that was read, committed or retained, and coverage and
+  configuration that was read, committed or retained — `ProxyView` carries that
+  as `endpoint_known` so a frontend cannot re-derive it from a label — and
+  coverage and
   authorization only for a configuration that was actually read, so a session
   with no successful read shows no endpoint and claims no consent.
 - `crates/cpg-tui`: `terminal.rs` (capability probe, raw-mode/alternate

@@ -129,7 +129,7 @@ fn interact(
                 // An endpoint that was never read is no default to offer: the
                 // brackets stay empty instead of showing the built-in port or
                 // the zero that stands for "unknown".
-                let endpoint_known = crate::app::endpoint_is_published(view.proxy.state);
+                let endpoint_known = view.proxy.endpoint_known;
                 let host_default = if editor_host.is_empty() {
                     view.proxy.host.clone()
                 } else {
@@ -153,7 +153,7 @@ fn interact(
                     return Ok(0);
                 };
                 let view = session.view();
-                let endpoint_known = crate::app::endpoint_is_published(view.proxy.state);
+                let endpoint_known = view.proxy.endpoint_known;
                 editor_host = if host.is_empty() {
                     view.proxy.host.clone()
                 } else {

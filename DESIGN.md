@@ -36,10 +36,12 @@ the only primary action.
 - The PROXY row shows the endpoint the engine last read from the configuration
   file; a failed read keeps that endpoint and marks it `last good read` instead
   of falling back to the built-in default, which would read as "my port was
-  reset". A just-committed value is `saved, not re-read`, and a session that
-  has read nothing shows `-` labelled `not read yet`: there is no endpoint to
-  display, and the built-in 10808 is not a fact about the user's file. The
-  proxy editor opens blank in that state rather than prefilling a default.
+  reset". A just-committed value is `saved, not re-read`, bytes Guard read but
+  could not parse are `stored file not usable`, and a session that has read
+  nothing shows `-` labelled `not read yet`: there is no endpoint to display,
+  and the built-in 10808 is not a fact about the user's file. The engine says
+  which of those states carries an endpoint (`endpoint_known`), so no frontend
+  prefills or reuses a port it never published; the proxy editor opens blank.
 - Coverage is only claimed for a configuration that was actually read: after a
   failed read the row keeps the endpoint for display and states no backend
   authorization, because the stored consent is unknown at that moment.

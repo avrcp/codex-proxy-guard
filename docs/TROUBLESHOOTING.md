@@ -24,7 +24,10 @@ opens the editor blank instead of offering the built-in 10808 — a port that
 never came from your file is not displayed as if it did. The line console
 leaves both prompts empty in that state and refuses an empty draft instead of
 submitting `0`. Fix the path or permissions, press `R`, and the real endpoint
-appears. While a read is failing, the COVERAGE row keeps the endpoint for
+appears. Bytes Guard read but cannot parse show `Proxy: - [stored file not
+usable]`, which is a different repair: pressing `R` reports the same bytes
+again, so set the proxy and save (press `E`), or correct the file yourself.
+While a read is failing, the COVERAGE row keeps the endpoint for
 display and states no backend authorization: the stored consent is unknown
 until the file can be read again.
 
