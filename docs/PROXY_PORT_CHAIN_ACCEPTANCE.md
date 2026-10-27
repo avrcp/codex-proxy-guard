@@ -318,3 +318,46 @@ and the directory left untouched, `- [stored file not usable]` with the refusal
 naming the save-repair, and the mid-session `[last good read]` retention — all
 PASS against this artifact. Real Desktop A→B activation, backend adoption and
 the TUI keystroke round trip remain **NOT RUN**.
+
+## Release-input hygiene (2026-10-28)
+
+`source.zip` is `git archive` of the tracked tree, so a session plan that a
+tool had committed into `.qoder/plans/` rode inside every release snapshot from
+`b611435c` on, and the script's clean-tree gate then refused a working copy that
+held nothing but local scratch state. Fixed at the input, not by moving files
+aside:
+
+- `.gitignore` now ignores `.qoder/` beside the other machine-local entries, and
+  the committed plan left tracking (`git rm --cached`; the file stays on disk).
+- `scripts/build-portable-rust.ps1` refuses a snapshot carrying `.qoder/`,
+  `.workbuddy/` or `.codegraph/` right after `git archive`, so a repeat mistake
+  stops the build instead of shipping.
+- `scripts/verify-package.py` adds the same three to `FORBIDDEN_SOURCE_SEGMENTS`,
+  so the packaging gate agrees with the build script.
+
+Both refusals were exercised against a real `git archive` produced in a throwaway
+repository containing `.qoder/plans/plan.md` — the build-script filter matched
+`.qoder/` and the verifier exited with "Source ZIP contains a forbidden
+directory"; the throwaway repo was discarded, nothing here was rebuilt from it.
+
+Rebuilt after the change, with the local plan file still present on disk (the
+clean-tree gate passed without moving it aside):
+
+```text
+Artifact: dist/releases/CodexProxyGuard-0.8.0-rc.1-rust-7ef7a2ba/CodexProxyGuard.exe
+Commit:   7ef7a2ba438f653ba924e1d5282f16705c0e4a53   dirty: false
+SHA256:   56898B96FECED8EA221591343B8FDCEEB1189235BDE996C67F5925EAB8F41EC6
+          (matches the shipped SHA256SUMS sidecar)
+Size:     1,226,752 bytes   Signature: UNSIGNED DEVELOPMENT BUILD
+PE facts: all seven mitigation flags true; console subsystem; 14 import
+          descriptors; the same BCRYPTPRIMITIVES.DLL allowlist gap as above
+Snapshot: source.zip 109 entries (was 112), zero tooling directories
+```
+
+Smoke against this binary: `--version`, `licenses` (527 lines), read state
+`Proxy: http://127.0.0.1:10809 | Plan: available …`, unusable bytes
+`Proxy: - [stored file not usable]`, unreadable path
+`Proxy: - [not read yet]` with nothing written to it — PASS. The `b611435c`
+directory remains as built: release directories are immutable, and its
+`source.zip` still carries that one plan file in git history; pruning it is an
+operator decision, not an automated cleanup.
