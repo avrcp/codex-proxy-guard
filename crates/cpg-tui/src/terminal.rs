@@ -3,13 +3,11 @@
 //! restore order that runs even on panic paths.
 
 use cpg_domain::{Error, Result};
-use crossterm::event::{
-    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
-};
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use crossterm::{execute, queue};
+use ratatui::{TerminalOptions, Viewport};
 use std::io::Stdout;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -40,8 +38,19 @@ impl TerminalGuard {
             let mut locked = stdout.lock();
             let _ = execute!(locked, EnterAlternateScreen);
         }
-        let terminal = ratatui::init(); // uses the ratatui default guard
-        let _ = PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES);
+        // Fullscreen viewport over the current buffer: entering/leaving the
+        // alternate screen stays owned by this guard, so the configured
+        // `tui.alternate_screen` policy is honored on every exit path (a bare
+        // `ratatui::init()` would always enter the alternate screen).
+        let terminal = ratatui::try_init_with_options(TerminalOptions {
+            viewport: Viewport::Fullscreen,
+        })
+        .map_err(|_| {
+            Error::new(
+                "CONSOLE_OUTPUT_FAILED",
+                "Cannot initialize the terminal buffer.",
+            )
+        })?;
         let guard = TerminalGuard {
             terminal,
             alternate,
@@ -77,7 +86,6 @@ impl TerminalGuard {
         use std::io::Write as _;
         let _ = locked.flush();
         let _ = disable_raw_mode();
-        let _ = PopKeyboardEnhancementFlags;
     }
 }
 

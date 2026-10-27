@@ -24,7 +24,7 @@ TUI 不是 daemon：关闭 Guard 不会关闭 Desktop；Guard 不管理代理软
 .\CodexProxyGuard.exe licenses             # 离线输出全部内嵌许可与 notices
 ```
 
-TUI 按键：`Enter`/`L` 启动、`E` 编辑代理、`B` 授权/撤销 Codex 后端代理块、`D` 修复启动、`R`/`F5` 刷新、`?`/`F1` 帮助、`Ctrl+C` 取消前台操作、`Q` 退出。授权与修复须在模态中键入 `YES`；编辑器支持 Tab 切换（端口仅数字）。TUI 和 plain 通过同进程引擎会话提交操作；原生激活使用短命的自有 worker 子进程。忙时 Q 需明确选择取消并退出，等待自有操作回收后退出；空闲 Ctrl+C 不修改授权提案。
+TUI 按键：`Enter`/`L` 启动、`E` 编辑代理、`B` 授权/撤销 Codex 后端代理块、`D` 修复启动、`R`/`F5` 刷新、`?`/`F1` 帮助、`Ctrl+C` 取消前台操作、`Q` 退出。授权与修复须在模态中键入 `YES`；编辑器支持 Tab 切换与字符级光标编辑（`←`/`→`/`Home`/`End`/`Backspace`/`Delete`，端口仅数字；带 Ctrl/Alt 的组合键一律不当作字母输入）。TUI 和 plain 通过同进程引擎会话提交操作；原生激活使用短命的自有 worker 子进程。忙时 Q 需明确选择取消并退出，等待自有操作回收后退出；空闲 Ctrl+C 不修改授权提案。
 
 代理编辑器在 Host 或 Port 上按 Enter 都提交完整表单；保存失败保留草稿。若已提交后刷新失败，只重试读取。授权弹窗绑定打开时显示的确切 Home 和一次性提案，配置变化后须重新确认。
 
@@ -65,7 +65,7 @@ Guard 的块由 `# BEGIN CODEX PROXY GUARD: proxy-v1` 和对应 END 标记界定
 要求 Windows、Rust stable（`rust-toolchain.toml` 固定 1.96.0，`x86_64-pc-windows-msvc`）、MSVC 链接工具。生产依赖仅 `windows`/`windows` COM 绑定、ratatui/crossterm、toml；一切 Win32 调用集中在 `crates/cpg-windows`。
 
 ```powershell
-cargo test --workspace                     # 全部 89 个测试
+cargo test --workspace                     # 99 个测试（另有 3 个 ConPTY TUI 验收测试暂以 #[ignore] 保留，见迁移验收文档）
 .\scripts\test-rust.ps1                    # fmt + clippy(-D warnings) + tests + diff 检查
 .\scripts\build-portable-rust.cmd -AllowUnsignedDev       # 未签名开发发布
 .\scripts\build-portable-rust.cmd -Sign -CertificateSha1 <thumbprint>   # 正式签名发布

@@ -8,10 +8,7 @@ use cpg_domain::{Error, Result};
 use cpg_engine::{
     ConsentProposal, EngineSession, LaunchOutcome, MutationOutcome, RepairProposal, SessionView,
 };
-use crossterm::event::{
-    DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers,
-};
-use crossterm::{execute, queue};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -49,14 +46,106 @@ enum Action {
     CancelAndQuit,
 }
 
+/// Single-line editor field with a character-based cursor (DESIGN.md:
+/// Home/End/Left/Right/Backspace/Delete editing; the port field additionally
+/// accepts ASCII digits only, enforced by the callers).
+#[derive(Clone, Debug, Default)]
+struct EditorField {
+    text: String,
+    cursor: usize,
+}
+
+impl EditorField {
+    fn set(&mut self, text: &str) {
+        self.text = text.to_owned();
+        self.cursor = self.text.chars().count();
+    }
+
+    fn char_len(&self) -> usize {
+        self.text.chars().count()
+    }
+
+    fn byte_index(&self) -> usize {
+        self.text
+            .char_indices()
+            .nth(self.cursor)
+            .map(|(index, _)| index)
+            .unwrap_or(self.text.len())
+    }
+
+    /// Inserts one character while the field stays under `limit` characters;
+    /// returns whether the draft changed.
+    fn insert(&mut self, character: char, limit: usize) -> bool {
+        if self.char_len() >= limit {
+            return false;
+        }
+        let index = self.byte_index();
+        self.text.insert(index, character);
+        self.cursor += 1;
+        true
+    }
+
+    /// Removes the character before the cursor.
+    fn backspace(&mut self) -> bool {
+        if self.cursor == 0 {
+            return false;
+        }
+        let end = self.byte_index();
+        let start = self.text[..end]
+            .char_indices()
+            .next_back()
+            .map(|(index, _)| index)
+            .unwrap_or(0);
+        self.text.drain(start..end);
+        self.cursor -= 1;
+        true
+    }
+
+    /// Removes the character at the cursor.
+    fn delete(&mut self) -> bool {
+        if self.cursor >= self.char_len() {
+            return false;
+        }
+        let start = self.byte_index();
+        let end = self.text[start..]
+            .char_indices()
+            .nth(1)
+            .map(|(offset, _)| start + offset)
+            .unwrap_or(self.text.len());
+        self.text.drain(start..end);
+        true
+    }
+
+    fn left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    fn right(&mut self) {
+        self.cursor = (self.cursor + 1).min(self.char_len());
+    }
+
+    fn home(&mut self) {
+        self.cursor = 0;
+    }
+
+    fn end(&mut self) {
+        self.cursor = self.char_len();
+    }
+}
+
+/// The accepted length limits for the editor fields: characters for the
+/// host, digits for the port.
+const HOST_LIMIT: usize = 255;
+const PORT_LIMIT: usize = 5;
+
 struct Model {
     session: EngineSession,
     view: SessionView,
     modal: Modal,
     notice: Option<String>,
     editor_field: u8, // 0 = host, 1 = port
-    editor_host: String,
-    editor_port: String,
+    editor_host: EditorField,
+    editor_port: EditorField,
     editor_error: Option<String>,
     saving_operation: Option<i64>,
     confirm_buffer: String,
@@ -81,8 +170,8 @@ impl Model {
             modal: Modal::None,
             notice: None,
             editor_field: 0,
-            editor_host: String::new(),
-            editor_port: String::new(),
+            editor_host: EditorField::default(),
+            editor_port: EditorField::default(),
             editor_error: None,
             saving_operation: None,
             confirm_buffer: String::new(),
@@ -170,6 +259,43 @@ impl Model {
             .push_str("\nPrepared configuration is not a network verification.");
     }
 
+    /// Keeps the editor open with the draft and shows the refusal inline,
+    /// focusing the offending field when the engine names one.
+    fn retain_editor_error(&mut self, error: &Error) {
+        self.modal = Modal::ProxyEditor;
+        self.editor_error = Some(public_text(&error.message, 1024));
+        match error.field.as_deref() {
+            Some("proxy.host") => self.editor_field = 0,
+            Some("proxy.port") => self.editor_field = 1,
+            _ => {}
+        }
+    }
+
+    /// Bracketed-paste insertion. Windows crossterm delivers pastes as key
+    /// events, so Guard never requests bracketed paste mode; this path stays
+    /// for terminals that synthesize `Event::Paste` anyway.
+    fn paste(&mut self, text: &str) -> Action {
+        if self.modal != Modal::ProxyEditor || self.saving_operation.is_some() {
+            return Action::None;
+        }
+        let port_field = self.editor_field == 1;
+        let limit = if port_field { PORT_LIMIT } else { HOST_LIMIT };
+        let mut changed = false;
+        for character in text.chars() {
+            if character.is_control() {
+                continue;
+            }
+            if port_field && !character.is_ascii_digit() {
+                continue;
+            }
+            changed |= self.active_editor_field_mut().insert(character, limit);
+        }
+        if changed {
+            self.editor_error = None;
+        }
+        Action::None
+    }
+
     fn apply_mutation_outcome(&mut self, outcome: &MutationOutcome) {
         match self.saving_operation {
             Some(operation) if operation == outcome.operation_id => {
@@ -185,21 +311,13 @@ impl Model {
                         .to_owned(),
                     );
                 } else {
-                    self.modal = Modal::ProxyEditor;
-                    let message = outcome
-                        .mutation_error
-                        .as_ref()
-                        .map(|error| public_text(&error.message, 1024))
-                        .unwrap_or_else(|| "Save did not complete. Your draft is retained.".into());
-                    self.editor_error = Some(message);
-                    match outcome
-                        .mutation_error
-                        .as_ref()
-                        .and_then(|error| error.field.as_deref())
-                    {
-                        Some("proxy.host") => self.editor_field = 0,
-                        Some("proxy.port") => self.editor_field = 1,
-                        _ => {}
+                    match outcome.mutation_error.as_ref() {
+                        Some(error) => self.retain_editor_error(error),
+                        None => {
+                            self.modal = Modal::ProxyEditor;
+                            self.editor_error =
+                                Some("Save did not complete. Your draft is retained.".into());
+                        }
                     }
                 }
             }
@@ -208,6 +326,9 @@ impl Model {
     }
 
     fn key(&mut self, key: KeyEvent) -> Action {
+        // Any key supersedes the last inline notice; handlers below may set a
+        // fresh one for the refused action.
+        self.notice = None;
         if key.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key.code, KeyCode::Char('c' | 'C'))
         {
@@ -217,6 +338,17 @@ impl Model {
                 Action::None
             };
             return action;
+        }
+        // Control/Alt character events must never reach the modal handlers as
+        // plain letters: Ctrl+L would launch the Desktop, Ctrl+Q would quit
+        // and Ctrl+V would insert a literal 'v' into the editor. Shift (for
+        // uppercase) stays allowed.
+        if key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            && matches!(key.code, KeyCode::Char(_))
+        {
+            return Action::None;
         }
         if self.modal == Modal::QuitWhileBusy {
             match key.code {
@@ -346,50 +478,63 @@ impl Model {
                 self.editor_field = 1 - self.editor_field;
                 Action::None
             }
-            KeyCode::Enter => {
-                let port = match cpg_domain::parse_port_strict(&self.editor_port) {
-                    Ok(port) => port as i64,
-                    Err(_) => {
-                        self.editor_field = 1;
-                        self.editor_error =
-                            Some("Port must be a number between 1 and 65535.".into());
-                        return Action::None;
-                    }
-                };
-                Action::SaveProxy {
-                    host: self.editor_host.clone(),
-                    port,
+            KeyCode::Enter => match cpg_domain::parse_port_strict(&self.editor_port.text) {
+                Ok(port) => Action::SaveProxy {
+                    host: self.editor_host.text.clone(),
+                    port: port as i64,
+                },
+                Err(error) => {
+                    self.editor_field = 1;
+                    self.editor_error = Some(public_text(&error.message, 1024));
+                    Action::None
                 }
-            }
+            },
             KeyCode::Left => {
-                // Cluster-safe editing is delegated to the line buffer.
+                self.active_editor_field_mut().left();
+                Action::None
+            }
+            KeyCode::Right => {
+                self.active_editor_field_mut().right();
+                Action::None
+            }
+            KeyCode::Home => {
+                self.active_editor_field_mut().home();
+                Action::None
+            }
+            KeyCode::End => {
+                self.active_editor_field_mut().end();
                 Action::None
             }
             KeyCode::Backspace => {
-                let field = self.active_editor_field_mut();
-                field.pop();
+                self.edit_field(EditorField::backspace);
                 Action::None
             }
-            KeyCode::Delete => Action::None,
-            KeyCode::Home | KeyCode::End => Action::None,
+            KeyCode::Delete => {
+                self.edit_field(EditorField::delete);
+                Action::None
+            }
             KeyCode::Char(character) => {
                 let port_field = self.editor_field == 1;
-                let limit = if port_field { 5 } else { 255 };
+                let limit = if port_field { PORT_LIMIT } else { HOST_LIMIT };
                 if port_field && !character.is_ascii_digit() {
                     return Action::None;
                 }
-                let field = self.active_editor_field_mut();
-                if field.chars().count() < limit {
-                    field.push(character);
-                    self.editor_error = None;
-                }
+                self.edit_field(|field| field.insert(character, limit));
                 Action::None
             }
             _ => Action::None,
         }
     }
 
-    fn active_editor_field_mut(&mut self) -> &mut String {
+    /// Applies one field edit and clears the editor error only when the edit
+    /// actually changed the draft.
+    fn edit_field(&mut self, edit: impl FnOnce(&mut EditorField) -> bool) {
+        if edit(self.active_editor_field_mut()) {
+            self.editor_error = None;
+        }
+    }
+
+    fn active_editor_field_mut(&mut self) -> &mut EditorField {
         if self.editor_field == 0 {
             &mut self.editor_host
         } else {
@@ -663,6 +808,21 @@ fn render(frame: &mut Frame, model: &Model) {
         ))
     };
     frame.render_widget(primary, action_bar);
+    if let Some(notice) = &model.notice {
+        let notice_row = Rect {
+            x: action_bar.x,
+            y: action_bar.y + 1,
+            width: action_bar.width,
+            height: 1,
+        };
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                format!(" {notice}"),
+                Style::default().fg(Color::Yellow),
+            )),
+            notice_row,
+        );
+    }
     frame.render_widget(
         Line::from(Span::styled(
             " E Proxy · B Backend · D Repair · R Refresh · ? Help · Q Quit",
@@ -683,6 +843,33 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
         width: width.min(area.width),
         height: height.min(area.height),
     }
+}
+
+/// One editor row: `label [text]` with a reversed cursor cell on the active
+/// field so the character-based cursor position is always visible.
+fn field_line(label: &str, field: &EditorField, active: bool) -> Line<'static> {
+    let marker = if active { " ◄" } else { "" };
+    let mut spans = vec![Span::raw(format!("{label} ["))];
+    if active {
+        let characters: Vec<char> = field.text.chars().collect();
+        let cursor = field.cursor.min(characters.len());
+        let before: String = characters[..cursor].iter().collect();
+        let at: String = characters
+            .get(cursor)
+            .map(|character| character.to_string())
+            .unwrap_or_else(|| " ".to_owned());
+        let after: String = characters[cursor..].iter().collect();
+        spans.push(Span::raw(before));
+        spans.push(Span::styled(
+            at,
+            Style::default().add_modifier(Modifier::REVERSED),
+        ));
+        spans.push(Span::raw(after));
+    } else {
+        spans.push(Span::raw(field.text.clone()));
+    }
+    spans.push(Span::raw(format!("]{marker}")));
+    Line::from(spans)
 }
 
 fn render_modal(frame: &mut Frame, model: &Model, area: Rect) {
@@ -709,17 +896,9 @@ fn render_modal(frame: &mut Frame, model: &Model, area: Rect) {
                 horizontal: 2,
             });
             let mut lines = vec![
-                Line::from(format!(
-                    "Host [{}] {}",
-                    model.editor_host,
-                    if model.editor_field == 0 { "◄" } else { "" }
-                )),
+                field_line("Host", &model.editor_host, model.editor_field == 0),
                 Line::from(""),
-                Line::from(format!(
-                    "Port [{}] {}",
-                    model.editor_port,
-                    if model.editor_field == 1 { "◄" } else { "" }
-                )),
+                field_line("Port", &model.editor_port, model.editor_field == 1),
             ];
             if let Some(error) = &model.editor_error {
                 lines.push(Line::from(""));
@@ -733,7 +912,7 @@ fn render_modal(frame: &mut Frame, model: &Model, area: Rect) {
                 if model.saving_operation.is_some() {
                     "Saving... Ctrl+C cancels; draft retained."
                 } else {
-                    "Tab switch · Enter save · Esc cancel"
+                    "Tab switch · ← → Home End · Enter save · Esc cancel"
                 },
                 Style::default().fg(Color::DarkGray),
             )));
@@ -828,6 +1007,7 @@ fn render_modal(frame: &mut Frame, model: &Model, area: Rect) {
                 Paragraph::new(
                     "Enter / L   Launch Desktop\n\
                      E   Edit proxy host and port\n\
+                     \x20   Editor: Tab switch, ← → Home End, Enter save\n\
                      B   Authorize/revoke backend proxy block\n\
                      D   Repair launch (one shared daemon stop)\n\
                      R / F5   Refresh status\n\
@@ -909,12 +1089,7 @@ pub fn run(config_path: &Path) -> Result<i32> {
 }
 
 fn run_loop(guard: &mut TerminalGuard, config_path: &Path) -> Result<i32> {
-    let stdout = std::io::stdout();
-    {
-        let mut locked = stdout.lock();
-        let _ = execute!(locked, EnableBracketedPaste);
-    }
-    let result = (|| -> Result<i32> {
+    (|| -> Result<i32> {
         let session = EngineSession::new(config_path.to_path_buf())?;
         let mut model = Model::new(session);
         model.session.request_refresh();
@@ -928,14 +1103,17 @@ fn run_loop(guard: &mut TerminalGuard, config_path: &Path) -> Result<i32> {
                 ));
             }
             // Poll the session and input with short slices so busy states and
-            // timeouts progress.
+            // timeouts progress. Bracketed paste mode is never requested:
+            // Windows crossterm cannot synthesize `Event::Paste`, so enabling
+            // it would only inject raw `ESC[200~…ESC[201~` keystrokes into
+            // the modal handlers.
             if crossterm::event::poll(Duration::from_millis(20)).unwrap_or(false) {
-                let key = crossterm::event::read().ok().and_then(|event| match event {
-                    Event::Key(key) => Some(key),
+                let action = crossterm::event::read().ok().and_then(|event| match event {
+                    Event::Key(key) => Some(model.key(key)),
+                    Event::Paste(text) => Some(model.paste(&text)),
                     _ => None,
                 });
-                if let Some(key) = key {
-                    let action = model.key(key);
+                if let Some(action) = action {
                     apply_action(&mut model, action)?;
                 }
             }
@@ -950,13 +1128,7 @@ fn run_loop(guard: &mut TerminalGuard, config_path: &Path) -> Result<i32> {
                 return Ok(0);
             }
         }
-    })();
-    let stdout = std::io::stdout();
-    {
-        let mut locked = stdout.lock();
-        let _ = queue!(locked, DisableBracketedPaste);
-    }
-    result
+    })()
 }
 
 fn handle_event(model: &mut Model, event: cpg_engine::session::Event) -> Result<()> {
@@ -1044,15 +1216,14 @@ fn apply_action(model: &mut Model, action: Action) -> Result<()> {
         Action::OpenEditor => {
             let view = model.session.view();
             model.editor_field = 0;
-            model.editor_host = view.proxy.host.clone();
-            model.editor_port = view.proxy.port.to_string();
+            model.editor_host.set(&view.proxy.host);
+            model.editor_port.set(&view.proxy.port.to_string());
             model.editor_error = None;
             model.saving_operation = None;
             model.modal = Modal::ProxyEditor;
         }
         Action::OpenConsent => {
-            if let Some(proposal) = model.session.view().consent.clone() {
-                drop(proposal);
+            if model.session.view().consent.is_some() {
                 model.confirm_buffer.clear();
                 model.confirm_scroll = 0;
                 model.modal = Modal::Consent;
@@ -1068,15 +1239,10 @@ fn apply_action(model: &mut Model, action: Action) -> Result<()> {
                 model.saving_operation = Some(model.session.operation_id());
                 model.editor_error = None;
             }
-            Err(error) => {
-                let operation = model.session.operation_id();
-                model.saving_operation = Some(operation);
-                model.apply_mutation_outcome(&MutationOutcome {
-                    operation_id: operation,
-                    mutation_error: Some(error),
-                    ..MutationOutcome::default()
-                });
-            }
+            // A synchronous refusal (busy, validation) never dispatched a
+            // task: keep the draft and show the cause inline instead of
+            // fabricating a mutation outcome under a stale operation id.
+            Err(error) => model.retain_editor_error(&error),
         },
         Action::ConfirmConsent(proposal) => {
             if let Err(error) = model.session.request_set_backend_consent(&proposal) {
@@ -1106,4 +1272,193 @@ fn apply_action(model: &mut Model, action: Action) -> Result<()> {
 #[allow(dead_code)]
 fn sink(_value: Result<Vec<u16>>) {
     let _ = wide_to_utf8;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    /// A model with the editor open; the session is never driven, so no
+    /// filesystem or discovery work happens.
+    fn editor_model() -> Model {
+        let session = EngineSession::new(r"C:\cpg-tui-tests\config.toml".into()).expect("session");
+        let mut model = Model::new(session);
+        model.modal = Modal::ProxyEditor;
+        model.editor_field = 0;
+        model.editor_host.set("127.0.0.1");
+        model.editor_port.set("10808");
+        model.editor_error = None;
+        model.saving_operation = None;
+        model
+    }
+
+    fn plain(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn with_modifier(code: KeyCode, modifier: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, modifier)
+    }
+
+    #[test]
+    fn control_and_alt_shortcuts_never_act_as_plain_letters() {
+        let mut model = editor_model();
+        model.modal = Modal::None;
+        assert!(matches!(model.key(plain(KeyCode::Char('q'))), Action::Quit));
+
+        let mut model = editor_model();
+        model.modal = Modal::None;
+        for key in [
+            with_modifier(KeyCode::Char('q'), KeyModifiers::CONTROL),
+            with_modifier(KeyCode::Char('l'), KeyModifiers::CONTROL),
+            with_modifier(KeyCode::Char('e'), KeyModifiers::CONTROL),
+            with_modifier(KeyCode::Char('d'), KeyModifiers::CONTROL),
+            with_modifier(KeyCode::Char('b'), KeyModifiers::CONTROL),
+            with_modifier(KeyCode::Char('e'), KeyModifiers::ALT),
+        ] {
+            assert!(matches!(model.key(key), Action::None));
+        }
+        assert!(!model.exit_requested);
+        assert_eq!(model.modal, Modal::None);
+    }
+
+    #[test]
+    fn editor_ignores_control_characters_and_filters_pastes() {
+        let mut model = editor_model();
+        model.key(with_modifier(KeyCode::Char('v'), KeyModifiers::CONTROL));
+        assert_eq!(model.editor_host.text, "127.0.0.1");
+        model.paste("ab\r\ncd");
+        assert_eq!(model.editor_host.text, "127.0.0.1abcd");
+        model.key(plain(KeyCode::Tab));
+        model.editor_port.set("");
+        model.paste("12x34");
+        assert_eq!(model.editor_port.text, "1234");
+
+        // Pastes outside the editor modal change nothing.
+        let mut model = editor_model();
+        model.modal = Modal::None;
+        model.paste("x");
+        assert_eq!(model.editor_host.text, "127.0.0.1");
+    }
+
+    #[test]
+    fn editor_cursor_editing_matches_design() {
+        let mut model = editor_model();
+        model.editor_host.set("abcd");
+        model.key(plain(KeyCode::Home));
+        assert_eq!(model.editor_host.cursor, 0);
+        model.key(plain(KeyCode::Char('X')));
+        assert_eq!(model.editor_host.text, "Xabcd");
+        model.key(plain(KeyCode::Delete));
+        assert_eq!(model.editor_host.text, "Xbcd");
+        model.key(plain(KeyCode::End));
+        model.key(plain(KeyCode::Backspace));
+        assert_eq!(model.editor_host.text, "Xbc");
+        model.key(plain(KeyCode::Left));
+        model.key(plain(KeyCode::Char('!')));
+        assert_eq!(model.editor_host.text, "Xb!c");
+        model.key(plain(KeyCode::Home));
+        model.key(plain(KeyCode::Backspace));
+        assert_eq!(model.editor_host.text, "Xb!c");
+        model.key(plain(KeyCode::End));
+        model.key(plain(KeyCode::Right));
+        assert_eq!(model.editor_host.cursor, model.editor_host.char_len());
+    }
+
+    #[test]
+    fn port_field_accepts_digits_only_and_caps_length() {
+        let mut model = editor_model();
+        model.editor_field = 1;
+        model.editor_port.set("");
+        for character in ['1', 'a', '2', '3', '4', '5', '6'] {
+            model.key(plain(KeyCode::Char(character)));
+        }
+        assert_eq!(model.editor_port.text, "12345");
+    }
+
+    #[test]
+    fn enter_submits_only_with_a_strict_port_and_keeps_the_draft() {
+        let mut model = editor_model();
+        model.editor_port.set("99999");
+        assert!(matches!(model.key(plain(KeyCode::Enter)), Action::None));
+        assert!(model.editor_error.is_some());
+        assert_eq!(model.editor_field, 1, "port error focuses the port field");
+        assert_eq!(model.editor_port.text, "99999", "draft retained");
+        model.editor_port.set("10808");
+        match model.key(plain(KeyCode::Enter)) {
+            Action::SaveProxy { host, port } => {
+                assert_eq!(host, "127.0.0.1");
+                assert_eq!(port, 10808);
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tab_switches_between_fields() {
+        let mut model = editor_model();
+        model.key(plain(KeyCode::Tab));
+        assert_eq!(model.editor_field, 1);
+        model.key(plain(KeyCode::BackTab));
+        assert_eq!(model.editor_field, 0);
+    }
+
+    #[test]
+    fn editing_after_an_error_clears_it() {
+        let mut model = editor_model();
+        model.editor_error = Some("prior failure".into());
+        model.editor_host.set("127.0.0.");
+        model.key(plain(KeyCode::Char('1')));
+        assert!(model.editor_error.is_none());
+    }
+
+    #[test]
+    fn editor_field_cursor_is_character_based() {
+        let mut field = EditorField::default();
+        field.set("héllo");
+        assert_eq!(field.char_len(), 5);
+        field.left();
+        field.left();
+        assert_eq!(field.cursor, 3);
+        assert!(field.insert('X', HOST_LIMIT));
+        assert_eq!(field.text, "hélXlo");
+        assert!(field.backspace());
+        assert_eq!(field.text, "héllo");
+        field.home();
+        assert!(field.delete());
+        assert_eq!(field.text, "éllo");
+        assert!(!field.backspace());
+        assert_eq!(field.text, "éllo");
+    }
+
+    #[test]
+    fn notices_render_in_the_action_bar() {
+        let mut model = editor_model();
+        model.modal = Modal::None;
+        model.notice = Some("Proxy saved.".to_owned());
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).expect("terminal");
+        terminal.draw(|frame| render(frame, &model)).expect("draw");
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol().to_owned())
+            .collect();
+        assert!(
+            rendered.contains("Proxy saved."),
+            "notice visible: {rendered}"
+        );
+    }
+
+    #[test]
+    fn notices_clear_on_the_next_key_press() {
+        let mut model = editor_model();
+        model.modal = Modal::None;
+        model.notice = Some("Proxy saved.".to_owned());
+        model.key(plain(KeyCode::Char('q')));
+        assert!(model.notice.is_none());
+    }
 }

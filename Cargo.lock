@@ -146,6 +146,7 @@ dependencies = [
  "cpg-engine",
  "cpg-tui",
  "cpg-windows",
+ "windows",
 ]
 
 [[package]]

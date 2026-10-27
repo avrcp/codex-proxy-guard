@@ -147,3 +147,54 @@ activation.
 - C++ product retired after this confirmation; the C++ implementation
   remains retrievable from git history (`main@0bdf2ed` and the
   `v0.4.0-rc.1`/`v0.6.1-rc.1` tags).
+
+## 2026-10-27 输入层修复与验收（TUI 代理编辑器）
+
+用户报告"TUI 配置代理一直异常（输入异常、保存异常）"。根因分析确认了五个
+产品缺陷并全部修复（`crates/cpg-tui`）：
+
+1. **粘贴注入按键序列**（最严重）：启用了 bracketed paste，但 crossterm
+   0.29 在 Windows 上只读 `INPUT_RECORD`、永不合成 `Event::Paste`，于是
+   粘贴被拆成 `ESC[200~…ESC[201~` 按键注入——首个 `Esc` 直接关闭编辑器，
+   其后字符落入主界面（含 `l` 触发启动、`q` 退出）。修复：不再请求
+   bracketed paste（Windows Terminal 此后以普通按键投递粘贴），同时保留
+   防御性 `Event::Paste` 处理（过滤控制字符/端口非数字）。
+2. **Ctrl/Alt 组合键被当作普通字母**：`Ctrl+L` 会启动 Desktop、`Ctrl+V`
+   在编辑器插入字面 `v`。修复：带 Ctrl/Alt 的字符事件统一拦截（Shift 放行）。
+3. **光标编辑未实现**（DESIGN.md 承诺 `Home/End/Left/Right/Backspace/Delete`，
+   实际全部空操作且注释谎称"委托给 line buffer"）：实现字符级
+   `EditorField` 光标编辑并在编辑器渲染反显光标块。
+4. **notice 从未渲染**：8 处赋值 0 处读取——"Proxy saved."、"Saved. Status
+   refresh failed…"、"Diagnostic copied." 等提示全部不可见。修复：动作栏
+   第二行内联显示，任意按键后消隐。
+5. **`tui.alternate_screen = "never"` 失效**：`ratatui::init()` 无条件进入
+   备用屏且退出不恢复，用户终端滞留备用屏。修复：改用
+   `try_init_with_options(Viewport::Fullscreen)`，进出备用屏完全由 guard
+   按策略掌控；初始化失败从 panic 改为按文档降级 plain 控制台。
+   另修复 plain 控制台启动/变更结果**每条命令后无限复读**（按 operation id
+   去重）并清理死代码（no-op `Push/PopKeyboardEnhancementFlags`、恒假
+   `modal_editor`、`clone` 即 `drop`）。
+
+保存链路核查结论：engine 侧事务（独占句柄、解析值比对、seek-zero 写入 +
+`SetEndOfFile` 截断、失败回滚）健全，非 loopback 主机被拒为产品安全边界；
+TUI 同步失败路径不再伪造 `MutationOutcome`，改为内联展示原因并按
+`error.field` 聚焦出错字段。
+
+验证：新增 8 个键路/编辑器单元测试 + 2 个 notice 渲染测试（ratatui
+`TestBackend`），全套 `scripts/test-rust.ps1` 门禁通过（fmt/clippy
+`-D warnings`/99 测试/diff check），并以临时 `--config` 完成 plain 控制台
+`E → localhost:10809 → 保存 → 刷新` 端到端真机烟测（未触碰真实 Codex
+Home/Desktop/daemon）。
+
+### ConPTY acceptance status（未完成，测试暂 `#[ignore]`）
+
+为覆盖交互面，新建 `app/tests/conpty_tui.rs`：以 Windows 伪终端
+（`CreatePseudoConsole` + 属性表子进程）驱动真实 EXE，规划断言粘贴、Ctrl
+键惰性、光标编辑、`alternate_screen` 两种策略、保存往返与干净退出。harness
+自身曾有一个 bug（`STARTUPINFOEXW.lpAttributeList` 未接线，子进程落到测试
+控制台）已修复；此后 conhost 初始化序列（`ESC[?9001h ESC[?1004h`）可以
+回流，但**子进程自身输出始终不回流**——连 `cmd.exe /c echo` 都只收到初始
+序列，判定为本机 conhost 直通/管线问题而非产品缺陷。三个测试保留为
+`#[ignore]`（可 `cargo test -- --ignored` 复跑），待排查 conhost 输出直通
+后启用。**下次公开发布前，编辑器相关项（粘贴、Ctrl 键、光标编辑、
+`alternate_screen=never`）仍需在 Windows Terminal 中人工复验。**

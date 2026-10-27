@@ -3,7 +3,7 @@
 
 use cpg_domain::text::public_text;
 use cpg_domain::{Error, Result};
-use cpg_engine::{EngineSession, Event, MutationOutcome};
+use cpg_engine::{EngineSession, MutationOutcome};
 use std::io::{BufRead, Write};
 use std::path::Path;
 
@@ -72,7 +72,11 @@ fn interact(
     wait_with_controls(session, controls);
     let mut editor_host = String::new();
     let mut editor_port = String::new();
-    let mut modal_editor = false;
+    // Retained outcomes are printed exactly once per operation id; without
+    // this guard every later command would re-print the last launch receipt
+    // or mutation failure forever.
+    let mut reported_launch: Option<i64> = None;
+    let mut reported_mutation: Option<i64> = None;
     loop {
         let view = session.view();
         prompt(&format!(
@@ -97,10 +101,6 @@ fn interact(
             continue;
         }
         let command = action.to_ascii_lowercase().chars().next().unwrap();
-        let retry_draft = command == 'e' && modal_editor;
-        if !retry_draft {
-            modal_editor = false;
-        }
         match command {
             'q' => return Ok(0),
             'r' => {
@@ -160,12 +160,6 @@ fn interact(
                         prompt(&format!("{}: {}", error.code, error.message));
                     }
                 }
-                if let Some(outcome) = session.mutation_outcome()
-                    && let Some(error) = outcome.mutation_error
-                {
-                    prompt(&format!("{}: {}", error.code, error.message));
-                }
-                modal_editor = false;
             }
             'b' | 'd' => {
                 if command == 'b' {
@@ -213,8 +207,12 @@ fn interact(
             }
             _ => prompt("Choose one listed command."),
         }
-        // Publish results.
-        if let Some(outcome) = session.launch_outcome() {
+        // Publish results once per operation id; a retained outcome would
+        // otherwise be re-printed after every later command.
+        if let Some(outcome) = session.launch_outcome()
+            && reported_launch != Some(outcome.operation_id)
+        {
+            reported_launch = Some(outcome.operation_id);
             if let Some(error) = &outcome.error {
                 prompt(&format!("{}: {}", error.code, error.message));
             } else if let Some(receipt) = &outcome.receipt {
@@ -231,17 +229,19 @@ fn interact(
             prompt("Prepared configuration is not a network verification.");
         }
         if let Some(MutationOutcome {
+            operation_id,
             mutation_error: Some(error),
             ..
         }) = session.mutation_outcome()
+            && reported_mutation != Some(operation_id)
         {
+            reported_mutation = Some(operation_id);
             prompt(&format!(
                 "{}: {}",
                 error.code,
                 public_text(&error.message, 1024)
             ));
         }
-        let _ = Event::None;
     }
 }
 

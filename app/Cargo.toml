@@ -13,3 +13,7 @@ cpg-domain = { workspace = true }
 cpg-engine = { workspace = true }
 cpg-tui = { workspace = true }
 cpg-windows = { workspace = true }
+
+[dev-dependencies]
+# ConPTY-driven TUI acceptance only; never linked into the shipped EXE.
+windows = { workspace = true }
