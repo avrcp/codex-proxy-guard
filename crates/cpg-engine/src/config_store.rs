@@ -61,6 +61,9 @@ fn try_config(bytes: &[u8]) -> Option<Config> {
 struct Transaction {
     handle: OwnedHandle,
     original: Vec<u8>,
+    /// True when the file did not exist and this transaction created it, so
+    /// there are no prior bytes to compare against.
+    created: bool,
 }
 
 impl Transaction {
@@ -116,7 +119,11 @@ impl Transaction {
                 "The invalid configuration contains proxy authorization fields; repair it manually while preserving the bound Home before resetting or saving.",
             ));
         }
-        Ok(Transaction { handle, original })
+        Ok(Transaction {
+            handle,
+            original,
+            created,
+        })
     }
 
     fn commit(&self, config: &Config) -> Result<()> {
@@ -190,6 +197,19 @@ pub fn initialize_config(path: &Path, config: &Config, force: bool) -> Result<()
     transaction.commit(config)
 }
 
+/// True only when the path is known to be absent; an unreadable parent is not
+/// evidence of a missing file.
+fn missing_file(path: &Path) -> bool {
+    matches!(path.try_exists(), Ok(false))
+}
+
+fn refuse_consent_restore() -> Error {
+    Error::new(
+        "CONFIG_CONSENT_REPAIR_REQUIRED",
+        "The configuration is missing and its last good read carried backend proxy authorization; save the proxy, then authorize the Codex Home again.",
+    )
+}
+
 pub fn update_proxy(
     path: &Path,
     expected: &Config,
@@ -197,12 +217,24 @@ pub fn update_proxy(
     host: &str,
     port: i64,
 ) -> Result<Config> {
+    if invalid && expected.manage_backend && missing_file(path) {
+        // Checked before opening so the refused repair does not create the
+        // file it is refusing to write.
+        return Err(refuse_consent_restore());
+    }
     let transaction = Transaction::open(
         path,
         if invalid { None } else { Some(expected) },
         invalid,
         false,
     )?;
+    if transaction.created && expected.manage_backend {
+        // The file is gone and the only evidence Guard holds is a snapshot
+        // from before it vanished. Recreating it with the consent fields would
+        // restore an authorization nobody asked for again. This is the same
+        // refusal as above, kept authoritative for a delete in between.
+        return Err(refuse_consent_restore());
+    }
     let mut updated = expected.clone();
     updated.host = host.to_owned();
     updated.port = port;

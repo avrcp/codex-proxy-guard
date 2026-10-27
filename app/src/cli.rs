@@ -345,17 +345,23 @@ fn run_launch(command: &ParsedCommand, config_path: &Path) -> Result<i32> {
     if command.json {
         print_json(&receipt);
     } else {
-        let pid = receipt.at("pid").as_u64().unwrap_or(0);
+        let method = receipt.string_at("launch_method");
+        let pid = receipt
+            .at("pid")
+            .as_u64()
+            .map(|pid| pid.to_string())
+            .unwrap_or_else(|| "unknown".to_owned());
         let endpoint = receipt.string_at("proxy_endpoint");
         print(&format!(
-            "Desktop activation: PID {pid}; instance={}; proxy={} endpoint={}; backend config={}; daemon={}",
-            receipt.string_at("instance"),
-            receipt.string_at("proxy_delivery"),
-            if endpoint.is_empty() { "-" } else { &endpoint },
-            receipt.string_at("backend_proxy_config"),
-            receipt.string_at("daemon_preparation"),
+            "Launched: method={} PID {pid}; instance={}; proxy={} endpoint={}; backend config={}; daemon={}",
+            cpg_tui::dash(&method),
+            cpg_tui::dash(&receipt.string_at("instance")),
+            cpg_tui::dash(&receipt.string_at("proxy_delivery")),
+            cpg_tui::dash(&endpoint),
+            cpg_tui::dash(&receipt.string_at("backend_proxy_config")),
+            cpg_tui::dash(&receipt.string_at("daemon_preparation")),
         ));
-        print("Delivery facts only: Desktop adoption and network use are not verified.");
+        print(cpg_tui::DELIVERY_LIMITATION);
     }
     Ok(0)
 }

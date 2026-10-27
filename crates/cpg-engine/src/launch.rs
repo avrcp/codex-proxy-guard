@@ -670,6 +670,21 @@ fn discover_desktop(config: &Config, cancel: &Cancellation) -> Result<Desktop> {
     )
 }
 
+/// The checks that need no file, handle or process. Running them before the
+/// configuration lease and the cross-process startup guard means a
+/// deterministic refusal leaves no trace at all; the bypass-expressibility
+/// refusal cannot move here, because only a discovered target says whether
+/// activation arguments are required at all.
+fn preflight(config: &Config, options: &LaunchOptions) -> Result<()> {
+    if options.repair && options.activation_only {
+        return fail(
+            "INVALID_LAUNCH_OPTIONS",
+            "Activation-only cannot be combined with daemon repair.",
+        );
+    }
+    config.validate()
+}
+
 /// The single authoritative pipeline used by CLI, plain console and TUI.
 pub fn launch_pipeline(
     config: &Config,
@@ -679,6 +694,7 @@ pub fn launch_pipeline(
     facts: Option<&mut LaunchFacts>,
 ) -> Result<Json> {
     cancel.check()?;
+    preflight(config, &options)?;
     let _lease = ConfigLease::new(config_path, config)?;
     elevation::require_not_elevated()?;
     let startup = StartupLock::open()?;
@@ -723,13 +739,7 @@ pub fn launch_with(
     facts: &mut LaunchFacts,
 ) -> Result<Json> {
     *facts = LaunchFacts::fresh();
-    if options.repair && options.activation_only {
-        return fail(
-            "INVALID_LAUNCH_OPTIONS",
-            "Activation-only cannot be combined with daemon repair.",
-        );
-    }
-    config.validate()?;
+    preflight(config, &options)?;
     cancel.check()?;
     elevation::require_not_elevated()?;
     let desktop = (services.discover)(config, cancel)?;
@@ -880,5 +890,34 @@ pub fn launch_with(
             }
             Err(error)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_deterministic_refusal_needs_no_file_handle_or_process() {
+        // Preflight is the only gate that can refuse before the configuration
+        // lease and the cross-process startup lock are taken, so both refusals
+        // are pure functions of the options and the stored configuration.
+        let conflict = preflight(
+            &Config::default(),
+            &LaunchOptions {
+                repair: true,
+                activation_only: true,
+            },
+        )
+        .expect_err("repair cannot be combined with activation-only");
+        assert_eq!(conflict.code, "INVALID_LAUNCH_OPTIONS");
+
+        let unusable = Config {
+            port: 0,
+            ..Config::default()
+        };
+        let refused = preflight(&unusable, &LaunchOptions::default())
+            .expect_err("a port outside 1..=65535 is not launchable");
+        assert_eq!(refused.code, "CONFIG_INVALID");
     }
 }

@@ -83,22 +83,30 @@ confirmed repair path, the official Codex CLI running the public
 - `crates/cpg-engine`: `config_store.rs` — held write transactions with
   expected-content gates and consent-evidence preservation, the launch
   read lease, `absoluteHome`/`boundHome` scoping, TxF-guarded `.env`
-  prepare/revoke with expected-bytes re-read inside the transaction, and
-  the consent enable/revoke ordering (revoke removes the block before
-  consent is persisted; failures stay retryable). `launch.rs` — proxy
-  plan (Chromium bypass list), Unicode proxy environment, safe CLI
-  resolution (absolute .exe override, explicit CODEX_HOME, known layouts,
-  PATH absolute dirs), exactly-one public daemon stop after preparation,
-  the cross-process startup lock exposed as the injectable
-  `mark_submitted` seam, receipt classification and the shared
-  `launch_with` orchestration used by tests and production alike.
+  prepare/revoke with expected-bytes re-read inside the transaction, the
+  consent enable/revoke ordering (revoke removes the block before
+  consent is persisted; failures stay retryable) and the rule that a repair
+  write never re-creates a missing file with backend consent carried over
+  from a stale snapshot. `launch.rs` — proxy plan (Chromium bypass list),
+  Unicode proxy environment, safe CLI resolution (absolute .exe override,
+  explicit CODEX_HOME, known layouts, PATH absolute dirs), exactly-one
+  public daemon stop after preparation, the cross-process startup lock
+  exposed as the injectable `mark_submitted` seam, receipt classification
+  and the shared `launch_with` orchestration used by tests and production
+  alike. Checks that need no file, handle or process run in `preflight`,
+  before the lease and the startup lock, so a deterministic refusal leaves
+  no trace; the bypass-expressibility refusal stays after discovery,
+  because only a discovered target says whether activation arguments are
+  required at all.
   `session.rs` — `EngineSession`: the transport-free state machine
   (typed `SessionView`, single-use CSPRNG confirmation tokens bound to
   revision + Home + confirmed config, the one-foreground-effect gate that
   stays busy through `CancellingAfterTimeout` until the worker is reaped,
   committed-mutation facts that survive refresh failures, and the
-  configuration-source and launch-plan facts the frontends render instead
-  of recomputing).
+  configuration-source, coverage, launch-plan and delivery facts —
+  configured endpoint, submitted endpoint, divergence — that the frontends
+  render instead of recomputing; coverage and authorization are claimed only
+  for a configuration that was actually read).
 - `crates/cpg-tui`: `terminal.rs` (capability probe, raw-mode/alternate
   screen guard with panic-path restore), `app.rs` (Ratatui event loop,
   modal machine — proxy editor, YES-typed consent/repair, result/help/
@@ -124,7 +132,10 @@ substituted for those facts. Mutation and refresh errors are separate: a
 successful commit followed by a read failure is not retried as a write.
 Launch results retain PID, instance, activation, backend block and daemon
 facts; the frontend schedules at most one read-only refresh after
-settlement and keeps the receipt. Consent proposals bind a CSPRNG
+settlement and keeps the receipt. A launch that produced no receipt is
+described as "no delivery receipt recorded", which is also the honest wording
+for an activation whose outcome is unknown — the absence of a receipt is never
+presented as proof that nothing was delivered. Consent proposals bind a CSPRNG
 single-use token, target enable value and revision to the current config
 and the exact Home; any refused or failed submission consumes the
 displayed proposal. Mutation transactions compare expected config under a

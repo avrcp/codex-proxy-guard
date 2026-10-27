@@ -25,6 +25,22 @@ consent and repair each require a YES-typed modal bound to a single-use engine
 confirmation token tied to the displayed scope and current configuration.
 The plain line console is the same contract in line form.
 
+Delivery judgment is an engine fact, not a frontend one: `LaunchOutcome`
+carries the endpoint in the configuration the launch used and the endpoint the
+receipt actually submitted, plus the divergence flag, so the TUI, the line
+console and the headless CLI state one receipt in one wording instead of each
+comparing strings locally. A failed launch says no delivery receipt was
+recorded, which is not a claim that nothing was delivered.
+
+Backend authorization is only ever re-read from the file it lives in. A repair
+save that would have to re-create a missing configuration refuses to carry the
+consent fields over from the last good read (`CONFIG_CONSENT_REPAIR_REQUIRED`,
+file left absent): revoking or granting authorization stays an explicit,
+single-use user act, and a positive `CONFIG_INVALID` read — never a read
+failure — is the only evidence that licenses replacing unusable bytes. The
+launch path runs the checks that need no file, handle or process before the
+configuration lease and the cross-process startup lock are taken.
+
 Guard runs asInvoker. The engine remains the final authority on elevation,
 loopback proxy validation, package identity and repair gates. A
 malformed/mismatched snapshot disables actions; no submitted operation is

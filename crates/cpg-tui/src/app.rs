@@ -224,36 +224,35 @@ impl Model {
 
     fn set_launch_outcome(&mut self, outcome: &LaunchOutcome) {
         self.set_operation_outcome(outcome.error.as_ref());
-        self.outcome_facts = format!(
-            "Activation: {}\nBackend config: {}\nDaemon: {}",
-            outcome.activation_state, outcome.backend_proxy_config, outcome.daemon_preparation
-        );
+        let mut facts: Vec<String> = Vec::new();
         if let Some(receipt) = &outcome.receipt {
-            let configured = self.view.proxy.url.clone();
-            let submitted = receipt.proxy_endpoint.clone().unwrap_or_default();
-            self.outcome_facts.push_str(&format!(
-                "\nPID: {}\nInstance: {}\nMethod: {}\nProxy delivery: {}\nConfigured: {}\nSubmitted: {}",
-                receipt
-                    .pid
-                    .map(|pid| pid.to_string())
-                    .unwrap_or_else(|| "unknown".into()),
-                receipt.instance,
-                receipt.launch_method,
-                receipt.proxy_delivery,
-                configured,
-                if submitted.is_empty() {
-                    "-"
-                } else {
-                    &submitted
-                }
+            facts.push(format!(
+                "PID: {} · Instance: {}",
+                dash(
+                    &receipt
+                        .pid
+                        .map(|pid| pid.to_string())
+                        .unwrap_or_else(|| "unknown".to_owned())
+                ),
+                dash(&receipt.instance)
             ));
-            if !submitted.is_empty() && submitted != configured {
-                // The receipt is a past fact and the view is a present fact:
-                // saying so is the only honest way to show both.
-                self.outcome_facts
-                    .push_str("\nSubmitted endpoint differs from the current configuration.");
+            facts.push(format!(
+                "Method: {} · Proxy delivery: {}",
+                dash(&receipt.launch_method),
+                dash(&receipt.proxy_delivery)
+            ));
+            // Both endpoints, and the engine's own comparison of them: the
+            // receipt is a past fact and the configuration is a present one.
+            facts.push(format!(
+                "Configured: {} · Submitted: {}",
+                dash(&outcome.configured_endpoint),
+                dash(&outcome.submitted_endpoint)
+            ));
+            if outcome.endpoint_diverged {
+                facts.push(DIVERGED_ENDPOINT.to_owned());
                 self.outcome_warning = true;
             }
+            facts.push(DELIVERY_LIMITATION.to_owned());
             self.outcome_warning |= receipt.instance != "created";
             if receipt.instance == "reused" {
                 self.outcome_message.push_str(
@@ -267,31 +266,33 @@ impl Model {
                 self.outcome_message = if receipt.launch_method == "native_process" {
                     format!(
                         "Desktop process created with the proxy in its environment ({}).",
-                        if submitted.is_empty() {
-                            "unknown"
-                        } else {
-                            &submitted
-                        }
+                        dash(&outcome.submitted_endpoint)
                     )
                 } else {
                     format!(
-                        "Desktop activation returned a new instance with the proxy arguments{}.",
-                        if submitted.is_empty() {
-                            String::new()
-                        } else {
-                            format!(" ({submitted})")
-                        }
+                        "Desktop activation returned a new instance with the proxy arguments ({}).",
+                        dash(&outcome.submitted_endpoint)
                     )
                 };
             }
+        } else {
+            // No receipt means Guard has nothing to state about delivery — not
+            // that nothing happened, which a post-submission failure proves.
+            facts.push(NO_RECEIPT.to_owned());
+            if outcome.backend_proxy_config != "unknown" {
+                facts.push(format!(
+                    "Backend config: {}",
+                    dash(outcome.backend_proxy_config)
+                ));
+            }
+            if outcome.daemon_preparation != "skipped" {
+                facts.push(format!("Daemon: {}", dash(outcome.daemon_preparation)));
+            }
         }
         if outcome.exceeded_budget {
-            self.outcome_facts
-                .push_str("\nSession budget exceeded; returned facts are preserved.");
+            facts.push(BUDGET_EXCEEDED.to_owned());
         }
-        self.outcome_facts.push_str(
-            "\nGuard verifies these delivery facts only: Desktop adoption and network use are not verified.",
-        );
+        self.outcome_facts = facts.join("\n");
     }
 
     /// Keeps the editor open with the draft and shows the refusal inline,
@@ -629,38 +630,162 @@ impl Model {
     }
 
     fn diagnostic_text(&self) -> String {
-        let mut text = format!(
-            "Codex Proxy Guard diagnostic\nversion: {}\ncommit: {}",
-            crate::terminal::diagnostic_version(),
-            crate::terminal::diagnostic_commit()
-        );
+        // One field per line, sanitized line by line: `public_text` folds every
+        // whitespace run into a single space, so washing the whole document at
+        // once would deliver one run-on line with the newest facts cut off.
+        let mut fields: Vec<String> = vec![
+            "Codex Proxy Guard diagnostic".to_owned(),
+            format!("version: {}", crate::terminal::diagnostic_version()),
+            format!("commit: {}", crate::terminal::diagnostic_commit()),
+        ];
         if !self.outcome_message.is_empty() {
-            text.push_str(&format!(
-                "\noperation.error.code: {}\noperation.message: {}",
-                self.outcome_code, self.outcome_message
-            ));
+            fields.push(format!("operation.error.code: {}", self.outcome_code));
+            fields.extend(
+                self.outcome_message
+                    .lines()
+                    .map(|line| format!("operation.message: {line}")),
+            );
         }
         if let Some(error) = &self.view.error {
-            text.push_str(&format!(
-                "\nstatus.error.code: {}\nstatus.error.message: {}",
-                error.code, error.message
-            ));
+            fields.push(format!("status.error.code: {}", error.code));
+            fields.extend(
+                error
+                    .message
+                    .lines()
+                    .map(|line| format!("status.message: {line}")),
+            );
         }
-        text.push_str(&format!(
-            "\nconfig: {}\nproxy: {} ({})\nplan: {} {}\nlaunch: {}\ndesktop: {}\nentry: {}\ncoverage: {}\n{}",
-            self.session.config_path().display(),
-            self.view.proxy.url,
-            self.view.proxy.state,
-            self.view.plan.state,
-            self.view.plan.endpoint,
-            self.view.launch_method,
-            self.view.desktop.display_name,
-            self.view.desktop.application_id.as_deref().unwrap_or("-"),
-            self.view.coverage.state,
-            self.outcome_facts
+        fields.push(format!("config: {}", self.session.config_path().display()));
+        fields.push(format!(
+            "proxy: {} ({})",
+            dash(&self.view.proxy.url),
+            self.view.proxy.state
         ));
-        public_text(&text, 4096)
+        fields.push(format!(
+            "plan: {} {}",
+            self.view.plan.state,
+            dash(&self.view.plan.endpoint)
+        ));
+        if let Some(error) = &self.view.plan.error {
+            fields.push(format!("plan.error: {}", error.code));
+        }
+        fields.push(format!("launch: {}", dash(self.view.launch_method)));
+        fields.push(format!("desktop: {}", dash(self.view.desktop.display_name)));
+        fields.push(format!(
+            "entry: {}",
+            self.view.desktop.application_id.as_deref().unwrap_or("-")
+        ));
+        fields.push(format!("coverage: {}", self.view.coverage.state));
+        fields.extend(
+            self.outcome_facts
+                .lines()
+                .map(|line| format!("fact: {line}")),
+        );
+
+        const LINE_LIMIT: usize = 512;
+        const TOTAL_LIMIT: usize = 4096;
+        let mut kept: Vec<String> = Vec::new();
+        let mut used = 0usize;
+        let mut dropped = 0usize;
+        for field in fields {
+            let line = public_text(&field, LINE_LIMIT);
+            if line.is_empty() {
+                continue;
+            }
+            if used + line.chars().count() + 1 > TOTAL_LIMIT {
+                dropped += 1;
+                continue;
+            }
+            used += line.chars().count() + 1;
+            kept.push(line);
+        }
+        if dropped > 0 {
+            kept.push(format!("truncated: {dropped} further line(s) omitted"));
+        }
+        kept.join("\n")
     }
+}
+
+/// A blank engine string is an absent fact, never an empty cell on screen.
+pub fn dash(value: &str) -> &str {
+    if value.is_empty() { "-" } else { value }
+}
+
+/// A status label always keeps its own cell: a nine-character label such as
+/// `ELEVATION` would otherwise run straight into the value it names.
+fn status_label(text: &str) -> Span<'static> {
+    Span::styled(format!("{text:<9} "), Style::default().fg(Color::DarkGray))
+}
+
+/// The one wording of the launch facts every frontend states, so the line
+/// console, the TUI and the headless CLI cannot describe one receipt three
+/// different ways.
+pub const DELIVERY_LIMITATION: &str =
+    "Guard verifies these delivery facts only: Desktop adoption and network use are not verified.";
+pub const DIVERGED_ENDPOINT: &str =
+    "The submitted endpoint differs from the configuration this launch used.";
+pub const NO_RECEIPT: &str = "Guard recorded no delivery receipt for this launch.";
+pub const BUDGET_EXCEEDED: &str = "Session budget exceeded; returned facts are preserved.";
+
+/// The one wording for where a displayed endpoint came from, shared by the
+/// TUI and the line console so the same state cannot be described two ways.
+pub fn proxy_source_label(state: &str) -> String {
+    match state {
+        "read" => String::new(),
+        "committed" => "saved, not re-read".to_owned(),
+        "retained" => "last good read".to_owned(),
+        "unconfirmed" => "not read yet".to_owned(),
+        other => format!("source: {other}"),
+    }
+}
+
+/// The engine facts shown beside the target: the endpoint and its source, the
+/// delivery plan, the consent state and the elevation state.
+fn status_rows(model: &Model) -> Vec<Line<'static>> {
+    let view = &model.view;
+    let source = proxy_source_label(view.proxy.state);
+    let mut lines = vec![
+        Line::from(vec![
+            status_label("PROXY"),
+            Span::raw(dash(&view.proxy.url).to_owned()),
+            Span::styled(
+                if source.is_empty() {
+                    String::new()
+                } else {
+                    format!(" · {source}")
+                },
+                Style::default().fg(Color::Yellow),
+            ),
+        ]),
+        plan_row(view),
+    ];
+    lines.push(Line::from(vec![
+        status_label("COVERAGE"),
+        Span::styled(
+            view.coverage.state,
+            Style::default().fg(state_style(view.coverage.state)),
+        ),
+        Span::styled(
+            view.coverage
+                .authorized_home
+                .as_ref()
+                .map(|home| format!(" · {}", home.display()))
+                .unwrap_or_default(),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]));
+    lines.push(Line::from(vec![
+        status_label("ELEVATION"),
+        Span::styled(
+            view.elevation,
+            Style::default().fg(if view.elevation == "not_elevated" {
+                Color::Green
+            } else {
+                Color::Red
+            }),
+        ),
+    ]));
+    lines
 }
 
 /// The engine's own statement about how the displayed endpoint would be
@@ -690,7 +815,7 @@ fn plan_row(view: &SessionView) -> Line<'static> {
         _ => ("not confirmed · press R".to_owned(), Color::DarkGray),
     };
     Line::from(vec![
-        Span::styled("PLAN     ", Style::default().fg(Color::DarkGray)),
+        status_label("PLAN"),
         Span::styled(detail, Style::default().fg(color)),
     ])
 }
@@ -704,15 +829,34 @@ fn state_style(state: &str) -> Color {
     }
 }
 
-fn render(frame: &mut Frame, model: &Model) {
-    let area = frame.area();
-    let [header, body, action_bar, footer] = Layout::vertical([
+/// Frame regions, so a render test can read exactly the band a widget owns.
+fn frame_areas(area: Rect) -> [Rect; 4] {
+    Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(1),
         Constraint::Length(2),
         Constraint::Length(2),
     ])
-    .areas(area);
+    .areas(area)
+}
+
+/// Body split: two columns on wide terminals, one column when the terminal is
+/// too narrow to show every engine fact side by side.
+fn body_columns(body: Rect) -> Vec<Rect> {
+    if body.width >= 72 {
+        let [left, right] =
+            Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .spacing(1)
+                .areas(body);
+        vec![left, right]
+    } else {
+        vec![body]
+    }
+}
+
+fn render(frame: &mut Frame, model: &Model) {
+    let area = frame.area();
+    let [header, body, action_bar, footer] = frame_areas(area);
 
     // Header
     let title = Line::from(vec![
@@ -759,22 +903,16 @@ fn render(frame: &mut Frame, model: &Model) {
     frame.render_widget(header_paragraph, header);
 
     // Body: two columns on wide terminals, single column when narrow.
-    let wide = body.width >= 72;
-    let columns = if wide {
-        let [left, right] =
-            Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-                .spacing(1)
-                .areas(body);
-        vec![left, right]
-    } else {
-        vec![body]
-    };
+    let columns = body_columns(body);
 
     let mut rows: Vec<(&str, Line)> = Vec::new();
     rows.push((
         "TARGET",
         Line::from(vec![
-            Span::styled(model.view.desktop.display_name, Style::default().bold()),
+            Span::styled(
+                dash(model.view.desktop.display_name),
+                Style::default().bold(),
+            ),
             Span::styled(
                 format!(
                     " · {} · {}",
@@ -787,7 +925,7 @@ fn render(frame: &mut Frame, model: &Model) {
     rows.push((
         "LAUNCH",
         Line::from(vec![
-            Span::raw(model.view.launch_method),
+            Span::raw(dash(model.view.launch_method)),
             Span::styled(
                 format!(
                     " · {}",
@@ -818,66 +956,27 @@ fn render(frame: &mut Frame, model: &Model) {
             Style::default().fg(state_style(model.view.process.state)),
         )),
     ));
-    let left_lines: Vec<Line> = rows
+    let mut left_lines: Vec<Line> = rows
         .iter()
         .map(|(label, line)| {
-            let mut merged = Line::from(Span::styled(
-                format!("{label:<9}"),
-                Style::default().fg(Color::DarkGray),
-            ));
+            let mut merged = Line::from(status_label(label));
             merged.spans.extend(line.spans.iter().cloned());
             merged
         })
         .collect();
-    let left_paragraph = Paragraph::new(left_lines);
-    frame.render_widget(left_paragraph, columns[0]);
-
+    let status = status_rows(model);
     if let Some(right) = columns.get(1) {
-        let proxy_row = Line::from(vec![
-            Span::styled("PROXY    ", Style::default().fg(Color::DarkGray)),
-            Span::raw(model.view.proxy.url.clone()),
-            Span::styled(
-                match model.view.proxy.state {
-                    "read" => String::new(),
-                    "committed" => " · saved, not re-read".to_owned(),
-                    "retained" => " · last good read".to_owned(),
-                    other => format!(" · {other}"),
-                },
-                Style::default().fg(Color::Yellow),
-            ),
-        ]);
-        let mut right_rows: Vec<Line> = vec![proxy_row, plan_row(&model.view)];
-        right_rows.push(Line::from(vec![
-            Span::styled("COVERAGE ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                model.view.coverage.state,
-                Style::default().fg(state_style(model.view.coverage.state)),
-            ),
-            Span::styled(
-                model
-                    .view
-                    .coverage
-                    .authorized_home
-                    .as_ref()
-                    .map(|home| format!(" · {}", home.display()))
-                    .unwrap_or_default(),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]));
-        right_rows.push(Line::from(vec![
-            Span::styled("ELEVATION", Style::default().fg(Color::DarkGray)),
-            Span::raw(" "),
-            Span::styled(
-                model.view.elevation,
-                Style::default().fg(if model.view.elevation == "not_elevated" {
-                    Color::Green
-                } else {
-                    Color::Red
-                }),
-            ),
-        ]));
-        frame.render_widget(Paragraph::new(right_rows), *right);
+        // Wrapped: a clipped endpoint would be a wrong endpoint, and a clipped
+        // source tag would be a claim about a save that was never made.
+        frame.render_widget(Paragraph::new(status).wrap(Wrap { trim: false }), *right);
+    } else {
+        // A narrow terminal still shows every engine fact, in one column.
+        left_lines.extend(status);
     }
+    frame.render_widget(
+        Paragraph::new(left_lines).wrap(Wrap { trim: false }),
+        columns[0],
+    );
 
     // Action bar
     let primary = if model.session.busy() {
@@ -923,6 +1022,16 @@ fn render(frame: &mut Frame, model: &Model) {
     render_modal(frame, model, area);
 }
 
+/// Rows a wrapped paragraph needs at this width. Panel words are short next to
+/// the width, so this division is close enough to bound the scroll.
+fn wrapped_rows(lines: &[String], width: u16) -> usize {
+    let width = usize::from(width.max(1));
+    lines
+        .iter()
+        .map(|line| line.chars().count().max(1).div_ceil(width))
+        .sum()
+}
+
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
     let x = area.x + area.width.saturating_sub(width) / 2;
     let y = area.y + area.height.saturating_sub(height) / 2;
@@ -932,6 +1041,35 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
         width: width.min(area.width),
         height: height.min(area.height),
     }
+}
+
+/// What the result panel states: a title line followed by the fact lines. The
+/// first entry of the returned list is the title, so the panel size and the
+/// panel content are derived from one description.
+fn result_texts(model: &Model) -> (String, Vec<String>) {
+    let title = if !model.outcome_code.is_empty() {
+        model.outcome_code.clone()
+    } else if model.outcome_warning {
+        "Outcome needs attention".to_owned()
+    } else {
+        "Operation completed".to_owned()
+    };
+    let mut texts = vec![title.clone()];
+    texts.extend(
+        format!("{}\n{}", model.outcome_message, model.outcome_facts)
+            .lines()
+            .map(str::to_owned),
+    );
+    (title, texts)
+}
+
+/// The result panel size: as wide as the terminal allows up to 72 columns and
+/// tall enough for its own wrapped content plus the hint row.
+fn result_panel_size(area: Rect, texts: &[String]) -> (u16, u16) {
+    let width = 72.min(area.width.saturating_sub(2));
+    let rows = wrapped_rows(texts, width.saturating_sub(6).max(1)) as u16;
+    let tallest = area.height.saturating_sub(2).max(9);
+    (width, (rows + 6).clamp(9, tallest))
 }
 
 /// One editor row: `label [text]` with a reversed cursor cell on the active
@@ -1035,6 +1173,11 @@ fn render_modal(frame: &mut Frame, model: &Model, area: Rect) {
                     },
                     proposal.home.display()
                 )
+            } else if consent {
+                // The proposal is single-use and already spent: the dialog must
+                // not describe the operation it is no longer able to perform.
+                "This authorization proposal has expired. Close the dialog, refresh, and open it again to see the exact Home."
+                    .to_owned()
             } else {
                 "Stop the shared Codex background server once. This may interrupt other clients' tasks on the same Home.\nThe backend proxy block is prepared before the stop.".to_owned()
             };
@@ -1110,6 +1253,15 @@ fn render_modal(frame: &mut Frame, model: &Model, area: Rect) {
             );
         }
         Modal::LaunchResult | Modal::ErrorResult => {
+            let (title, texts) = result_texts(model);
+            let title_color = match model.modal {
+                Modal::ErrorResult => Color::Red,
+                _ if model.outcome_warning => Color::Yellow,
+                _ => Color::Green,
+            };
+            // The panel grows to its content: a fixed height used to hide the
+            // last line, which is the delivery-facts caveat, behind the hint.
+            let (popup_width, popup_height) = result_panel_size(area, &texts);
             let rect = popup(
                 frame,
                 if model.modal == Modal::ErrorResult {
@@ -1117,38 +1269,34 @@ fn render_modal(frame: &mut Frame, model: &Model, area: Rect) {
                 } else {
                     "Operation Result"
                 },
-                72,
-                17,
+                popup_width,
+                popup_height,
             );
             let inner = rect.inner(ratatui::layout::Margin {
                 vertical: 1,
                 horizontal: 2,
             });
-            let title = if !model.outcome_code.is_empty() {
-                model.outcome_code.clone()
-            } else if model.outcome_warning {
-                "Outcome needs attention".to_owned()
-            } else {
-                "Operation completed".to_owned()
+            // The hint row belongs to the panel, not to the last detail line.
+            let detail = Rect {
+                x: inner.x,
+                y: inner.y,
+                width: inner.width,
+                height: inner.height.saturating_sub(1),
             };
-            let body = format!("{}\n{}", model.outcome_message, model.outcome_facts);
-            let title_color = match model.modal {
-                Modal::ErrorResult => Color::Red,
-                _ if model.outcome_warning => Color::Yellow,
-                _ => Color::Green,
-            };
+            let scroll_max = wrapped_rows(&texts, detail.width.max(1))
+                .saturating_sub(detail.height as usize) as u16;
             let mut lines: Vec<Line> = vec![Line::from(Span::styled(
                 title,
                 Style::default()
                     .fg(title_color)
                     .add_modifier(Modifier::BOLD),
             ))];
-            lines.extend(body.lines().map(Line::from));
+            lines.extend(texts.iter().skip(1).map(|text| Line::from(text.clone())));
             frame.render_widget(
                 Paragraph::new(lines)
                     .wrap(Wrap { trim: false })
-                    .scroll((model.outcome_scroll as u16, 0)),
-                inner,
+                    .scroll(((model.outcome_scroll as u16).min(scroll_max), 0)),
+                detail,
             );
             frame.render_widget(
                 Line::from(Span::styled(
@@ -1670,7 +1818,12 @@ mod tests {
         assert!(model.notice.is_none());
     }
 
-    fn launched_outcome(method: &str, delivery: &str, endpoint: &str) -> LaunchOutcome {
+    fn launched_outcome(
+        method: &str,
+        delivery: &str,
+        configured: &str,
+        submitted: &str,
+    ) -> LaunchOutcome {
         LaunchOutcome {
             operation_id: 7,
             receipt: Some(cpg_engine::LaunchReceipt {
@@ -1681,9 +1834,13 @@ mod tests {
                 proxy_delivery: delivery.to_owned(),
                 backend_proxy_config: "not_authorized".to_owned(),
                 daemon_preparation: "not_requested".to_owned(),
-                proxy_endpoint: Some(endpoint.to_owned()),
+                proxy_endpoint: Some(submitted.to_owned()),
                 target_elevation: Some(false),
             }),
+            // The engine makes this comparison, not the console.
+            configured_endpoint: configured.to_owned(),
+            submitted_endpoint: submitted.to_owned(),
+            endpoint_diverged: !submitted.is_empty() && submitted != configured,
             ..LaunchOutcome::default()
         }
     }
@@ -1698,47 +1855,95 @@ mod tests {
     #[test]
     fn the_result_modal_separates_the_submitted_endpoint_from_the_current_one() {
         let mut model = editor_model();
-        model.view.proxy.url = "http://127.0.0.1:10809".to_owned();
         model.set_launch_outcome(&launched_outcome(
             "appmodel_activation",
             "activation_arguments",
+            "http://127.0.0.1:10809",
             "http://127.0.0.1:10809",
         ));
         assert!(
             model
                 .outcome_facts
-                .contains("Configured: http://127.0.0.1:10809\nSubmitted: http://127.0.0.1:10809"),
+                .contains("Configured: http://127.0.0.1:10809 · Submitted: http://127.0.0.1:10809"),
             "{}",
             model.outcome_facts
         );
         assert!(model.outcome_facts.contains("Method: appmodel_activation"));
         assert!(
-            model.outcome_facts.contains("PID: 4242\nInstance: created"),
+            model
+                .outcome_facts
+                .contains("PID: 4242 · Instance: created"),
             "{}",
             model.outcome_facts
         );
         assert!(
             !model.outcome_warning,
-            "the receipt matches the current view"
+            "a receipt that matches its configuration is not a warning"
         );
         assert_eq!(
             model.outcome_message,
             "Desktop activation returned a new instance with the proxy arguments (http://127.0.0.1:10809)."
         );
 
-        // A later edit makes the retained receipt a past fact: it stays
-        // visible, but the divergence is stated instead of hidden.
-        model.view.proxy.url = "http://127.0.0.1:10810".to_owned();
+        // The engine's own divergence fact reaches the panel unchanged; the
+        // console does not decide what counts as a mismatch.
         model.set_launch_outcome(&launched_outcome(
             "appmodel_activation",
             "activation_arguments",
+            "http://127.0.0.1:10810",
             "http://127.0.0.1:10809",
         ));
         assert!(model.outcome_warning);
         assert!(
-            model
-                .outcome_facts
-                .contains("Submitted endpoint differs from the current configuration."),
+            model.outcome_facts.contains(DIVERGED_ENDPOINT),
+            "{}",
+            model.outcome_facts
+        );
+    }
+
+    #[test]
+    fn a_failed_launch_states_no_delivery_fact() {
+        let mut model = editor_model();
+        let outcome = LaunchOutcome {
+            operation_id: 9,
+            error: Some(Error::new(
+                "APPX_ACTIVATION_FAILED",
+                "Windows refused the activation.",
+            )),
+            backend_proxy_config: "prepared",
+            daemon_preparation: "stopped",
+            exceeded_budget: true,
+            ..LaunchOutcome::default()
+        };
+        model.set_launch_outcome(&outcome);
+        assert!(
+            model.outcome_facts.contains(NO_RECEIPT),
+            "{}",
+            model.outcome_facts
+        );
+        assert!(
+            model.outcome_facts.contains(BUDGET_EXCEEDED),
+            "a timed-out launch keeps that fact whether or not it was reaped: {}",
+            model.outcome_facts
+        );
+        assert!(
+            !model.outcome_facts.contains(DELIVERY_LIMITATION),
+            "a launch that delivered nothing is not a delivery fact: {}",
+            model.outcome_facts
+        );
+        assert!(
+            !model.outcome_facts.contains("Submitted"),
+            "{}",
+            model.outcome_facts
+        );
+        // What the pipeline did touch stays visible.
+        assert!(
+            model.outcome_facts.contains("Backend config: prepared"),
+            "{}",
+            model.outcome_facts
+        );
+        assert!(
+            model.outcome_facts.contains("Daemon: stopped"),
             "{}",
             model.outcome_facts
         );
@@ -1760,6 +1965,7 @@ mod tests {
             let mut outcome = launched_outcome(
                 "appmodel_activation",
                 "activation_arguments",
+                "http://127.0.0.1:10809",
                 "http://127.0.0.1:10809",
             );
             outcome.receipt.as_mut().expect("receipt").instance = instance.to_owned();
@@ -1788,6 +1994,7 @@ mod tests {
             "native_process",
             "process_environment",
             "http://127.0.0.1:10809",
+            "http://127.0.0.1:10809",
         ));
         assert_eq!(
             model.outcome_message,
@@ -1807,7 +2014,7 @@ mod tests {
         let mut view = SessionView::default();
         assert_eq!(
             line_text(&plan_row(&view)),
-            "PLAN     not confirmed · press R"
+            "PLAN      not confirmed · press R"
         );
         view.plan = cpg_engine::session::LaunchPlanView {
             state: "available",
@@ -1816,7 +2023,7 @@ mod tests {
         };
         assert_eq!(
             line_text(&plan_row(&view)),
-            "PLAN     via activation arguments · http://127.0.0.1:10809"
+            "PLAN      via activation arguments · http://127.0.0.1:10809"
         );
         view.plan = cpg_engine::session::LaunchPlanView {
             state: "environment",
@@ -1825,7 +2032,7 @@ mod tests {
         };
         assert_eq!(
             line_text(&plan_row(&view)),
-            "PLAN     via process environment · http://127.0.0.1:10809"
+            "PLAN      via process environment · http://127.0.0.1:10809"
         );
         view.plan = cpg_engine::session::LaunchPlanView {
             state: "unavailable",
@@ -1834,33 +2041,134 @@ mod tests {
         };
         assert_eq!(
             line_text(&plan_row(&view)),
-            "PLAN     not buildable · PROXY_BYPASS_UNSUPPORTED"
+            "PLAN      not buildable · PROXY_BYPASS_UNSUPPORTED"
         );
     }
 
-    #[test]
-    fn a_wide_terminal_renders_the_plan_row() {
+    /// The screen a model produces, read inside one rectangle in row order with
+    /// whitespace collapsed. A wrapped fact continues on the next row of the
+    /// rectangle it belongs to, so a whole-screen read would interleave the
+    /// two body columns and hide the phrase the user actually sees.
+    fn region_text(width: u16, height: u16, model: &Model, area: Rect) -> String {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+                .expect("terminal");
+        terminal.draw(|frame| render(frame, model)).expect("draw");
+        let buffer = terminal.backend().buffer();
+        (area.top()..area.bottom())
+            .map(|row| {
+                (area.left()..area.right())
+                    .map(|column| buffer[(column, row)].symbol().chars().next().unwrap_or(' '))
+                    // A frame border separates two facts, it does not join them.
+                    .map(|glyph| {
+                        if matches!(glyph, '\u{2500}'..='\u{257f}') {
+                            ' '
+                        } else {
+                            glyph
+                        }
+                    })
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// One body column as the user reads it; a narrow terminal has one column.
+    fn body_text(width: u16, height: u16, model: &Model, band: usize) -> String {
+        let body = frame_areas(Rect::new(0, 0, width, height))[1];
+        let area = *body_columns(body).get(band).unwrap_or(&body);
+        region_text(width, height, model, area)
+    }
+
+    fn endpoint_model() -> Model {
         let mut model = editor_model();
         model.modal = Modal::None;
-        model.view.proxy.url = "http://127.0.0.1:10809".to_owned();
+        model.view.proxy = cpg_engine::session::ProxyView {
+            url: "http://127.0.0.1:10809".to_owned(),
+            host: "127.0.0.1".to_owned(),
+            port: 10809,
+            state: "retained",
+        };
         model.view.plan = cpg_engine::session::LaunchPlanView {
             state: "available",
             endpoint: "http://127.0.0.1:10809".to_owned(),
             error: None,
         };
-        let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).expect("terminal");
-        terminal.draw(|frame| render(frame, &model)).expect("draw");
-        let rendered: String = terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(|cell| cell.symbol().to_owned())
-            .collect();
+        model
+    }
+
+    #[test]
+    fn an_80_column_terminal_keeps_the_endpoint_and_its_source() {
+        let facts = body_text(80, 24, &endpoint_model(), 1);
         assert!(
-            rendered.contains("PLAN") && rendered.contains("via activation arguments"),
-            "plan row visible: {rendered}"
+            facts.contains("http://127.0.0.1:10809"),
+            "the endpoint is never broken across rows: {facts}"
+        );
+        assert!(facts.contains("via activation arguments"), "{facts}");
+        assert!(
+            facts.contains("last good read"),
+            "the source tag is wrapped, not clipped: {facts}"
+        );
+        assert!(
+            facts.contains("ELEVATION not_elevated"),
+            "a nine-character label keeps its own cell: {facts}"
+        );
+    }
+    #[test]
+    fn a_narrow_terminal_still_shows_every_engine_fact() {
+        let facts = body_text(60, 24, &endpoint_model(), 0);
+        for label in ["PROXY", "PLAN", "COVERAGE", "ELEVATION"] {
+            assert!(facts.contains(label), "{label} row missing: {facts}");
+        }
+        assert!(
+            facts.contains("http://127.0.0.1:10809"),
+            "the endpoint is not dropped with the column: {facts}"
+        );
+        assert!(
+            facts.contains("last good read"),
+            "the source tag survives the single column: {facts}"
+        );
+    }
+
+    #[test]
+    fn the_result_panel_shows_the_last_fact_without_scrolling() {
+        let mut model = endpoint_model();
+        model.set_launch_outcome(&launched_outcome(
+            "appmodel_activation",
+            "activation_arguments",
+            "http://127.0.0.1:10809",
+            "http://127.0.0.1:10809",
+        ));
+        model.modal = Modal::LaunchResult;
+        let area = Rect::new(0, 0, 100, 30);
+        let (width, height) = result_panel_size(area, &result_texts(&model).1);
+        let panel = region_text(100, 30, &model, centered(area, width, height));
+        assert!(
+            panel.contains(DELIVERY_LIMITATION),
+            "the caveat is not cut off: {panel}"
+        );
+        assert!(
+            panel.contains("Up/Down details"),
+            "the hint keeps its own row: {panel}"
+        );
+    }
+
+    #[test]
+    fn a_spent_consent_proposal_does_not_describe_a_live_operation() {
+        let mut model = editor_model();
+        model.modal = Modal::Consent;
+        // A fresh session holds no proposal: the dialog has nothing to bind to,
+        // so it must not name an enable value or a Home it cannot see.
+        assert!(model.session.view().consent.is_none());
+        let area = Rect::new(0, 0, 100, 30);
+        let panel = region_text(100, 30, &model, centered(area, 72, 17));
+        assert!(panel.contains("expired"), "{panel}");
+        assert!(
+            !panel.contains("Authorize HTTP_PROXY"),
+            "a spent proposal is not described as grantable: {panel}"
         );
     }
 
@@ -1879,14 +2187,15 @@ mod tests {
             error: None,
         };
         let text = model.diagnostic_text();
+        let lines: Vec<&str> = text.lines().collect();
         assert!(
-            text.contains(r"config: C:\cpg-tui-tests\config.toml"),
+            lines.contains(&r"config: C:\cpg-tui-tests\config.toml"),
             "{text}"
         );
         assert!(
-            text.contains("proxy: http://127.0.0.1:10809 (retained)"),
+            lines.contains(&"proxy: http://127.0.0.1:10809 (retained)"),
             "{text}"
         );
-        assert!(text.contains("plan: unknown "), "{text}");
+        assert!(lines.contains(&"plan: unknown -"), "{text}");
     }
 }

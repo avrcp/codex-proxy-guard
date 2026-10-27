@@ -171,3 +171,49 @@ Executed against the packaged EXE:
 | `no_proxy = ['localhost','intranet.example']` in the stored file | `Plan: unavailable` plus `PROXY_BYPASS_UNSUPPORTED: …` — defect 3 visible without launching anything |
 | Valid config read, then file truncated mid-session and refreshed | `Proxy: http://127.0.0.1:10809 [retained] \| Plan: unknown`, `CONFIG_INVALID: Configuration is not valid TOML.` — defect 1 fixed in the shipped binary; before the change this displayed the default 10808 as if it were configured |
 | Real Desktop A→B launch, backend adoption | **NOT RUN** — see above |
+
+## Second remediation pass (same day, after re-review)
+
+The re-review re-read the changed source and confirmed classes A (save) and B
+(stale launch snapshot) were already sound. What it found instead was a layering
+violation and a set of statements that were louder than the evidence behind
+them. Each item below names the test that pins it; every one ran on this
+machine in this session.
+
+| # | Defect | Fix | Evidence |
+| --- | --- | --- | --- |
+| 1 | `ProxyView::default()`/`LaunchPlanView::default()` used `""` as a fifth, undocumented state | explicit `Default` impls: `unconfirmed` proxy state, `unknown` plan state | `a_view_that_has_read_nothing_states_no_empty_state` |
+| 2 | A retained snapshot kept claiming backend consent and the bound Home after the read failed | coverage and `authorized_home` are published only for a configuration that was actually read | `a_failed_read_stops_claiming_the_backend_authorization` |
+| 3 | One blocked reason covered three different states, telling an unusable-file user to refresh | three sentences: repair-by-saving, refresh-after-read-failure, nothing-read-yet | `an_unusable_configuration_is_offered_as_a_repair_not_a_refresh` |
+| 4 | A recovery save could re-create a deleted config carrying consent from a stale snapshot, i.e. re-granting authorization | `Transaction` reports `created`; `update_proxy` refuses before the open and after it, file left absent | `a_recreated_configuration_does_not_restore_backend_consent` |
+| 5 | Option conflict and config validation ran after the config lease and the cross-process startup lock were taken | `preflight()` runs first; the bypass-expressibility refusal stays after discovery because only a discovered target proves arguments are needed | `a_deterministic_refusal_needs_no_file_handle_or_process` (pure refusal, no lease, no lock), `an_unbuildable_plan_blocks_a_registered_launch_before_any_side_effect` |
+| 6 | The TUI compared the receipt endpoint with the live view and drew its own conclusion | `LaunchOutcome` carries `configured_endpoint`, `submitted_endpoint`, `endpoint_diverged`; the console renders the engine's verdict | `the_result_modal_separates_the_submitted_endpoint_from_the_current_one` |
+| 7 | A failed launch inherited the previous receipt's delivery lines and the caveat | facts are receipt-gated: without a receipt the panel states "no delivery receipt recorded", which is also honest for `APPX_ACTIVATION_OUTCOME_UNKNOWN`, plus the retained budget fact | `a_failed_launch_states_no_delivery_fact` |
+| 8 | PROXY/PLAN were cut off at 80 columns and dropped entirely on a narrow terminal | both body columns wrap; under 72 columns the facts join the single column; every label keeps its own cell (`ELEVATION` no longer runs into its value) | `an_80_column_terminal_keeps_the_endpoint_and_its_source`, `a_narrow_terminal_still_shows_every_engine_fact` |
+| 9 | The result panel was a fixed height, so the last fact — the delivery limitation — sat behind the hint row | panel height derives from its own wrapped content (`result_panel_size`), hint row reserved | `the_result_panel_shows_the_last_fact_without_scrolling` |
+| 10 | `public_text` collapses whitespace, so the copied diagnostic was one run-on line where a long path swallowed later fields | one field per line, each redacted on its own, bounded 4096 with an explicit "further line(s) omitted" tail | `the_copied_diagnostic_names_the_file_the_endpoint_and_the_plan` |
+| 11 | The consent modal described a live proposal even when the proposal was spent | expired-proposal wording for `Modal::Consent` with no proposal; the live wording still comes from the engine's own proposal and Home | `a_spent_consent_proposal_does_not_describe_a_live_operation` |
+| 12 | The three frontends described one receipt three ways | `DELIVERY_LIMITATION`, `DIVERGED_ENDPOINT`, `NO_RECEIPT`, `BUDGET_EXCEEDED`, `dash`, `proxy_source_label` shared from `cpg-tui` and used by the TUI, the line console and the headless CLI | `cargo test -p cpg-tui` plus the shipped-EXE smoke below |
+
+Deliberately **not** changed, after checking them: `known_good` never
+authorizes a write (a read failure still refuses recovery writes, and only
+positive `CONFIG_INVALID` evidence licenses replacing bytes); the
+`may_contain_consent` byte gate; the session-level PLAN gate versus the CLI's
+`PROXY_BYPASS_UNSUPPORTED` refusal — the two differ by design, both fail closed,
+and the ordering is now documented in `ARCHITECTURE.md` and `SECURITY.md`.
+Mutation outcomes keep reporting committed/refresh-error/save-failure states as
+before; the engine's `exceeded_budget` fact for a save was already conveyed
+through those, and no wording was invented for it here.
+
+## Gates executed (second pass)
+
+```text
+cargo fmt --all -- --check                     clean
+cargo clippy --workspace --all-targets -- -D warnings   clean
+cargo test --workspace                         133 passed; 0 failed; 3 ignored
+git diff --check                               clean
+.\scripts\test-rust.ps1                        ALL RUST GATES PASSED
+```
+
+The release package for this pass, its PE facts and the commands actually run
+against it follow; anything not executed is marked NOT RUN rather than inferred.

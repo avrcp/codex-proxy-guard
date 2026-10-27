@@ -19,6 +19,20 @@ then fails (`CONFIG_LOCK_FAILED`, `CONFIG_CHANGED`) and nothing is written.
 Replacing unusable stored bytes needs the positive `CONFIG_INVALID` evidence
 Guard only has after actually reading bytes it cannot use; a file containing
 authorization fields is still refused with `CONFIG_CONSENT_REPAIR_REQUIRED`.
+A session that has not read anything yet says `not read yet` rather than
+showing an empty endpoint. While a read is failing, the COVERAGE row keeps the
+endpoint for display and states no backend authorization: the stored consent
+is unknown until the file can be read again.
+
+The blocked `L` reason tells you which of the three states is true: an
+unusable stored configuration is repaired by saving the proxy again, a failed
+read is repaired by refreshing, and a session that has read nothing is
+repaired by refreshing too — Guard never claims it read something it did not.
+If the configuration file disappears while its last good read carried backend
+proxy authorization, the repair save is refused
+(`CONFIG_CONSENT_REPAIR_REQUIRED`) and the file is left absent: Guard does not
+re-create a file that grants itself authorization from a stale snapshot. Save
+the proxy, then authorize the Codex Home again.
 
 `PLAN not buildable · PROXY_BYPASS_UNSUPPORTED` means a stored `no_proxy`
 entry has no Chromium equivalent: the activation bypass list accepts
@@ -82,12 +96,22 @@ resubmitting.
 
 A submitted activation can remain unknown
 (`APPX_ACTIVATION_OUTCOME_UNKNOWN`) even after cancellation — refresh
-instead of retrying. Quitting the TUI (`Q`) or closing the window never
+instead of retrying. In that state Guard reports that no delivery receipt was
+recorded; "no receipt" is not the same claim as "nothing was delivered", and
+neither one is a statement about the network. The same three receipt facts —
+method, `Configured` versus `Submitted` endpoint, and the delivery-facts
+limitation — are worded identically in the TUI panel, the line console and the
+headless CLI, because the engine, not the frontend, compares the two
+endpoints. Facts wrap inside their own column instead of being cut off, and
+the result panel grows to fit its content, so the last line is on screen
+before you scroll. Quitting the TUI (`Q`) or closing the window never
 terminates Desktop. The proxy editor keeps your input when a save fails;
 fix the reported cause and retry, or verify the stored settings after a
 mid-save engine failure instead of resubmitting blindly. Copy Diagnostic
 (`C` in the result modal) needs a working clipboard; on failure it shows
-`CLIPBOARD_FAILED` instead of silently pretending the copy succeeded.
+`CLIPBOARD_FAILED` instead of silently pretending the copy succeeded. The
+copied text is one field per line, so a long path cannot push the plan state
+off the end of a single run-on line.
 
 Backend proxy block writes require working local NTFS transactions.
 Unsupported filesystems keep consent and refuse modification — there is

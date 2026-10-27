@@ -745,3 +745,157 @@ fn a_committed_save_survives_a_failing_following_refresh() {
     assert_eq!(view.proxy.port, 10809, "the committed value survives");
     assert!(view.error.is_some(), "and the read failure is still shown");
 }
+
+// ---------------------------------------------------------------------------
+// Review #2: which refusal is described, and what a failed read may still claim
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_unusable_configuration_is_offered_as_a_repair_not_a_refresh() {
+    // Guard read the bytes and proved they cannot be used. Telling the user to
+    // refresh describes the one action that cannot help, and this string is
+    // also what the CONFIG_INVALID error carries to every frontend.
+    let directory = temp_dir("invalid-wording");
+    let path = directory.join("config.toml");
+    initialize_config(&path, &Config::default(), false).expect("seed");
+    let mut session = harness_session(&path);
+    session.request_refresh();
+    settled(&mut session);
+
+    std::fs::write(&path, "broken toml [").expect("corrupt");
+    session.request_refresh();
+    settled(&mut session);
+    let view = session.view();
+    assert_eq!(
+        view.error.as_ref().map(|error| error.code.as_str()),
+        Some("CONFIG_INVALID")
+    );
+    assert_eq!(
+        view.actions.blocked_reason,
+        "The stored configuration is not usable; set the proxy again to repair it."
+    );
+    assert!(
+        view.actions.can_edit_proxy,
+        "the offered action is the save"
+    );
+
+    // A read that never produced bytes, after Guard had read the file once:
+    // refresh is the action and no recovery write is authorized.
+    std::fs::remove_file(&path).expect("remove");
+    std::fs::create_dir_all(&path).expect("directory");
+    session.request_refresh();
+    settled(&mut session);
+    let view = session.view();
+    assert_eq!(view.proxy.state, "retained");
+    assert_eq!(
+        view.actions.blocked_reason,
+        "Guard could not read the configuration; refresh before launching."
+    );
+
+    // Before any read at all, neither of those sentences applies.
+    let unreadable = directory.join("not-a-file");
+    std::fs::create_dir_all(&unreadable).expect("directory");
+    let mut session = harness_session(&unreadable);
+    session.request_refresh();
+    settled(&mut session);
+    let view = session.view();
+    assert_eq!(
+        view.actions.blocked_reason,
+        "Guard has not read a usable configuration yet; refresh before launching."
+    );
+}
+
+#[test]
+fn a_failed_read_stops_claiming_the_backend_authorization() {
+    let directory = temp_dir("coverage-stale");
+    let home = directory.join("codex-home");
+    std::fs::create_dir_all(&home).expect("home");
+    let path = directory.join("config.toml");
+    initialize_config(
+        &path,
+        &Config {
+            manage_backend: true,
+            home: home.clone(),
+            ..Config::default()
+        },
+        false,
+    )
+    .expect("seed");
+    let mut session = harness_session(&path);
+    session.request_refresh();
+    settled(&mut session);
+    let view = session.view();
+    assert!(view.coverage.enabled, "authorized while the file reads");
+    assert_eq!(
+        view.coverage.authorized_home.as_deref(),
+        Some(home.as_path())
+    );
+
+    std::fs::write(&path, "broken toml [").expect("corrupt");
+    session.request_refresh();
+    settled(&mut session);
+    let view = session.view();
+    // The endpoint is still shown for reading convenience, marked retained…
+    assert_eq!(view.proxy.state, "retained");
+    // …but consent is a fact about the file, and the file was not understood.
+    assert!(
+        !view.coverage.enabled,
+        "a stale authorization is not presented as current"
+    );
+    assert_eq!(view.coverage.authorized_home, None);
+    assert!(!view.actions.can_launch, "{}", view.actions.blocked_reason);
+}
+
+#[test]
+fn a_view_that_has_read_nothing_states_no_empty_state() {
+    // Every state string is documented; a default view must not invent a fifth
+    // empty one that the frontends render as a blank cell.
+    let view = cpg_engine::session::SessionView::default();
+    assert_eq!(view.proxy.state, "unconfirmed");
+    assert_eq!(view.plan.state, "unknown");
+    let json = view.public_json();
+    assert_eq!(json.at("proxy").at("source").as_str(), Some("unconfirmed"));
+    assert_eq!(
+        json.at("launch_plan").at("state").as_str(),
+        Some("unknown"),
+        "the public JSON keeps the documented state"
+    );
+}
+
+#[test]
+fn a_recreated_configuration_does_not_restore_backend_consent() {
+    // Recovery from a proven-invalid file rewrites the whole file. If the file
+    // has since disappeared, recreating it with the consent fields would
+    // re-authorize a Home without any prompt.
+    let directory = temp_dir("recreate-consent");
+    let home = directory.join("codex-home");
+    std::fs::create_dir_all(&home).expect("home");
+    let path = directory.join("config.toml");
+    let authorized = Config {
+        manage_backend: true,
+        home: home.clone(),
+        ..Config::default()
+    };
+    initialize_config(&path, &authorized, false).expect("seed");
+    let expected = load_config(&path).expect("read");
+    std::fs::remove_file(&path).expect("remove");
+
+    let error = update_proxy(&path, &expected, true, "127.0.0.1", 10809).unwrap_err();
+    assert_eq!(error.code, "CONFIG_CONSENT_REPAIR_REQUIRED");
+    assert!(
+        !path.exists(),
+        "the refused repair does not create the file it would have written"
+    );
+
+    // Without consent fields, recreating a missing configuration is a repair.
+    let plain_path = directory.join("plain.toml");
+    let plain = Config {
+        port: 10808,
+        ..Config::default()
+    };
+    initialize_config(&plain_path, &plain, false).expect("seed");
+    std::fs::remove_file(&plain_path).expect("remove");
+    let saved = update_proxy(&plain_path, &plain, true, "127.0.0.1", 10809).expect("repair");
+    assert_eq!(saved.port, 10809);
+    assert!(!saved.manage_backend);
+}

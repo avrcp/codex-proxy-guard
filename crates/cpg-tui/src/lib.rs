@@ -6,6 +6,9 @@ mod app;
 mod plain;
 mod terminal;
 
+// The launch facts are stated once, in these words, by every frontend.
+pub use app::{DELIVERY_LIMITATION, DIVERGED_ENDPOINT, NO_RECEIPT, dash};
+
 use cpg_domain::Result;
 use std::path::Path;
 

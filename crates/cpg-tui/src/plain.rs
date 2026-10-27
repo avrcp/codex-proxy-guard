@@ -79,20 +79,18 @@ fn interact(
     let mut reported_mutation: Option<i64> = None;
     loop {
         let view = session.view();
-        let configured = if view.proxy.state == "read" {
-            view.proxy.url.clone()
+        // Same wording as the TUI for the same engine state.
+        let source = crate::app::proxy_source_label(view.proxy.state);
+        let configured = if source.is_empty() {
+            crate::app::dash(&view.proxy.url).to_owned()
         } else {
-            format!("{} [{}]", view.proxy.url, view.proxy.state)
+            format!("{} [{source}]", crate::app::dash(&view.proxy.url))
         };
         prompt(&format!(
-            "Proxy: {} | Plan: {}{} | Process: {} | Coverage: {}",
+            "Proxy: {} | Plan: {} {} | Process: {} | Coverage: {}",
             configured,
             view.plan.state,
-            if view.plan.endpoint.is_empty() {
-                String::new()
-            } else {
-                format!(" {}", view.plan.endpoint)
-            },
+            crate::app::dash(&view.plan.endpoint),
             view.process.state,
             view.coverage.state
         ));
@@ -228,27 +226,40 @@ fn interact(
             reported_launch = Some(outcome.operation_id);
             if let Some(error) = &outcome.error {
                 prompt(&format!("{}: {}", error.code, error.message));
+                prompt(crate::app::NO_RECEIPT);
             } else if let Some(receipt) = &outcome.receipt {
                 prompt(&format!(
                     "Launched: method={} PID={} instance={}",
-                    receipt.launch_method,
+                    crate::app::dash(&receipt.launch_method),
                     receipt
                         .pid
                         .map(|pid| pid.to_string())
                         .unwrap_or_else(|| "unknown".into()),
-                    receipt.instance
+                    crate::app::dash(&receipt.instance)
                 ));
+                // The engine's own comparison, so the line console states the
+                // same delivery fact as the TUI and the headless CLI.
                 prompt(&format!(
-                    "Proxy delivery: {} endpoint={}",
-                    receipt.proxy_delivery,
-                    receipt.proxy_endpoint.as_deref().unwrap_or("-")
+                    "Proxy delivery: {} configured={} submitted={}",
+                    crate::app::dash(&receipt.proxy_delivery),
+                    crate::app::dash(&outcome.configured_endpoint),
+                    crate::app::dash(&outcome.submitted_endpoint)
                 ));
+                if outcome.endpoint_diverged {
+                    prompt(crate::app::DIVERGED_ENDPOINT);
+                }
                 prompt(&format!(
                     "Backend config: {} daemon={}",
-                    receipt.backend_proxy_config, receipt.daemon_preparation
+                    crate::app::dash(outcome.backend_proxy_config),
+                    crate::app::dash(outcome.daemon_preparation)
                 ));
+                prompt(crate::app::DELIVERY_LIMITATION);
             }
-            prompt("Delivery facts only: Desktop adoption and network use are not verified.");
+            if outcome.exceeded_budget {
+                // The same caveat the TUI panel shows: the facts are retained,
+                // the operation still ran past its budget.
+                prompt(crate::app::BUDGET_EXCEEDED);
+            }
         }
         if let Some(MutationOutcome {
             operation_id,

@@ -46,7 +46,7 @@ pub struct RepairProposal {
     pub revision: u64,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct ProxyView {
     pub url: String,
     pub host: String,
@@ -58,7 +58,18 @@ pub struct ProxyView {
     pub state: &'static str,
 }
 
-#[derive(Clone, Debug, Default)]
+impl Default for ProxyView {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            host: String::new(),
+            port: 0,
+            state: "unconfirmed",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct LaunchPlanView {
     /// `available`: activation arguments can be built and carry `endpoint`;
     /// `environment`: the native path delivers `endpoint` through the process
@@ -68,6 +79,16 @@ pub struct LaunchPlanView {
     pub state: &'static str,
     pub endpoint: String,
     pub error: Option<Error>,
+}
+
+impl Default for LaunchPlanView {
+    fn default() -> Self {
+        Self {
+            state: "unknown",
+            endpoint: String::new(),
+            error: None,
+        }
+    }
 }
 
 fn unknown_plan() -> LaunchPlanView {
@@ -338,6 +359,12 @@ pub struct LaunchOutcome {
     pub activation_state: &'static str,
     pub daemon_preparation: &'static str,
     pub backend_proxy_config: &'static str,
+    /// The endpoint in the configuration this launch used, and the endpoint it
+    /// actually carried to the target. The engine compares them so every
+    /// frontend states one delivery fact instead of judging it locally.
+    pub configured_endpoint: String,
+    pub submitted_endpoint: String,
+    pub endpoint_diverged: bool,
 }
 
 /// Injectable production services; the constructor-only seam keeps tests
@@ -588,11 +615,17 @@ impl Task {
                     activation_state: facts.activation_state,
                     daemon_preparation: facts.daemon_preparation,
                     backend_proxy_config: facts.backend_proxy_config,
+                    configured_endpoint: expected.proxy_url(),
                     ..LaunchOutcome::default()
                 };
                 match outcome {
                     Ok(value) => {
-                        launch_outcome.receipt = Some(typed_receipt(&value));
+                        let receipt = typed_receipt(&value);
+                        let submitted = receipt.proxy_endpoint.clone().unwrap_or_default();
+                        launch_outcome.submitted_endpoint = submitted.clone();
+                        launch_outcome.endpoint_diverged = !submitted.is_empty()
+                            && submitted != launch_outcome.configured_endpoint;
+                        launch_outcome.receipt = Some(receipt);
                         result.value = value;
                     }
                     Err(error) => launch_outcome.error = Some(error),
@@ -1095,9 +1128,14 @@ impl EngineSession {
             result.desktop.state = "not_found";
         }
         result.coverage.state = self.state.coverage;
-        result.coverage.enabled = self.state.config.manage_backend;
-        if self.state.config.manage_backend {
-            result.coverage.authorized_home = Some(self.state.config.home.clone());
+        // Consent is a fact about the file Guard just read. A retained
+        // snapshot is kept for the endpoint display only: after a failed read
+        // the stored authorization is unknown, so it is not claimed.
+        if self.state.ready {
+            result.coverage.enabled = self.state.config.manage_backend;
+            if self.state.config.manage_backend {
+                result.coverage.authorized_home = Some(self.state.config.home.clone());
+            }
         }
         if let Some(consent) = self.consent.as_ref() {
             result.coverage.candidate_home = Some(consent.home.clone());
@@ -1118,11 +1156,17 @@ impl EngineSession {
         if self.pending {
             result.actions.blocked_reason = "Another foreground operation is active.".to_owned();
         } else if !self.state.ready {
-            result.actions.blocked_reason = if self.state.config_source == "retained" {
-                "Guard could not read the configuration; refresh before launching.".to_owned()
+            result.actions.blocked_reason = if self.state.config_invalid {
+                // Guard read the bytes and proved they cannot be used, so a
+                // refresh would report the same thing: saving the proxy is the
+                // repair, and it is offered.
+                "The stored configuration is not usable; set the proxy again to repair it."
+            } else if self.state.config_source == "retained" {
+                "Guard could not read the configuration; refresh before launching."
             } else {
-                "Repair the proxy configuration before launch.".to_owned()
-            };
+                "Guard has not read a usable configuration yet; refresh before launching."
+            }
+            .to_owned();
         } else if result.elevation != "not_elevated" {
             result.actions.blocked_reason =
                 "Run Guard as a normal user; elevation must be verifiable.".to_owned();
