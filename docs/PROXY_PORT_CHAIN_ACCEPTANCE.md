@@ -140,3 +140,34 @@ git diff --check                               clean
 The 3 ignored tests are the pre-existing ConPTY TUI harness cases, ignored
 because child output does not reach the session pipe on this host — a harness
 problem, recorded in `RUST_TUI_MIGRATION_ACCEPTANCE.md`, not a product pass.
+
+## Release package smoke (same session)
+
+The canonical script built an unsigned development package from the committed,
+clean tree. Only commands that touch a throwaway `--config` path ran; no real
+Codex Home, no Desktop activation, no daemon command.
+
+```text
+Artifact: dist/releases/CodexProxyGuard-0.8.0-rc.1-rust-9569348e/CodexProxyGuard.exe
+Commit:   9569348eaa820d1bd451488d340ca14a92f697bb   dirty: false
+SHA256:   4F4E414B5397E9607CD4CF61DF94428671C4EBE264A32229D62ED923134560EF
+Size:     1,207,296 bytes   Signature: UNSIGNED DEVELOPMENT BUILD
+PE facts: dynamic_base, high_entropy_va, nx_compat, guard_cf, cf_instrumented,
+          cf_function_table_present, cet_compat — all true
+```
+
+`--mitigations-of` is the verifier's PE parsing core; the full `--release`
+manifest gate still expects the retired C++ package schema and was not run
+against this layout (tracked follow-up work, no script changed here). The
+release-profile test pass is part of the same script run.
+
+Executed against the packaged EXE:
+
+| Check | Result |
+| --- | --- |
+| `--version`, `--help`, `build-info`, `licenses` (527 lines, offline) | PASS |
+| `init-config --proxy-port 10809` writes the port, `config-path` resolves the explicit file | PASS — class A proven by the shipped binary |
+| Plain console over a temp config | `Proxy: http://127.0.0.1:10809 \| Plan: available http://127.0.0.1:10809` |
+| `no_proxy = ['localhost','intranet.example']` in the stored file | `Plan: unavailable` plus `PROXY_BYPASS_UNSUPPORTED: …` — defect 3 visible without launching anything |
+| Valid config read, then file truncated mid-session and refreshed | `Proxy: http://127.0.0.1:10809 [retained] \| Plan: unknown`, `CONFIG_INVALID: Configuration is not valid TOML.` — defect 1 fixed in the shipped binary; before the change this displayed the default 10808 as if it were configured |
+| Real Desktop A→B launch, backend adoption | **NOT RUN** — see above |
