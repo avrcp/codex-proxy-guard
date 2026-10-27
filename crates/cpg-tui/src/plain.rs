@@ -126,39 +126,54 @@ fn interact(
             }
             'e' => {
                 let view = session.view();
+                // An endpoint that was never read is no default to offer: the
+                // brackets stay empty instead of showing the built-in port or
+                // the zero that stands for "unknown".
+                let endpoint_known = crate::app::endpoint_is_published(view.proxy.state);
+                let host_default = if editor_host.is_empty() {
+                    view.proxy.host.clone()
+                } else {
+                    editor_host.clone()
+                };
+                let port_default = if !editor_port.is_empty() {
+                    editor_port.clone()
+                } else if endpoint_known {
+                    view.proxy.port.to_string()
+                } else {
+                    String::new()
+                };
                 prompt(&format!(
-                    "Loopback HTTP/Mixed host [{}] (Enter keeps draft):",
-                    if editor_host.is_empty() {
-                        view.proxy.host.clone()
-                    } else {
-                        editor_host.clone()
-                    }
+                    "Loopback HTTP/Mixed host [{host_default}] (Enter keeps draft):"
                 ));
                 let Some(host) = line(input) else {
                     return Ok(0);
                 };
-                prompt(&format!(
-                    "Port [{}] (Enter keeps draft):",
-                    if editor_port.is_empty() {
-                        view.proxy.port.to_string()
-                    } else {
-                        editor_port.clone()
-                    }
-                ));
+                prompt(&format!("Port [{port_default}] (Enter keeps draft):"));
                 let Some(port) = line(input) else {
                     return Ok(0);
                 };
                 let view = session.view();
+                let endpoint_known = crate::app::endpoint_is_published(view.proxy.state);
                 editor_host = if host.is_empty() {
                     view.proxy.host.clone()
                 } else {
                     host
                 };
                 editor_port = if port.is_empty() {
-                    view.proxy.port.to_string()
+                    if endpoint_known {
+                        view.proxy.port.to_string()
+                    } else {
+                        String::new()
+                    }
                 } else {
                     port
                 };
+                if editor_host.is_empty() || editor_port.is_empty() {
+                    prompt(
+                        "Host and port are required - Guard has read no configuration to reuse.",
+                    );
+                    continue;
+                }
                 let parsed = cpg_domain::parse_port_strict(&editor_port);
                 match parsed {
                     Ok(port) => {

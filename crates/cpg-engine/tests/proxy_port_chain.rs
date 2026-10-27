@@ -899,3 +899,41 @@ fn a_recreated_configuration_does_not_restore_backend_consent() {
     assert_eq!(saved.port, 10809);
     assert!(!saved.manage_backend);
 }
+
+#[test]
+fn a_session_that_never_read_a_file_shows_no_endpoint() {
+    // The built-in default endpoint on screen reads as "my port got reset",
+    // which is the very confusion this review started from. Before any
+    // successful read Guard has no endpoint to show.
+    let directory = temp_dir("no-default-display");
+    let unreadable = directory.join("not-a-file");
+    std::fs::create_dir_all(&unreadable).expect("directory");
+    let mut session = harness_session(&unreadable);
+    session.request_refresh();
+    settled(&mut session);
+    let view = session.view();
+    assert_eq!(view.proxy.state, "unconfirmed");
+    assert!(
+        view.proxy.url.is_empty() && view.proxy.host.is_empty() && view.proxy.port == 0,
+        "no endpoint is invented for a file Guard never read: {:?}",
+        view.proxy
+    );
+
+    // A real read restores the endpoint without needing a default.
+    let path = directory.join("config.toml");
+    initialize_config(
+        &path,
+        &Config {
+            port: 10809,
+            ..Config::default()
+        },
+        false,
+    )
+    .expect("seed");
+    let mut session = harness_session(&path);
+    session.request_refresh();
+    settled(&mut session);
+    let view = session.view();
+    assert_eq!(view.proxy.url, "http://127.0.0.1:10809");
+    assert_eq!(view.proxy.state, "read");
+}

@@ -1067,10 +1067,27 @@ impl EngineSession {
             error: self.state.error.clone(),
             ..SessionView::default()
         };
+        // An endpoint is a fact about a file. Before the first successful read
+        // (or a committed save) Guard holds no such fact, so the row stays
+        // empty; publishing the built-in default there reads as "my port was
+        // reset to 10808", which is the confusion this display must never add.
+        let endpoint_known = self.state.config_source != "unconfirmed";
         result.proxy = ProxyView {
-            url: self.state.config.proxy_url(),
-            host: self.state.config.host.clone(),
-            port: self.state.config.port,
+            url: if endpoint_known {
+                self.state.config.proxy_url()
+            } else {
+                String::new()
+            },
+            host: if endpoint_known {
+                self.state.config.host.clone()
+            } else {
+                String::new()
+            },
+            port: if endpoint_known {
+                self.state.config.port
+            } else {
+                0
+            },
             state: self.state.config_source,
         };
         // The launch plan is stated only for what this refresh actually

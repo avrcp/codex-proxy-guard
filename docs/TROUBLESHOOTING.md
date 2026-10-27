@@ -19,10 +19,14 @@ then fails (`CONFIG_LOCK_FAILED`, `CONFIG_CHANGED`) and nothing is written.
 Replacing unusable stored bytes needs the positive `CONFIG_INVALID` evidence
 Guard only has after actually reading bytes it cannot use; a file containing
 authorization fields is still refused with `CONFIG_CONSENT_REPAIR_REQUIRED`.
-A session that has not read anything yet says `not read yet` rather than
-showing an empty endpoint. While a read is failing, the COVERAGE row keeps the
-endpoint for display and states no backend authorization: the stored consent
-is unknown until the file can be read again.
+A session that has not read anything yet shows `Proxy: - [not read yet]` and
+opens the editor blank instead of offering the built-in 10808 — a port that
+never came from your file is not displayed as if it did. The line console
+leaves both prompts empty in that state and refuses an empty draft instead of
+submitting `0`. Fix the path or permissions, press `R`, and the real endpoint
+appears. While a read is failing, the COVERAGE row keeps the endpoint for
+display and states no backend authorization: the stored consent is unknown
+until the file can be read again.
 
 The blocked `L` reason tells you which of the three states is true: an
 unusable stored configuration is repaired by saving the proxy again, a failed

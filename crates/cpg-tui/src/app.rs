@@ -739,6 +739,12 @@ pub fn proxy_source_label(state: &str) -> String {
     }
 }
 
+/// The engine publishes an endpoint only for a configuration it actually read
+/// or committed; until then no frontend may show, prefill or reuse a port.
+pub fn endpoint_is_published(state: &str) -> bool {
+    state != "unconfirmed"
+}
+
 /// The engine facts shown beside the target: the endpoint and its source, the
 /// delivery plan, the consent state and the elevation state.
 fn status_rows(model: &Model) -> Vec<Line<'static>> {
@@ -1453,8 +1459,18 @@ fn apply_action(model: &mut Model, action: Action) -> Result<()> {
         Action::OpenEditor => {
             let view = model.session.view();
             model.editor_field = 0;
+            // The engine publishes no endpoint for a configuration it never
+            // read, so the host stays empty; the port needs the same gate
+            // because zero would render as the digit "0".
+            let port = view.proxy.port.to_string();
             model.editor_host.set(&view.proxy.host);
-            model.editor_port.set(&view.proxy.port.to_string());
+            model
+                .editor_port
+                .set(if endpoint_is_published(view.proxy.state) {
+                    &port
+                } else {
+                    ""
+                });
             model.editor_error = None;
             model.saving_operation = None;
             model.modal = Modal::ProxyEditor;
@@ -1567,6 +1583,19 @@ mod tests {
         ));
         assert_eq!(model.editor_host.text, host);
         assert_eq!(model.editor_host.cursor, cursor);
+    }
+
+    #[test]
+    fn the_editor_prefills_no_endpoint_that_was_never_read() {
+        let mut model = editor_model();
+        model.modal = Modal::None;
+        let action = model.key(plain(KeyCode::Char('e')));
+        assert!(matches!(action, Action::OpenEditor));
+        apply_action(&mut model, action).expect("open editor");
+        // This session has read no file, so the editor opens blank instead of
+        // offering the built-in default as if it came from the configuration.
+        assert_eq!(model.editor_host.text, "");
+        assert_eq!(model.editor_port.text, "");
     }
 
     #[test]

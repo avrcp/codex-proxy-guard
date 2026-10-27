@@ -105,8 +105,10 @@ confirmed repair path, the official Codex CLI running the public
   committed-mutation facts that survive refresh failures, and the
   configuration-source, coverage, launch-plan and delivery facts —
   configured endpoint, submitted endpoint, divergence — that the frontends
-  render instead of recomputing; coverage and authorization are claimed only
-  for a configuration that was actually read).
+  render instead of recomputing; the endpoint itself is published only for a
+  configuration that was read, committed or retained, and coverage and
+  authorization only for a configuration that was actually read, so a session
+  with no successful read shows no endpoint and claims no consent.
 - `crates/cpg-tui`: `terminal.rs` (capability probe, raw-mode/alternate
   screen guard with panic-path restore), `app.rs` (Ratatui event loop,
   modal machine — proxy editor, YES-typed consent/repair, result/help/

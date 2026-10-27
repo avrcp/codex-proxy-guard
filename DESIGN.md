@@ -37,7 +37,9 @@ the only primary action.
   file; a failed read keeps that endpoint and marks it `last good read` instead
   of falling back to the built-in default, which would read as "my port was
   reset". A just-committed value is `saved, not re-read`, and a session that
-  has not read anything says `not read yet`.
+  has read nothing shows `-` labelled `not read yet`: there is no endpoint to
+  display, and the built-in 10808 is not a fact about the user's file. The
+  proxy editor opens blank in that state rather than prefilling a default.
 - Coverage is only claimed for a configuration that was actually read: after a
   failed read the row keeps the endpoint for display and states no backend
   authorization, because the stored consent is unknown at that moment.
