@@ -361,3 +361,84 @@ Smoke against this binary: `--version`, `licenses` (527 lines), read state
 directory remains as built: release directories are immutable, and its
 `source.zip` still carries that one plan file in git history; pruning it is an
 operator decision, not an automated cleanup.
+
+## Fourth review pass (2026-10-28)
+
+Scope: the whole tree again, plus an independent review report of eleven
+candidate findings. Every candidate was checked against the current source
+before anything was changed; the ones that did not survive that check are
+recorded below as **not founded**, so no working module was rewritten on a
+suspicion. Three further defects came from reading the console and the terminal
+guard rather than the report.
+
+### Confirmed and fixed, each with a failing test first
+
+| Defect | Evidence | Fix |
+| --- | --- | --- |
+| `absolute_home` panicked on a non-ASCII Codex Home | `cargo test` aborted at `config_store.rs:259` — `end byte index 8 is not a char boundary; it is inside '据'` for `D:\数据\codex` | prefix tests now compare bytes only after an all-ASCII prefix proves the slice boundary; the one `cpg_domain::text::opens_with_ascii_prefix` helper carries that proof for both call sites (`config_store.rs:259-264` and `cpg-windows/paths.rs:59`, the same hazard) |
+| A cancellation after the submission seam was reported as `not_submitted` | `launch.rs:879-881` relabelled any `LAUNCH_CANCELLED` seen while the state was `unknown`, i.e. also one raised inside the activation/native-launch call | the seam itself (`mark_submitted`) now sets `unknown`, the relabelling is gone, and the pre-seam path keeps the fresh `not_submitted`; two tests pin both sides (`a_cancel_before_the_submission_seam…`, `a_cancel_after_the_submission_seam…`) |
+| A successful native launch published `activation_state: not_submitted` | `launch.rs:653` while the same receipt carried a pid and `instance: created`, and the pipeline fact for that launch said `returned` | the native receipt says `returned` — the create call returned; the method field still says `native_process`, so it is never called an activation |
+| The line console read stdin without a bound and required UTF-8 | `plain.rs:18-24` `read_line` grows to any length and returns `Err` on a non-UTF-8 paste, which the loop treated as EOF | reads are capped at 4096 bytes, the tail of an over-long line is discarded so it cannot arrive as the next command, and non-UTF-8 bytes become one rejected command instead of closing the console |
+| The line console referred to "one listed command" and listed none | the whole `interact` loop printed no key list while dispatching six keys | the accepted keys are printed under the status line every round, and the console now states `Elevation` with the TUI's own wording (`unknown (not verified)` is not coloured or worded like `elevated`) |
+| The documented window-title restore did not exist | the design doc promised restoration on exit (`DESIGN.md:20-22`); nothing in `terminal.rs` or `console.rs` read or wrote the title | `cpg-windows/console.rs` gained `current_title`/`set_title` (bounded, control characters stripped); `TerminalGuard` captures the title on enter and restores it on exit **and** on the panic path; the TUI writes `Codex Proxy Guard - READY/BUSY/RUNNING/BLOCKED` only when the state word changes |
+
+### TUI work against the current Codex CLI console design
+
+Borrowed as design input, not as a rewrite: a status row of ` · ` separated
+facts, a transient instruction row that describes only the keys that do
+something now, whole-item collapse with an explicit marker instead of a
+half-rendered shortcut, and a second status surface in the terminal title.
+
+- `hints_for`/`fit_hints` replaced the fixed hint row: busy, editor, consent,
+  repair, result and help each publish their own live keys, capability-gated
+  chips disappear when the engine says the action is unavailable, and a row
+  that cannot fit drops whole chips with a trailing ` …` while `?` Help and
+  `Q` Quit survive a 20-column terminal.
+- Every single-row band (header state word, action bar, blocked reason,
+  notice) now goes through `ellipsized`, so clipped text says it was clipped
+  instead of silently losing the tail; `join_facts` removed the dangling
+  ` ·` separators that appeared when a qualifier was empty.
+- `unknown` / `not_applicable` / empty states read as absence in both wording
+  and colour (`elevation_row`, `state_style`), so a query that could not be
+  answered is never shown like a refusal.
+- Dialogs are content-sized (`content_panel_size`) and their scrolling is
+  clamped to the end of their own text (`clamped_scroll`), so a short terminal
+  shrinks the panel instead of hiding its last fact; the result panel no longer
+  repeats a hint row inside its own border.
+
+### Not founded
+
+- *Recovery write after a plain read failure without `CONFIG_INVALID`*: already
+  gated and covered by `a_failed_read_does_not_offer_an_unsafe_recovery`.
+- *A `Disconnected` state leaves the session pending*: no such identifier
+  exists in the workspace.
+- *An empty token can confirm a repair launch*: `request_launch` compares the
+  submitted token against the displayed proposal, whose token comes from
+  `random_token()`, and `repair_requires_matching_single_use_token` pins both
+  the match and the single use.
+- *A successful refresh pops the error modal*: `handle_event` opens it only
+  when no modal is showing and no launch outcome is retained, and otherwise
+  downgrades to a notice.
+- *`require_stopped` runs after the submission seam*: all three call sites
+  (`launch.rs:747`, `:808`, `:831`) precede `mark_submitted` at `:834`.
+- *The line console drops the budget-exceeded fact*: it prints
+  `BUDGET_EXCEEDED` once per operation id.
+- *`refuse_if_running` is silently ignored*: the field is part of the frozen
+  v2 schema (`tests/golden/*.toml`) and is kept for parity; Guard refuses a
+  running Desktop at `require_stopped` regardless of it, and never launches
+  into a live instance because the proxy could not reach one.
+
+### Gates executed (fourth pass)
+
+```text
+cargo fmt --all --check          PASS
+cargo clippy --workspace --all-targets -- -D warnings   PASS
+cargo test --workspace           PASS — 157 tests (app 4, domain 48, engine 15 + 23,
+                                 tui 41, windows 26), 3 ConPTY tests still #[ignore]
+git diff --check                 PASS
+.\scripts\test-rust.ps1          ALL RUST GATES PASSED
+```
+
+Real Desktop A→B activation, a real Codex Home block and the ConPTY keystroke
+round trip remain **NOT RUN**: no automated test starts Desktop, stops a shared
+daemon or writes a real Home.
