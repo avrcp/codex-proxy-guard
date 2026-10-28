@@ -1,10 +1,10 @@
 //! Plain line-mode console: the VT-unavailable / `--plain` / redirected
 //! fallback. Same engine semantics, line-driven interaction, no ANSI.
 
+use cpg_domain::Result;
 use cpg_domain::text::public_text;
-use cpg_domain::{Error, Result};
 use cpg_engine::{EngineSession, MutationOutcome};
-use std::io::{BufRead, Write};
+use std::io::{BufRead, Read, Write};
 use std::path::Path;
 
 fn prompt(text: &str) {
@@ -14,12 +14,29 @@ fn prompt(text: &str) {
     let _ = out.flush();
 }
 
-/// Reads one trimmed line from stdin; `None` on EOF.
+/// What this console reads. The engine still refuses what the current state
+/// does not allow, in the same words the TUI shows.
+const COMMAND_LINE: &str = "[L] Launch  [E] Edit proxy  [B] Backend authorization  \
+                            [D] Repair launch  [R] Refresh  [Q] Quit";
+
+/// Reads one trimmed line, keeping at most `LINE_LIMIT` bytes. Bytes are read
+/// without a UTF-8 requirement so an over-long or non-UTF-8 paste is one
+/// rejected command rather than a stream error that closes the console; the
+/// remainder of an over-long line is discarded so it cannot arrive as the next
+/// command.
 fn line(input: &mut dyn BufRead) -> Option<String> {
-    let mut buffer = String::new();
-    match input.read_line(&mut buffer) {
+    const LINE_LIMIT: u64 = 4096;
+    let mut raw: Vec<u8> = Vec::new();
+    let read = input.take(LINE_LIMIT).read_until(b'\n', &mut raw);
+    match read {
         Ok(0) | Err(_) => None,
-        Ok(_) => Some(buffer.trim().to_owned()),
+        Ok(_) => {
+            if !raw.ends_with(b"\n") {
+                let mut remainder = Vec::new();
+                let _ = input.read_until(b'\n', &mut remainder);
+            }
+            Some(String::from_utf8_lossy(&raw).trim().to_owned())
+        }
     }
 }
 
@@ -87,13 +104,15 @@ fn interact(
             format!("{} [{source}]", crate::app::dash(&view.proxy.url))
         };
         prompt(&format!(
-            "Proxy: {} | Plan: {} {} | Process: {} | Coverage: {}",
+            "Proxy: {} | Plan: {} {} | Process: {} | Coverage: {} | Elevation: {}",
             configured,
             view.plan.state,
             crate::app::dash(&view.plan.endpoint),
             view.process.state,
-            view.coverage.state
+            view.coverage.state,
+            crate::app::elevation_label(view.elevation)
         ));
+        prompt(COMMAND_LINE);
         if let Some(error) = &view.error {
             prompt(&format!("{}: {}", error.code, error.message));
         }
@@ -293,7 +312,41 @@ fn interact(
     }
 }
 
-#[allow(dead_code)]
-fn sink(error: Option<Error>) {
-    let _ = error;
+#[cfg(test)]
+mod tests {
+    use super::{COMMAND_LINE, line};
+    use std::io::Cursor;
+
+    #[test]
+    fn the_command_line_lists_every_key_the_console_reads() {
+        // "Choose one listed command" only means something if every key the
+        // console dispatches is on the list the user is looking at.
+        for key in ['L', 'E', 'B', 'D', 'R', 'Q'] {
+            assert!(
+                COMMAND_LINE.contains(&format!("[{key}]")),
+                "{key} is accepted but not listed: {COMMAND_LINE}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_over_long_line_is_bounded_and_leaves_the_next_line_intact() {
+        let mut input = Cursor::new(format!("{}\nQ\n", "h".repeat(9000)));
+        let first = line(&mut input).expect("bounded read");
+        assert_eq!(first.len(), 4096, "the read stops at its limit");
+        assert_eq!(
+            line(&mut input).as_deref(),
+            Some("Q"),
+            "the discarded tail is not read as a command"
+        );
+        assert!(line(&mut input).is_none(), "EOF still ends the console");
+    }
+
+    #[test]
+    fn a_non_utf8_byte_is_a_rejected_command_not_a_closed_console() {
+        let mut input = Cursor::new(vec![b'e', b'\r', b'\n', 0xff, b'\n']);
+        assert_eq!(line(&mut input).as_deref(), Some("e"));
+        assert_eq!(line(&mut input).as_deref(), Some("\u{fffd}"));
+        assert!(line(&mut input).is_none());
+    }
 }

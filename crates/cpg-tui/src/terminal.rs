@@ -21,12 +21,14 @@ pub fn supports_terminal() -> bool {
 pub struct TerminalGuard {
     terminal: ratatui::DefaultTerminal,
     alternate: bool,
+    saved_title: Option<String>,
     restored: AtomicBool,
 }
 
 impl TerminalGuard {
     /// Enters raw mode and (depending on `alternate`) the alternate screen.
     pub fn enter(alternate: bool) -> Result<TerminalGuard> {
+        let saved_title = cpg_windows::console::current_title();
         enable_raw_mode().map_err(|_| {
             Error::new(
                 "CONSOLE_OUTPUT_FAILED",
@@ -54,16 +56,21 @@ impl TerminalGuard {
         let guard = TerminalGuard {
             terminal,
             alternate,
+            saved_title,
             restored: AtomicBool::new(false),
         };
         // Panic hook: restore the terminal before the default hook unwinds.
         let previous = panic::take_hook();
+        let title_on_panic = guard.saved_title.clone();
         panic::set_hook(Box::new(move |info| {
             let _ = disable_raw_mode();
             let stdout = std::io::stdout();
             let mut locked = stdout.lock();
             let _ = execute!(locked, LeaveAlternateScreen);
             let _ = crossterm::cursor::Show;
+            if let Some(title) = title_on_panic.as_deref() {
+                cpg_windows::console::set_title(title);
+            }
             previous(info);
         }));
         Ok(guard)
@@ -86,6 +93,9 @@ impl TerminalGuard {
         use std::io::Write as _;
         let _ = locked.flush();
         let _ = disable_raw_mode();
+        if let Some(title) = self.saved_title.as_deref() {
+            cpg_windows::console::set_title(title);
+        }
     }
 }
 

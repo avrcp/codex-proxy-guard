@@ -4,13 +4,22 @@ Mode: Operate. The first screen answers which proxy, which application,
 whether it is running, and what proxy configuration is prepared. Launch is
 the only primary action.
 
-- Fixed full-width console frame, minimum 72x22 (a resize notice below that),
-  comfortable at 86x28 and above.
+- Fixed full-width console frame, comfortable at 86x28 and above. There is no
+  minimum size to enforce and no notice about one: the layout adapts, and the
+  rows stay whole down to a 20-column terminal.
 - One aligned block of seven information rows, no scrolling or nested cards;
   each label keeps its own cell, the facts wrap instead of being cut off, and
   a terminal under 72 columns stacks the two columns into one. Box-drawing
   modal dialogs are centered over the frame and grow with their content, so
   the last fact of a result is on screen rather than behind the hint row.
+- The bottom row lists only the keys that do something in the current state
+  (idle, busy, editor, consent, repair, result, help), so a chip never
+  advertises a shortcut the screen would ignore. When the row cannot fit, it
+  drops whole chips from the right and says so with a trailing marker; `?`
+  Help and `Q` Quit survive every width. Nothing on screen is half a shortcut.
+- The console window title carries the same state word as the header
+  (`READY`/`BUSY`/`RUNNING`/`BLOCKED`), written only when it changes and built
+  only from Guard's own constants; the previous title is restored on exit.
 - Standard 16-color SGR styling; semantic status text plus color (green
   ready/current/running, yellow pending/stale/not-authorized, red
   conflict/invalid/blocked, dim unknown) — never color alone.

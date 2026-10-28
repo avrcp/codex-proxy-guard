@@ -6,8 +6,8 @@ use crate::cancellation::Cancellation;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 use windows::Win32::System::Console::{
-    CONSOLE_MODE, GetConsoleMode, GetStdHandle, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
-    SetConsoleCtrlHandler, SetConsoleMode,
+    CONSOLE_MODE, GetConsoleMode, GetConsoleTitleW, GetStdHandle, STD_INPUT_HANDLE,
+    STD_OUTPUT_HANDLE, SetConsoleCtrlHandler, SetConsoleMode, SetConsoleTitleW,
 };
 
 static SIGNAL_FLAGS: AtomicU8 = AtomicU8::new(0);
@@ -150,6 +150,38 @@ pub fn stdout_is_console() -> bool {
         let mut mode = CONSOLE_MODE::default();
         GetConsoleMode(handle, &mut mode).is_ok()
     }
+}
+
+/// The console title, so the interactive console can put it back on exit.
+/// `None` when the query fails, the title is empty, or it does not fit the
+/// buffer: a title Guard cannot read exactly is a title it must not rewrite.
+pub fn current_title() -> Option<String> {
+    const CAPACITY: usize = 512;
+    let mut buffer = [0u16; CAPACITY];
+    // SAFETY: caller-owned buffer passed as its full WCHAR slice.
+    let written = unsafe { GetConsoleTitleW(&mut buffer) };
+    let Ok(length) = usize::try_from(written) else {
+        return None;
+    };
+    // A zero return is a failed query, and a length at the capacity means the
+    // title was truncated: neither is a title Guard may safely write back.
+    if written == 0 || length >= CAPACITY {
+        return None;
+    }
+    String::from_utf16(&buffer[..length]).ok()
+}
+
+/// Sets the console title. Control characters are stripped because the title
+/// is drawn by the terminal rather than echoed as data.
+pub fn set_title(title: &str) {
+    let clean: String = title
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(200)
+        .collect();
+    let wide: Vec<u16> = clean.encode_utf16().chain([0]).collect();
+    // SAFETY: `wide` is null-terminated and outlives the call.
+    unsafe { SetConsoleTitleW(windows::core::PCWSTR(wide.as_ptr())) }.ok();
 }
 
 /// Counter of handler invocations, exposed for tests that raise Ctrl+ events

@@ -26,6 +26,10 @@ TUI 不是 daemon：关闭 Guard 不会关闭 Desktop；Guard 不管理代理软
 
 TUI 按键：`Enter`/`L` 启动、`E` 编辑代理、`B` 授权/撤销 Codex 后端代理块、`D` 修复启动、`R`/`F5` 刷新、`?`/`F1` 帮助、`Ctrl+C` 取消前台操作、`Q` 退出。授权与修复须在模态中键入 `YES`；编辑器支持 Tab / Shift+Tab 切换与字符级光标编辑（`←`/`→`/`Home`/`End`/`Backspace`/`Delete`，端口仅数字；带 Ctrl/Alt 的组合键一律不当作字母输入）。统一忽略按键松开事件，避免字符重复和焦点来回跳转，并保留长按连续输入、移动和删除。TUI 和 plain 通过同进程引擎会话提交操作；原生激活使用短命的自有 worker 子进程。忙时 Q 需明确选择取消并退出，等待自有操作回收后退出；空闲 Ctrl+C 不修改授权提案。
 
+屏幕底部的按键提示只列当前画面真正接受的组合：忙碌时是取消与退出，编辑器打开时是取消/保存/切换字段/移动光标，授权与修复弹窗是取消或键入 `YES`，结果面板是关闭/复制/刷新/翻阅详情，空闲界面才按引擎发布的能力列出 `E`/`R`/`B`/`D`。宽度不够时整枚按键从右侧丢弃并留下省略号标记，绝不显示半个快捷键，`?` Help 与 `Q` Quit 在最窄处仍然保留。控制台标题同步显示 `READY`/`BUSY`/`RUNNING`/`BLOCKED`（仅在状态变化时写入，内容全部来自 Guard 自己的常量，不含任何外部文本），退出时恢复进入前读到的原标题；标题读取失败或超长时不假装成功。
+
+行式控制台没有模态面板，因此每轮状态行下面直接列出它读取的按键（`L`/`E`/`B`/`D`/`R`/`Q`），状态行与 TUI 陈述同一组引擎事实，包含 `Elevation`（未验证时写 `unknown (not verified)`，不与 `elevated` 同色同词）。输入按 4096 字节封顶：超长行作为一条被拒绝的命令处理，其余部分被丢弃而不会被当成下一条指令；含非 UTF-8 字节的输入同样只是被拒绝，不会关闭控制台。
+
 代理编辑器在 Host 或 Port 上按 Enter 都提交完整表单；保存失败保留草稿。若已提交后刷新失败，只重试读取。授权弹窗绑定打开时显示的确切 Home 和一次性提案，配置变化后须重新确认。
 
 主界面呈现的是引擎事实，不是界面推断：`PROXY` 行显示最近一次成功读取（或刚刚提交）的配置端点，读取失败时保留该端点并标注 `last good read`/`saved, not re-read`，从未读到过配置则显示 `-` 并标注 `not read yet`，读到但无法解析的文件则标注 `stored file not usable`——内置默认 10808 不是用户文件里的事实，首次读取就失败时不会顶替你的端口，代理编辑器此时也留空不预填（是否发布了端点由引擎的 `endpoint_known` 事实决定，界面不自行猜测）；`PLAN` 行说明这个端点将经哪个通道投递——激活参数、进程环境、未确认（按 `R` 刷新）或无法构造（给出拒绝错误码）。注册应用只有在能构造出激活参数时才允许启动，判定由引擎给出，界面不重复计算。读取失败时 `COVERAGE` 行只保留端点显示，不再声称后端授权状态——那一刻文件里的授权对 Guard 已是未知。标签各占自己的单元格，内容超出宽度时换行而不是截断，72 列以下自动并为单列，启动结果面板随内容增高，最后一条投递说明不会被按键提示遮住。
@@ -71,7 +75,7 @@ Guard 的块由 `# BEGIN CODEX PROXY GUARD: proxy-v1` 和对应 END 标记界定
 要求 Windows、Rust stable（`rust-toolchain.toml` 固定 1.96.0，`x86_64-pc-windows-msvc`）、MSVC 链接工具。生产依赖仅 `windows`/`windows` COM 绑定、ratatui/crossterm、toml；一切 Win32 调用集中在 `crates/cpg-windows`。
 
 ```powershell
-cargo test --workspace                     # 99 个测试（另有 3 个 ConPTY TUI 验收测试暂以 #[ignore] 保留，见迁移验收文档）
+cargo test --workspace                     # 157 个测试（另有 3 个 ConPTY TUI 验收测试暂以 #[ignore] 保留，见迁移验收文档）
 .\scripts\test-rust.ps1                    # fmt + clippy(-D warnings) + tests + diff 检查
 .\scripts\build-portable-rust.cmd -AllowUnsignedDev       # 未签名开发发布
 .\scripts\build-portable-rust.cmd -Sign -CertificateSha1 <thumbprint>   # 正式签名发布

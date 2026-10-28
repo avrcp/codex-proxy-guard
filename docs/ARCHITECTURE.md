@@ -112,10 +112,12 @@ confirmed repair path, the official Codex CLI running the public
   authorization only for a configuration that was actually read, so a session
   with no successful read shows no endpoint and claims no consent.
 - `crates/cpg-tui`: `terminal.rs` (capability probe, raw-mode/alternate
-  screen guard with panic-path restore), `app.rs` (Ratatui event loop,
+  screen guard with panic-path restore, console-title capture and restore),
+  `app.rs` (Ratatui event loop,
   modal machine — proxy editor, YES-typed consent/repair, result/help/
   quit-while-busy — key translation, redacted clipboard diagnostic) and
-  `plain.rs` (the line console fallback). The frontends never decide
+  `plain.rs` (the line console fallback, with its own bounded line reader).
+  The frontends never decide
   authorization; they render `SessionView` and forward intents.
 - `app`: `cli.rs` (strict parser + dispatcher + launch), `worker.rs`
   (bounded stdin framing, schema-v1 validation, COM activation, receipt

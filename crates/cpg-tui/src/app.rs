@@ -717,6 +717,183 @@ fn status_label(text: &str) -> Span<'static> {
     Span::styled(format!("{text:<9} "), Style::default().fg(Color::DarkGray))
 }
 
+/// One primary value plus its qualifiers, with absent qualifiers dropped: a
+/// trailing ` · ` or a second ` · ` with nothing after it reads as a fact
+/// Guard does not hold.
+fn join_facts(primary: &str, qualifiers: &[&str]) -> String {
+    let mut text = primary.to_owned();
+    for qualifier in qualifiers {
+        if !qualifier.is_empty() {
+            text.push_str(" · ");
+            text.push_str(qualifier);
+        }
+    }
+    text
+}
+
+/// A single-row band cannot wrap, so text that does not fit loses its last
+/// incomplete word and says so with an ellipsis instead of being cut mid-word.
+fn ellipsized(text: &str, width: usize) -> String {
+    let characters: Vec<char> = text.chars().collect();
+    if characters.len() <= width {
+        return text.to_owned();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let budget = width - 1;
+    let head: String = characters[..budget].iter().collect();
+    let cut = head
+        .char_indices()
+        .rfind(|(_, character)| *character == ' ')
+        .map(|(index, _)| index)
+        .unwrap_or(budget);
+    let mut kept: String = characters[..cut].iter().collect();
+    while kept.ends_with(' ') {
+        kept.pop();
+    }
+    if kept.is_empty() {
+        // One word longer than the band: as much of it as fits, marked.
+        kept = characters[..budget].iter().collect();
+    }
+    kept.push('…');
+    kept
+}
+
+/// One footer chip: a key and the operation it names.
+struct Hint {
+    key: &'static str,
+    label: &'static str,
+}
+
+/// Cells a row of chips occupies, separators included.
+fn row_width(chips: &[String]) -> usize {
+    chips.iter().map(|chip| chip.chars().count()).sum::<usize>() + 3 * chips.len().saturating_sub(1)
+}
+
+/// The longest prefix of complete chips readable in `width`, or `None` when
+/// not even the first chip fits with its omission marked.
+fn fit_prefixes(chips: &[String], width: usize) -> Option<(Vec<String>, bool)> {
+    if chips.is_empty() {
+        return Some((Vec::new(), false));
+    }
+    if row_width(chips) <= width {
+        return Some((chips.to_vec(), false));
+    }
+    for marker in [2usize, 1] {
+        for count in (1..chips.len()).rev() {
+            if row_width(&chips[..count]) + marker <= width {
+                return Some((chips[..count].to_vec(), true));
+            }
+        }
+        if chips.len() == 1 && row_width(chips) + marker <= width {
+            return Some((chips.to_vec(), true));
+        }
+    }
+    None
+}
+
+/// The footer chips that fit. A shortcut is never half-rendered: the row drops
+/// whole chips, and below one whole chip the keys stay alone rather than
+/// losing their labels.
+fn fit_hints(hints: &[Hint], width: usize) -> (Vec<String>, bool) {
+    let chips: Vec<String> = hints
+        .iter()
+        .map(|hint| format!("{} {}", hint.key, hint.label))
+        .collect();
+    if let Some(fitted) = fit_prefixes(&chips, width) {
+        return fitted;
+    }
+    let keys: Vec<String> = hints.iter().map(|hint| hint.key.to_owned()).collect();
+    fit_prefixes(&keys, width).unwrap_or_else(|| (Vec::new(), false))
+}
+
+/// The keys that do something right now, in the order a narrow terminal may
+/// drop them from: the escape hatches first, the optional flows last. Every
+/// chip is gated on the same published fact the dispatcher gates on, so the
+/// footer cannot advertise `B Backend` while no proposal exists, or `E Proxy`
+/// while an editor owns the keystrokes.
+fn hints_for(busy: bool, modal: Modal, view: &SessionView) -> Vec<Hint> {
+    let hint = |key, label| Hint { key, label };
+    if busy {
+        return vec![hint("Ctrl+C", "Cancel"), hint("Q", "Cancel and quit")];
+    }
+    match modal {
+        Modal::None => {
+            let actions = &view.actions;
+            let mut hints = vec![hint("?", "Help"), hint("Q", "Quit")];
+            if actions.can_edit_proxy {
+                hints.push(hint("E", "Proxy"));
+            }
+            if actions.can_refresh {
+                hints.push(hint("R", "Refresh"));
+            }
+            if actions.can_authorize_backend_proxy || actions.can_revoke_backend_proxy {
+                hints.push(hint("B", "Backend"));
+            }
+            if actions.can_repair {
+                hints.push(hint("D", "Repair"));
+            }
+            hints
+        }
+        Modal::ProxyEditor => vec![
+            hint("Esc", "Cancel"),
+            hint("Enter", "Save"),
+            hint("Tab", "Field"),
+            hint("←→", "Move"),
+            hint("Home/End", "Jump"),
+        ],
+        Modal::Consent | Modal::Repair => vec![hint("Esc", "Cancel"), hint("Type YES", "Confirm")],
+        Modal::LaunchResult | Modal::ErrorResult => vec![
+            hint("Esc", "Close"),
+            hint("C", "Copy"),
+            hint("R", "Refresh"),
+            hint("↑↓", "Details"),
+        ],
+        Modal::Help => vec![hint("Esc", "Close")],
+        Modal::QuitWhileBusy => vec![hint("Esc", "Keep running"), hint("Y", "Cancel and quit")],
+    }
+}
+
+fn visible_hints(model: &Model) -> Vec<Hint> {
+    hints_for(model.session.busy(), model.modal, &model.view)
+}
+
+/// The footer row: a padding cell, the chips that fit, and an explicit mark
+/// when a chip the engine allows had to be dropped.
+fn hint_row(model: &Model, width: u16) -> Line<'static> {
+    let (chips, truncated) = fit_hints(&visible_hints(model), usize::from(width).saturating_sub(1));
+    let mut text = String::from(" ");
+    if !chips.is_empty() {
+        text.push_str(&chips.join(" · "));
+        if truncated {
+            text.push_str(" …");
+        }
+    }
+    Line::from(Span::styled(text, Style::default().fg(Color::DarkGray)))
+}
+
+/// The one state word shown by the header, the action bar and the terminal
+/// title. `RUNNING` is not an error and `BLOCKED` is not a wait: they read
+/// differently on purpose.
+fn status_kind(model: &Model) -> (&'static str, Color) {
+    if model.session.busy() {
+        ("BUSY", Color::Yellow)
+    } else if model.view.process.state == "running" {
+        ("RUNNING", Color::Yellow)
+    } else if model.view.actions.can_launch {
+        ("READY", Color::Green)
+    } else {
+        ("BLOCKED", Color::Red)
+    }
+}
+
+/// The tab title, built only from Guard's own constants: no configuration,
+/// path or target text reaches it.
+fn console_title(model: &Model) -> String {
+    format!("Codex Proxy Guard - {}", status_kind(model).0)
+}
+
 /// The one wording of the launch facts every frontend states, so the line
 /// console, the TUI and the headless CLI cannot describe one receipt three
 /// different ways.
@@ -740,6 +917,55 @@ pub fn proxy_source_label(state: &str) -> String {
     }
 }
 
+/// The target's own name, with the discovered identity as qualifiers. Absent
+/// fields are dropped rather than shown as empty cells behind a separator.
+fn target_row(view: &SessionView) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            dash(view.desktop.display_name).to_owned(),
+            Style::default().bold(),
+        ),
+        Span::styled(
+            join_facts(
+                "",
+                &[
+                    view.desktop.package_version.as_str(),
+                    view.desktop.architecture.as_str(),
+                ],
+            ),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ])
+}
+
+/// How a launch would reach the target, and the executable it would activate.
+/// Before discovery both facts are absent, so the row is one dash, not two.
+fn launch_row(view: &SessionView) -> Line<'static> {
+    let manifest = view
+        .desktop
+        .manifest_executable
+        .as_deref()
+        .filter(|_| !view.launch_method.is_empty())
+        .unwrap_or("");
+    Line::from(vec![
+        Span::raw(dash(view.launch_method).to_owned()),
+        Span::styled(
+            join_facts("", &[manifest]),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ])
+}
+
+fn process_row(view: &SessionView) -> Line<'static> {
+    Line::from(Span::styled(
+        match view.process.pid {
+            Some(pid) => format!("{} ({})", dash(view.process.state), pid),
+            None => dash(view.process.state).to_owned(),
+        },
+        Style::default().fg(state_style(view.process.state)),
+    ))
+}
+
 /// The engine facts shown beside the target: the endpoint and its source, the
 /// delivery plan, the consent state and the elevation state.
 fn status_rows(model: &Model) -> Vec<Line<'static>> {
@@ -749,21 +975,19 @@ fn status_rows(model: &Model) -> Vec<Line<'static>> {
         Line::from(vec![
             status_label("PROXY"),
             Span::raw(dash(&view.proxy.url).to_owned()),
-            Span::styled(
-                if source.is_empty() {
-                    String::new()
-                } else {
-                    format!(" · {source}")
-                },
-                Style::default().fg(Color::Yellow),
-            ),
+            // A qualifier with no fact behind it is not a separator's job.
+            if source.is_empty() {
+                Span::styled(String::new(), Style::default())
+            } else {
+                Span::styled(format!(" · {source}"), Style::default().fg(Color::Yellow))
+            },
         ]),
         plan_row(view),
     ];
     lines.push(Line::from(vec![
         status_label("COVERAGE"),
         Span::styled(
-            view.coverage.state,
+            dash(view.coverage.state).to_owned(),
             Style::default().fg(state_style(view.coverage.state)),
         ),
         Span::styled(
@@ -775,18 +999,31 @@ fn status_rows(model: &Model) -> Vec<Line<'static>> {
             Style::default().fg(Color::DarkGray),
         ),
     ]));
-    lines.push(Line::from(vec![
-        status_label("ELEVATION"),
-        Span::styled(
-            view.elevation,
-            Style::default().fg(if view.elevation == "not_elevated" {
-                Color::Green
-            } else {
-                Color::Red
-            }),
-        ),
-    ]));
+    lines.push(elevation_row(view.elevation));
     lines
+}
+
+/// Elevation has three published states and they are not two colours: an
+/// unknown is a query that failed, which is not the same claim as `elevated`.
+pub fn elevation_label(elevation: &str) -> &'static str {
+    match elevation {
+        "not_elevated" => "not_elevated",
+        "elevated" => "elevated",
+        _ => "unknown (not verified)",
+    }
+}
+
+fn elevation_row(elevation: &str) -> Line<'static> {
+    let label = elevation_label(elevation);
+    let color = match elevation {
+        "not_elevated" => Color::Green,
+        "elevated" => Color::Red,
+        _ => Color::DarkGray,
+    };
+    Line::from(vec![
+        status_label("ELEVATION"),
+        Span::styled(label, Style::default().fg(color)),
+    ])
 }
 
 /// The engine's own statement about how the displayed endpoint would be
@@ -795,21 +1032,22 @@ fn status_rows(model: &Model) -> Vec<Line<'static>> {
 fn plan_row(view: &SessionView) -> Line<'static> {
     let (detail, color) = match view.plan.state {
         "available" => (
-            format!("via activation arguments · {}", view.plan.endpoint),
+            join_facts("via activation arguments", &[dash(&view.plan.endpoint)]),
             Color::Green,
         ),
         "environment" => (
-            format!("via process environment · {}", view.plan.endpoint),
+            join_facts("via process environment", &[dash(&view.plan.endpoint)]),
             Color::Green,
         ),
         "unavailable" => (
-            format!(
-                "not buildable · {}",
-                view.plan
+            join_facts(
+                "not buildable",
+                &[view
+                    .plan
                     .error
                     .as_ref()
-                    .map(|error| error.code.clone())
-                    .unwrap_or_else(|| "unknown".to_owned())
+                    .map(|error| error.code.as_str())
+                    .unwrap_or("unknown")],
             ),
             Color::Red,
         ),
@@ -821,22 +1059,28 @@ fn plan_row(view: &SessionView) -> Line<'static> {
     ])
 }
 
+/// Semantic colour for a published state string. `not_applicable` and an empty
+/// state are absence, not failure: a target that needs no backend block is
+/// not shown in the colour reserved for a conflict.
 fn state_style(state: &str) -> Color {
     match state {
         "ready" | "current" | "running" | "stopped" | "found" | "prepared" => Color::Green,
-        "unknown" => Color::DarkGray,
+        "unknown" | "" => Color::DarkGray,
+        "not_applicable" => Color::DarkGray,
         "pending" | "stale" | "not_authorized" | "repair_required" => Color::Yellow,
         _ => Color::Red,
     }
 }
 
 /// Frame regions, so a render test can read exactly the band a widget owns.
+/// The footer carries the live key hints and needs one row; the row it used to
+/// reserve is given back to the facts.
 fn frame_areas(area: Rect) -> [Rect; 4] {
     Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(1),
         Constraint::Length(2),
-        Constraint::Length(2),
+        Constraint::Length(1),
     ])
     .areas(area)
 }
@@ -859,44 +1103,45 @@ fn render(frame: &mut Frame, model: &Model) {
     let area = frame.area();
     let [header, body, action_bar, footer] = frame_areas(area);
 
-    // Header
-    let title = Line::from(vec![
-        Span::styled(" CODEX PROXY GUARD ", Style::default().bold()),
-        Span::raw("  "),
-        Span::styled(
-            format!("{} · ", crate::terminal::diagnostic_version()),
+    // Header: the state word is never the thing that gets clipped, so the
+    // version and the tagline are the first to go on a narrow terminal.
+    let (status, status_color) = status_kind(model);
+    let status_text = if model.session.busy() {
+        format!(
+            "{status} {}",
+            "|/-\\"
+                .chars()
+                .nth(model.spinner_phase as usize % 4)
+                .unwrap_or('|')
+        )
+    } else {
+        status.to_owned()
+    };
+    let brand = " CODEX PROXY GUARD ";
+    let version = crate::terminal::diagnostic_version();
+    let mut title_spans = vec![
+        Span::styled(brand.to_owned(), Style::default().bold()),
+        Span::raw(" "),
+    ];
+    if usize::from(area.width)
+        >= brand.chars().count() + status_text.chars().count() + version.chars().count() + 5
+    {
+        title_spans.push(Span::styled(
+            format!("{version} · "),
             Style::default().fg(Color::DarkGray),
-        ),
-        Span::styled(
-            {
-                if model.session.busy() {
-                    format!(
-                        "BUSY {}",
-                        "|/-\\"
-                            .chars()
-                            .nth(model.spinner_phase as usize % 4)
-                            .unwrap_or('|')
-                    )
-                } else if model.view.process.state == "running" {
-                    "RUNNING".to_owned()
-                } else if model.view.actions.can_launch {
-                    "READY".to_owned()
-                } else {
-                    "BLOCKED".to_owned()
-                }
-            },
-            Style::default().fg(if model.view.actions.can_launch {
-                Color::Green
-            } else {
-                Color::Yellow
-            }),
-        ),
-    ]);
-    let subtitle = Line::from(Span::styled(
-        " Local proxy · Windows desktop launcher",
-        Style::default().fg(Color::DarkGray),
-    ));
-    let header_paragraph = Paragraph::new(vec![title, subtitle]).block(
+        ));
+    }
+    title_spans.push(Span::styled(status_text, Style::default().fg(status_color)));
+    let title = Line::from(title_spans);
+    let tagline = " Local proxy · Windows desktop launcher";
+    let mut header_lines = vec![title];
+    if usize::from(area.width) >= tagline.chars().count() {
+        header_lines.push(Line::from(Span::styled(
+            tagline.to_owned(),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    let header_paragraph = Paragraph::new(header_lines).block(
         Block::default()
             .borders(Borders::BOTTOM)
             .border_style(Style::default().fg(Color::DarkGray)),
@@ -906,65 +1151,18 @@ fn render(frame: &mut Frame, model: &Model) {
     // Body: two columns on wide terminals, single column when narrow.
     let columns = body_columns(body);
 
-    let mut rows: Vec<(&str, Line)> = Vec::new();
-    rows.push((
-        "TARGET",
-        Line::from(vec![
-            Span::styled(
-                dash(model.view.desktop.display_name),
-                Style::default().bold(),
-            ),
-            Span::styled(
-                format!(
-                    " · {} · {}",
-                    model.view.desktop.package_version, model.view.desktop.architecture
-                ),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]),
-    ));
-    rows.push((
-        "LAUNCH",
-        Line::from(vec![
-            Span::raw(dash(model.view.launch_method)),
-            Span::styled(
-                format!(
-                    " · {}",
-                    model
-                        .view
-                        .desktop
-                        .manifest_executable
-                        .as_deref()
-                        .unwrap_or("-")
-                ),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]),
-    ));
-    rows.push((
-        "PROCESS",
-        Line::from(Span::styled(
-            format!(
-                "{}{}",
-                model.view.process.state,
-                model
-                    .view
-                    .process
-                    .pid
-                    .map(|pid| format!(" ({pid})"))
-                    .unwrap_or_default()
-            ),
-            Style::default().fg(state_style(model.view.process.state)),
-        )),
-    ));
-    let mut left_lines: Vec<Line> = rows
-        .iter()
-        .map(|(label, line)| {
-            let mut merged = Line::from(status_label(label));
-            merged.spans.extend(line.spans.iter().cloned());
-            merged
-        })
-        .collect();
+    let mut left_lines: Vec<Line> = [
+        ("TARGET", target_row(&model.view)),
+        ("LAUNCH", launch_row(&model.view)),
+        ("PROCESS", process_row(&model.view)),
+    ]
+    .into_iter()
+    .map(|(label, line)| {
+        let mut merged = Line::from(status_label(label));
+        merged.spans.extend(line.spans.iter().cloned());
+        merged
+    })
+    .collect();
     let status = status_rows(model);
     if let Some(right) = columns.get(1) {
         // Wrapped: a clipped endpoint would be a wrong endpoint, and a clipped
@@ -979,20 +1177,26 @@ fn render(frame: &mut Frame, model: &Model) {
         columns[0],
     );
 
-    // Action bar
+    // Action bar: the one thing Guard would do next, then the fresher notice.
+    // Both are single-row bands, so text that does not fit is ellipsized by a
+    // whole word rather than cut in the middle of a sentence.
+    let band = usize::from(action_bar.width);
     let primary = if model.session.busy() {
         Line::from(Span::styled(
-            format!("Ctrl+C Cancel · Q Cancel and quit · {}", model.busy_label),
+            ellipsized(&format!(" {}…", model.busy_label), band),
             Style::default().fg(Color::Yellow),
         ))
     } else if model.view.actions.can_launch {
         Line::from(Span::styled(
-            format!("[ Enter ] Launch {}", model.view.desktop.display_name),
+            ellipsized(
+                &format!(" [ Enter ] Launch {}", model.view.desktop.display_name),
+                band,
+            ),
             Style::default().bold(),
         ))
     } else {
         Line::from(Span::styled(
-            model.view.actions.blocked_reason.clone(),
+            ellipsized(&format!(" {}", model.view.actions.blocked_reason), band),
             Style::default().fg(Color::Yellow),
         ))
     };
@@ -1006,19 +1210,13 @@ fn render(frame: &mut Frame, model: &Model) {
         };
         frame.render_widget(
             Paragraph::new(Span::styled(
-                format!(" {notice}"),
+                ellipsized(&format!(" {notice}"), band),
                 Style::default().fg(Color::Yellow),
             )),
             notice_row,
         );
     }
-    frame.render_widget(
-        Line::from(Span::styled(
-            " E Proxy · B Backend · D Repair · R Refresh · ? Help · Q Quit",
-            Style::default().fg(Color::DarkGray),
-        )),
-        footer,
-    );
+    frame.render_widget(hint_row(model, footer.width), footer);
 
     render_modal(frame, model, area);
 }
@@ -1031,6 +1229,39 @@ fn wrapped_rows(lines: &[String], width: u16) -> usize {
         .iter()
         .map(|line| line.chars().count().max(1).div_ceil(width))
         .sum()
+}
+
+/// The scroll a dialog may actually use: content rows minus the rows on
+/// screen. Scrolling past the end would show an empty dialog instead of the
+/// words a confirmation or a receipt is made of.
+fn clamped_scroll(scroll: usize, lines: &[String], width: u16, height: u16) -> u16 {
+    let extra = wrapped_rows(lines, width).saturating_sub(height as usize);
+    (scroll.min(extra)) as u16
+}
+
+/// The key table. One description, used both to size the dialog and to fill
+/// it, so a short terminal shrinks the dialog instead of cutting its last row.
+const HELP_LINES: [&str; 11] = [
+    "Enter / L   Launch Desktop\n",
+    "E   Edit proxy host and port\n",
+    "  Tab field · ←→ move · Home/End jump · Enter save\n",
+    "B   Authorize/revoke backend proxy block\n",
+    "D   Repair launch (one shared daemon stop)\n",
+    "R / F5   Refresh status\n",
+    "Ctrl+C   Cancel current operation\n",
+    "Q   Quit (never terminates Desktop)\n",
+    "\n",
+    "Closing Guard never closes Desktop.\n",
+    "The bottom row lists the keys that do something right now.",
+];
+
+/// A panel that must show all of its own text: as wide as the terminal allows
+/// up to `max_width`, tall enough for its wrapped rows plus its frame.
+fn content_panel_size(area: Rect, texts: &[String], max_width: u16) -> (u16, u16) {
+    let width = max_width.min(area.width.saturating_sub(2));
+    let rows = wrapped_rows(texts, width.saturating_sub(6).max(1)) as u16;
+    let tallest = area.height.saturating_sub(2).max(9);
+    (width, (rows + 4).clamp(9, tallest))
 }
 
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
@@ -1062,15 +1293,6 @@ fn result_texts(model: &Model) -> (String, Vec<String>) {
             .map(str::to_owned),
     );
     (title, texts)
-}
-
-/// The result panel size: as wide as the terminal allows up to 72 columns and
-/// tall enough for its own wrapped content plus the hint row.
-fn result_panel_size(area: Rect, texts: &[String]) -> (u16, u16) {
-    let width = 72.min(area.width.saturating_sub(2));
-    let rows = wrapped_rows(texts, width.saturating_sub(6).max(1)) as u16;
-    let tallest = area.height.saturating_sub(2).max(9);
-    (width, (rows + 6).clamp(9, tallest))
 }
 
 /// One editor row: `label [text]` with a reversed cursor cell on the active
@@ -1135,15 +1357,15 @@ fn render_modal(frame: &mut Frame, model: &Model, area: Rect) {
                     Style::default().fg(Color::Red),
                 )));
             }
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                if model.saving_operation.is_some() {
-                    "Saving... Ctrl+C cancels; draft retained."
-                } else {
-                    "Tab switch · ← → Home End · Enter save · Esc cancel"
-                },
-                Style::default().fg(Color::DarkGray),
-            )));
+            // The keys this dialog owns live in the footer, where they are
+            // stated once; only the in-flight status stays here.
+            if model.saving_operation.is_some() {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "Saving… your draft is retained.",
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
             frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
         }
         Modal::Consent | Modal::Repair => {
@@ -1183,11 +1405,23 @@ fn render_modal(frame: &mut Frame, model: &Model, area: Rect) {
                 "Stop the shared Codex background server once. This may interrupt other clients' tasks on the same Home.\nThe backend proxy block is prepared before the stop.".to_owned()
             };
             let lines: Vec<Line> = message.lines().map(Line::from).collect();
+            // The prompt owns the last rows of the dialog, so the message is
+            // scrolled inside the rows that remain and never past its own
+            // content: an unbounded scroll would blank the words the
+            // confirmation depends on.
+            let detail = Rect {
+                x: inner.x,
+                y: inner.y,
+                width: inner.width,
+                height: inner.height.saturating_sub(3),
+            };
+            let texts: Vec<String> = message.lines().map(str::to_owned).collect();
             frame.render_widget(
-                Paragraph::new(lines)
-                    .wrap(Wrap { trim: false })
-                    .scroll((model.confirm_scroll as u16, 0)),
-                inner,
+                Paragraph::new(lines).wrap(Wrap { trim: false }).scroll((
+                    clamped_scroll(model.confirm_scroll, &texts, detail.width, detail.height),
+                    0,
+                )),
+                detail,
             );
             let confirm = Line::from(vec![
                 Span::styled(
@@ -1210,46 +1444,30 @@ fn render_modal(frame: &mut Frame, model: &Model, area: Rect) {
             );
         }
         Modal::QuitWhileBusy => {
-            let rect = popup(frame, "Operation Active", 64, 6);
+            let rect = popup(frame, "Operation Active", 64, 5);
             let inner = rect.inner(ratatui::layout::Margin {
                 vertical: 1,
                 horizontal: 2,
             });
             frame.render_widget(
-                Paragraph::new(vec![
-                    Line::from(Span::styled(
-                        "Cancel the current operation and exit after cleanup?",
-                        Style::default().fg(Color::Yellow),
-                    )),
-                    Line::from(""),
-                    Line::from(Span::styled(
-                        "Y confirms · Enter/Esc keeps running (default)",
-                        Style::default().fg(Color::DarkGray),
-                    )),
-                ]),
+                Paragraph::new(vec![Line::from(Span::styled(
+                    "Cancel the current operation and exit after cleanup?",
+                    Style::default().fg(Color::Yellow),
+                ))])
+                .wrap(Wrap { trim: false }),
                 inner,
             );
         }
         Modal::Help => {
-            let rect = popup(frame, "Help", 72, 15);
+            let texts: Vec<String> = HELP_LINES.iter().map(|line| (*line).to_owned()).collect();
+            let (width, height) = content_panel_size(area, &texts, 72);
+            let rect = popup(frame, "Help", width, height);
             let inner = rect.inner(ratatui::layout::Margin {
                 vertical: 1,
                 horizontal: 2,
             });
             frame.render_widget(
-                Paragraph::new(
-                    "Enter / L   Launch Desktop\n\
-                     E   Edit proxy host and port\n\
-                     \x20   Editor: Tab switch, ← → Home End, Enter save\n\
-                     B   Authorize/revoke backend proxy block\n\
-                     D   Repair launch (one shared daemon stop)\n\
-                     R / F5   Refresh status\n\
-                     Ctrl+C   Cancel current operation\n\
-                     Q   Quit (never terminates Desktop)\n\n\
-                     Closing Guard never closes Desktop."
-                        .to_owned(),
-                )
-                .wrap(Wrap { trim: false }),
+                Paragraph::new(HELP_LINES.concat()).wrap(Wrap { trim: false }),
                 inner,
             );
         }
@@ -1261,8 +1479,8 @@ fn render_modal(frame: &mut Frame, model: &Model, area: Rect) {
                 _ => Color::Green,
             };
             // The panel grows to its content: a fixed height used to hide the
-            // last line, which is the delivery-facts caveat, behind the hint.
-            let (popup_width, popup_height) = result_panel_size(area, &texts);
+            // last line, which is the delivery-facts caveat, behind a hint.
+            let (popup_width, popup_height) = content_panel_size(area, &texts, 72);
             let rect = popup(
                 frame,
                 if model.modal == Modal::ErrorResult {
@@ -1277,15 +1495,6 @@ fn render_modal(frame: &mut Frame, model: &Model, area: Rect) {
                 vertical: 1,
                 horizontal: 2,
             });
-            // The hint row belongs to the panel, not to the last detail line.
-            let detail = Rect {
-                x: inner.x,
-                y: inner.y,
-                width: inner.width,
-                height: inner.height.saturating_sub(1),
-            };
-            let scroll_max = wrapped_rows(&texts, detail.width.max(1))
-                .saturating_sub(detail.height as usize) as u16;
             let mut lines: Vec<Line> = vec![Line::from(Span::styled(
                 title,
                 Style::default()
@@ -1294,22 +1503,11 @@ fn render_modal(frame: &mut Frame, model: &Model, area: Rect) {
             ))];
             lines.extend(texts.iter().skip(1).map(|text| Line::from(text.clone())));
             frame.render_widget(
-                Paragraph::new(lines)
-                    .wrap(Wrap { trim: false })
-                    .scroll(((model.outcome_scroll as u16).min(scroll_max), 0)),
-                detail,
-            );
-            frame.render_widget(
-                Line::from(Span::styled(
-                    "Up/Down details · R refresh · C copy · Esc close",
-                    Style::default().fg(Color::DarkGray),
+                Paragraph::new(lines).wrap(Wrap { trim: false }).scroll((
+                    clamped_scroll(model.outcome_scroll, &texts, inner.width, inner.height),
+                    0,
                 )),
-                Rect {
-                    x: inner.x,
-                    y: inner.y + inner.height.saturating_sub(1),
-                    width: inner.width,
-                    height: 1,
-                },
+                inner,
             );
         }
     }
@@ -1332,6 +1530,9 @@ fn run_loop(guard: &mut TerminalGuard, config_path: &Path) -> Result<i32> {
         let mut model = Model::new(session);
         model.session.request_refresh();
         model.synchronize();
+        // The tab title is written only when Guard's own state word changes,
+        // so a redraw loop cannot turn into an unbounded stream of escapes.
+        let mut title = String::new();
         loop {
             let frame_result = guard.terminal_mut().draw(|frame| render(frame, &model));
             if frame_result.is_err() {
@@ -1339,6 +1540,11 @@ fn run_loop(guard: &mut TerminalGuard, config_path: &Path) -> Result<i32> {
                     "CONSOLE_OUTPUT_FAILED",
                     "Cannot render the console interface.",
                 ));
+            }
+            let next_title = console_title(&model);
+            if next_title != title {
+                title = next_title;
+                cpg_windows::console::set_title(&title);
             }
             // Poll the session and input with short slices so busy states and
             // timeouts progress. Bracketed paste mode is never requested:
@@ -2201,16 +2407,251 @@ mod tests {
             "http://127.0.0.1:10809",
         ));
         model.modal = Modal::LaunchResult;
-        let area = Rect::new(0, 0, 100, 30);
-        let (width, height) = result_panel_size(area, &result_texts(&model).1);
-        let panel = region_text(100, 30, &model, centered(area, width, height));
-        assert!(
-            panel.contains(DELIVERY_LIMITATION),
-            "the caveat is not cut off: {panel}"
+        let texts = result_texts(&model).1;
+        for (width, height) in [(100, 30), (60, 16)] {
+            let area = Rect::new(0, 0, width, height);
+            let (panel_width, panel_height) = content_panel_size(area, &texts, 72);
+            let panel = region_text(
+                width,
+                height,
+                &model,
+                centered(area, panel_width, panel_height),
+            );
+            assert!(
+                panel.contains(DELIVERY_LIMITATION),
+                "the caveat is not cut off at {width}x{height}: {panel}"
+            );
+        }
+    }
+
+    /// The footer band as drawn at this terminal size.
+    fn footer_text(width: u16, height: u16, model: &Model) -> String {
+        let footer = frame_areas(Rect::new(0, 0, width, height))[3];
+        region_text(width, height, model, footer)
+    }
+
+    fn hint_texts(hints: &[Hint]) -> Vec<String> {
+        hints
+            .iter()
+            .map(|hint| format!("{} {}", hint.key, hint.label))
+            .collect()
+    }
+
+    #[test]
+    fn the_footer_ladder_drops_whole_chips_and_marks_the_drop() {
+        let mut view = SessionView::default();
+        view.actions.can_edit_proxy = true;
+        view.actions.can_refresh = true;
+        let hints = hints_for(false, Modal::None, &view);
+        assert_eq!(
+            hint_texts(&hints),
+            ["? Help", "Q Quit", "E Proxy", "R Refresh"]
+        );
+        for width in [20usize, 30, 40, 80] {
+            // One cell of the band is the row's leading padding.
+            let (chips, truncated) = fit_hints(&hints, width - 1);
+            let rendered = chips.join(" · ");
+            assert!(
+                rendered.chars().count() + usize::from(truncated) * 2 < width,
+                "the row must fit {width}: {rendered}"
+            );
+            // Whole chips only: nothing on screen is half a shortcut.
+            for chip in &chips {
+                assert!(
+                    hint_texts(&hints).contains(chip),
+                    "partial chip rendered: {chip}"
+                );
+            }
+            assert!(
+                chips.contains(&"? Help".to_owned()) && chips.contains(&"Q Quit".to_owned()),
+                "{width} columns still shows a way to ask and a way out"
+            );
+        }
+        // Dropping is announced, never silent.
+        assert_eq!(
+            fit_hints(&hints, 19),
+            (vec!["? Help".to_owned(), "Q Quit".to_owned()], true)
         );
         assert!(
-            panel.contains("Up/Down details"),
-            "the hint keeps its own row: {panel}"
+            !fit_hints(&hints, 79).1,
+            "a row that fits is not marked as shortened"
+        );
+    }
+
+    #[test]
+    fn a_view_that_allows_nothing_offers_only_its_escape_hatches() {
+        let hints = hint_texts(&hints_for(false, Modal::None, &SessionView::default()));
+        assert_eq!(hints, ["? Help", "Q Quit"]);
+    }
+
+    #[test]
+    fn the_footer_lists_only_the_keys_that_do_something_now() {
+        let mut view = SessionView::default();
+        view.actions.can_authorize_backend_proxy = true;
+        let labels = hint_texts(&hints_for(false, Modal::None, &view));
+        assert!(labels.contains(&"B Backend".to_owned()));
+        assert!(
+            !labels.contains(&"D Repair".to_owned()),
+            "no repair proposal means no D chip: {labels:?}"
+        );
+        view.actions.can_repair = true;
+        assert!(hint_texts(&hints_for(false, Modal::None, &view)).contains(&"D Repair".to_owned()));
+
+        // The editor owns the keystrokes, so the main-screen chips are gone.
+        let editor = hint_texts(&hints_for(false, Modal::ProxyEditor, &view));
+        assert_eq!(editor[0], "Esc Cancel");
+        assert_eq!(editor[1], "Enter Save");
+        assert!(
+            !editor.iter().any(|chip| chip.ends_with("Refresh")),
+            "R types into the field while the editor is open: {editor:?}"
+        );
+        // A foreground operation gates every other key.
+        let busy = hint_texts(&hints_for(true, Modal::None, &view));
+        assert_eq!(busy, ["Ctrl+C Cancel", "Q Cancel and quit"]);
+    }
+
+    #[test]
+    fn an_80_column_footer_and_header_show_their_rows_whole() {
+        let model = endpoint_model();
+        let footer = footer_text(80, 24, &model);
+        for chip in ["? Help", "Q Quit", "E Proxy", "R Refresh"] {
+            assert!(footer.contains(chip), "{chip} missing at 80: {footer}");
+        }
+        assert!(!footer.ends_with('·'), "no dangling separator: {footer}");
+        let header = region_text(80, 24, &model, frame_areas(Rect::new(0, 0, 80, 24))[0]);
+        assert!(header.contains("BLOCKED"), "{header}");
+    }
+
+    #[test]
+    fn a_narrow_header_keeps_the_state_word_and_drops_the_version() {
+        let model = endpoint_model();
+        let header = region_text(30, 24, &model, frame_areas(Rect::new(0, 0, 30, 24))[0]);
+        assert!(
+            header.contains("BLOCKED"),
+            "state word whole at 30: {header}"
+        );
+        assert!(
+            !header.contains(crate::terminal::diagnostic_version()),
+            "the version is the first thing dropped: {header}"
+        );
+    }
+
+    #[test]
+    fn text_that_does_not_fit_loses_a_whole_word_and_says_so() {
+        let reason = "Guard could not read the configuration; refresh before launching.";
+        let cut = ellipsized(reason, 20);
+        assert_eq!(cut, "Guard could not…");
+        assert!(
+            !cut.contains("rea"),
+            "a sentence is never cut mid-word: {cut}"
+        );
+        assert!(
+            ellipsized(reason, 200) == reason,
+            "fitting text is untouched"
+        );
+        // One word longer than the band: the mark stays inside the width.
+        assert_eq!(ellipsized("uncompromisinglylongword", 8), "uncompr…");
+        assert_eq!(ellipsized("x", 0), "");
+    }
+
+    #[test]
+    fn an_undiscovered_target_shows_one_absence_not_empty_qualifiers() {
+        let view = SessionView::default();
+        assert_eq!(line_text(&target_row(&view)), "-");
+        assert_eq!(line_text(&launch_row(&view)), "-");
+        assert_eq!(line_text(&process_row(&view)), "-");
+        let discovered = cpg_engine::session::DesktopView {
+            state: "found",
+            product: "codex",
+            display_name: "Codex",
+            package_version: "1.2.3".to_owned(),
+            architecture: "x64".to_owned(),
+            application_id: None,
+            manifest_executable: Some("Codex.exe".to_owned()),
+            runtime_kind: None,
+        };
+        let mut view = SessionView {
+            desktop: discovered,
+            launch_method: "appmodel_activation",
+            ..SessionView::default()
+        };
+        assert_eq!(line_text(&target_row(&view)), "Codex · 1.2.3 · x64");
+        assert_eq!(
+            line_text(&launch_row(&view)),
+            "appmodel_activation · Codex.exe"
+        );
+        // A native target has no AUMID fields to show, so no trailing mark.
+        view.desktop.manifest_executable = None;
+        view.launch_method = "native_process";
+        assert_eq!(line_text(&launch_row(&view)), "native_process");
+    }
+
+    #[test]
+    fn an_unverified_elevation_is_not_coloured_like_an_elevated_one() {
+        for (state, label) in [
+            ("not_elevated", "not_elevated"),
+            ("elevated", "elevated"),
+            ("unknown", "unknown (not verified)"),
+        ] {
+            let row = elevation_row(state);
+            let text = line_text(&row);
+            assert!(text.ends_with(label), "{state} renders {text:?}");
+        }
+        let unknown = elevation_row("unknown");
+        assert_ne!(
+            unknown.spans[1].style.fg,
+            elevation_row("elevated").spans[1].style.fg,
+            "a failed query must not read as the state that blocks launch"
+        );
+    }
+
+    #[test]
+    fn a_coverage_state_that_cannot_be_shown_red_is_dim() {
+        assert_eq!(state_style("not_applicable"), Color::DarkGray);
+        assert_eq!(state_style(""), Color::DarkGray);
+        assert_eq!(state_style("conflict"), Color::Red);
+        let mut view = SessionView::default();
+        view.coverage.state = "not_applicable";
+        let row = Line::from(vec![
+            status_label("COVERAGE"),
+            Span::raw(dash(view.coverage.state).to_owned()),
+        ]);
+        assert_eq!(line_text(&row), "COVERAGE  not_applicable");
+    }
+
+    #[test]
+    fn the_help_dialog_is_tall_enough_for_its_own_last_line() {
+        let mut model = endpoint_model();
+        model.modal = Modal::Help;
+        let area = Rect::new(0, 0, 100, 30);
+        let texts: Vec<String> = HELP_LINES.iter().map(|line| (*line).to_owned()).collect();
+        let (width, height) = content_panel_size(area, &texts, 72);
+        let panel = region_text(100, 30, &model, centered(area, width, height));
+        assert!(
+            panel.contains("keys that do something right now"),
+            "the last help line is on screen: {panel}"
+        );
+    }
+
+    #[test]
+    fn a_dialog_scroll_stops_at_the_end_of_its_own_text() {
+        let lines: Vec<String> = vec!["one".to_owned(), "two".to_owned()];
+        assert_eq!(clamped_scroll(0, &lines, 40, 5), 0);
+        assert_eq!(clamped_scroll(99, &lines, 40, 1), 1, "two rows in one");
+        assert_eq!(clamped_scroll(99, &lines, 40, 5), 0, "nothing to scroll");
+    }
+
+    #[test]
+    fn the_terminal_title_states_only_guards_own_state_word() {
+        let mut model = endpoint_model();
+        assert_eq!(console_title(&model), "Codex Proxy Guard - BLOCKED");
+        model.view.actions.can_launch = true;
+        assert_eq!(console_title(&model), "Codex Proxy Guard - READY");
+        model.view.process.state = "running";
+        assert_eq!(
+            console_title(&model),
+            "Codex Proxy Guard - RUNNING",
+            "a running Desktop is not an error"
         );
     }
 
