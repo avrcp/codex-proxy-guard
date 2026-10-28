@@ -439,6 +439,39 @@ git diff --check                 PASS
 .\scripts\test-rust.ps1          ALL RUST GATES PASSED
 ```
 
+### Release build from this pass
+
+```text
+Artifact: dist/releases/CodexProxyGuard-0.8.0-rc.1-rust-94960a45/CodexProxyGuard.exe
+Commit:   94960a45d243fb29e1562e55db3587d56e92e6e2   dirty: false
+SHA256:   E065D6D4C11FF7DC50B8DB0691F2E3171A156F81E66EDD79DD7123DD2982C2B5
+          (recomputed over the shipped EXE; matches the SHA256SUMS sidecar)
+Size:     1,252,352 bytes   Signature: UNSIGNED DEVELOPMENT BUILD
+PE facts: all seven mitigation flags true; console subsystem (3); 14 import
+          descriptors; the same BCRYPTPRIMITIVES.DLL allowlist gap as above
+Snapshot: source.zip 109 entries, zero tooling directories, zero forbidden
+          suffixes
+```
+
+`--release` verification of this layout is still not possible: the Rust package
+has no `release-manifest.json`, so `verify-package.py --release` exits with
+`FileNotFoundError` before checking anything. The gates above therefore ran the
+verifier's own parsing core (`--mitigations-of`, plus `pe_imports`,
+`pe_subsystem` and `FORBIDDEN_SOURCE_*` applied in-process) against the shipped
+bytes, which is the wiring AGENTS.md already records as follow-up work.
+
+Smoke against this binary (all read-only; no `launch`, no real Codex Home):
+`-v`, `build-info` (the provenance above), `config-path`, `licenses` (527
+lines) — PASS. The line console now states its own accepted keys and the
+elevation fact every round, and the display states held: `Proxy:
+http://127.0.0.1:10809 | Plan: available …`, `Proxy: - [stored file not usable]`
+with `CONFIG_INVALID`, `Proxy: - [not read yet]` with `CONFIG_LOCK_FAILED` and
+nothing written, and `Coverage: pending` for a bound Home whose early component
+is multi-byte (`…/数据/codex`) — the input that used to panic `absolute_home`
+— with the directory left uncreated. The footer ladder, the word-level
+ellipsis and the terminal title are covered by render tests, not by a live
+terminal.
+
 Real Desktop A→B activation, a real Codex Home block and the ConPTY keystroke
-round trip remain **NOT RUN**: no automated test starts Desktop, stops a shared
-daemon or writes a real Home.
+round trip (including the title restore on a real console) remain **NOT RUN**:
+no automated test starts Desktop, stops a shared daemon or writes a real Home.
