@@ -650,7 +650,7 @@ fn native_launch(
     Ok(Json::object_from([
         ("pid", Json::from(u64::from(information.dwProcessId))),
         ("launch_method", Json::from("native_process")),
-        ("activation_state", Json::from("not_submitted")),
+        ("activation_state", Json::from("returned")),
         ("instance", Json::from("created")),
         ("package_identity", Json::from("not_applicable")),
         ("aumid", Json::from("not_applicable")),
@@ -832,9 +832,10 @@ pub fn launch_with(
         elevation::require_not_elevated()?;
         cancel.check()?;
         (services.mark_submitted)()?;
+        // Past this seam Guard cannot prove the submission never happened.
+        facts.activation_state = "unknown";
         let mut receipt;
         if desktop.registered {
-            facts.activation_state = "unknown";
             let worker = (services.activate)(&desktop, &plan.arguments, cancel)?;
             if worker.at("activation_returned").as_bool().unwrap_or(false) {
                 facts.activation_state = "returned";
@@ -855,7 +856,6 @@ pub fn launch_with(
             if !cli.home.as_os_str().is_empty() {
                 environment.set("CODEX_HOME", &cli.home.to_string_lossy());
             }
-            facts.activation_state = "unknown";
             receipt = native_launch(&desktop, &mut environment, cancel)?;
             facts.activation_state = "returned";
             receipt.insert("proxy_delivery", Json::from("process_environment"));
@@ -876,9 +876,6 @@ pub fn launch_with(
     match outcome {
         Ok(receipt) => Ok(receipt),
         Err(error) => {
-            if error.code == "LAUNCH_CANCELLED" && facts.activation_state == "unknown" {
-                facts.activation_state = "not_submitted";
-            }
             if daemon_stopped {
                 return Err(Error::new(
                     error.code,

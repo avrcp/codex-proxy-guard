@@ -465,6 +465,104 @@ fn no_launch_path_reuses_another_configuration_than_the_one_it_was_given() {
     assert!(!environment.has("ALL_PROXY") && !environment.has("all_proxy"));
 }
 
+#[test]
+fn a_cancel_before_the_submission_seam_says_nothing_was_submitted() {
+    let directory = temp_dir("seam");
+    let path = directory.join("config.toml");
+    let config = Config {
+        port: 10809,
+        ..Config::default()
+    };
+    initialize_config(&path, &config, false).expect("seed");
+    let activated = AtomicUsize::new(0);
+    let services = LaunchServices {
+        config_path: &path,
+        discover: &|_config, cancel| {
+            cancel.check()?;
+            Ok(registered_desktop())
+        },
+        prepare: &|_config| Ok(()),
+        resolve: &|_config| {
+            Ok(CodexCli {
+                executable: PathBuf::from(r"C:\cpg-chain-fixture\codex.exe"),
+                home: PathBuf::new(),
+            })
+        },
+        stop: &|_cli, _cancel| Ok("stopped"),
+        activate: &|_desktop, _arguments, _cancel| {
+            activated.fetch_add(1, Ordering::SeqCst);
+            Err(Error::new("UNREACHED", "not activated in this test"))
+        },
+        mark_submitted: &|| Ok(()),
+    };
+    let cancel = Cancellation::new();
+    cancel.cancel();
+    let mut facts = LaunchFacts::fresh();
+    let error = cpg_engine::launch::launch_with(
+        &config,
+        LaunchOptions::default(),
+        &cancel,
+        &services,
+        &mut facts,
+    )
+    .unwrap_err();
+    assert_eq!(error.code, "LAUNCH_CANCELLED");
+    assert_eq!(facts.activation_state, "not_submitted");
+    assert_eq!(activated.load(Ordering::SeqCst), 0, "no submission");
+}
+
+#[test]
+fn a_cancel_after_the_submission_seam_is_never_relabeled_not_submitted() {
+    // The activation call is where Desktop may already have been created, so a
+    // cancellation landing inside it stays an unknown outcome.
+    let directory = temp_dir("seam");
+    let path = directory.join("config.toml");
+    let config = Config {
+        port: 10809,
+        ..Config::default()
+    };
+    initialize_config(&path, &config, false).expect("seed");
+    let activated = AtomicUsize::new(0);
+    let services = LaunchServices {
+        config_path: &path,
+        discover: &|_config, cancel| {
+            cancel.check()?;
+            Ok(registered_desktop())
+        },
+        prepare: &|_config| Ok(()),
+        resolve: &|_config| {
+            Ok(CodexCli {
+                executable: PathBuf::from(r"C:\cpg-chain-fixture\codex.exe"),
+                home: PathBuf::new(),
+            })
+        },
+        stop: &|_cli, _cancel| Ok("stopped"),
+        activate: &|_desktop, _arguments, cancel| {
+            activated.fetch_add(1, Ordering::SeqCst);
+            cancel.cancel();
+            cancel.check()?;
+            Err(Error::new("UNREACHED", "not reached"))
+        },
+        mark_submitted: &|| Ok(()),
+    };
+    let cancel = Cancellation::new();
+    let mut facts = LaunchFacts::fresh();
+    let error = cpg_engine::launch::launch_with(
+        &config,
+        LaunchOptions::default(),
+        &cancel,
+        &services,
+        &mut facts,
+    )
+    .unwrap_err();
+    assert_eq!(error.code, "LAUNCH_CANCELLED");
+    assert_eq!(
+        facts.activation_state, "unknown",
+        "past the seam Guard cannot prove the submission never happened"
+    );
+    assert_eq!(activated.load(Ordering::SeqCst), 1, "submission attempted");
+}
+
 // ---------------------------------------------------------------------------
 // T21-T28: the consented Home block follows the same port
 // ---------------------------------------------------------------------------
