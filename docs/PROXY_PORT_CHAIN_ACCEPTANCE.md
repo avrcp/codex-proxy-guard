@@ -439,7 +439,7 @@ git diff --check                 PASS
 .\scripts\test-rust.ps1          ALL RUST GATES PASSED
 ```
 
-### Release build from this pass
+### Release builds from this pass
 
 ```text
 Artifact: dist/releases/CodexProxyGuard-0.8.0-rc.1-rust-94960a45/CodexProxyGuard.exe
@@ -451,7 +451,23 @@ PE facts: all seven mitigation flags true; console subsystem (3); 14 import
           descriptors; the same BCRYPTPRIMITIVES.DLL allowlist gap as above
 Snapshot: source.zip 109 entries, zero tooling directories, zero forbidden
           suffixes
+
+Artifact: dist/releases/CodexProxyGuard-0.8.0-rc.1-rust-aaa57327/CodexProxyGuard.exe
+Commit:   aaa573273121da8579be912cb227b977639b3aff   dirty: false   (pushed tip)
+SHA256:   48EFCB2679BB9BE797C244BBFF28EC24DF304554D9F6F8F7F26C4A671CE2E314
+          (recomputed over the shipped EXE; matches the SHA256SUMS sidecar)
+Size:     1,252,352 bytes   Signature: UNSIGNED DEVELOPMENT BUILD
+PE facts: identical set — seven flags true, console subsystem (3), 14 import
+          descriptors, same allowlist gap
+Snapshot: source.zip 109 entries, zero tooling directories, zero forbidden
+          suffixes
 ```
+
+The second package is the one that matches `main` as pushed: the commit between
+them changed the acceptance record only, so the only product difference is the
+embedded provenance, and `build-info` on the shipped EXE says
+`aaa573273121da8579be912cb227b977639b3aff` with `dirty: false`. Both directories
+stay: release directories are immutable and the build refuses an existing one.
 
 `--release` verification of this layout is still not possible: the Rust package
 has no `release-manifest.json`, so `verify-package.py --release` exits with
@@ -460,7 +476,8 @@ verifier's own parsing core (`--mitigations-of`, plus `pe_imports`,
 `pe_subsystem` and `FORBIDDEN_SOURCE_*` applied in-process) against the shipped
 bytes, which is the wiring AGENTS.md already records as follow-up work.
 
-Smoke against this binary (all read-only; no `launch`, no real Codex Home):
+Smoke against both binaries, and in full against the pushed-tip package (all
+read-only; no `launch`, no real Codex Home):
 `-v`, `build-info` (the provenance above), `config-path`, `licenses` (527
 lines) — PASS. The line console now states its own accepted keys and the
 elevation fact every round, and the display states held: `Proxy:
