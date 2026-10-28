@@ -3,6 +3,7 @@
 //! on held handles, containment checks, and the current executable path.
 
 use crate::handles::OwnedHandle;
+use cpg_domain::text::opens_with_ascii_prefix;
 use cpg_domain::{Error, Result};
 use std::path::{Path, PathBuf};
 use windows::Win32::Storage::FileSystem::GetFileInformationByHandle;
@@ -55,9 +56,9 @@ fn known_folder(id: &windows::core::GUID) -> Result<PathBuf> {
 pub fn normalized_windows_path(path: &Path) -> String {
     let text = path.to_string_lossy().replace('\\', "/");
     let mut folded = text;
-    if folded.len() > 8 && folded[..8].eq_ignore_ascii_case("//?/unc/") {
+    if opens_with_ascii_prefix(&folded, "//?/unc/") {
         folded = format!("//{}", &folded[8..]);
-    } else if folded.len() > 4 && folded[..4].eq_ignore_ascii_case("//?/") {
+    } else if opens_with_ascii_prefix(&folded, "//?/") {
         folded = folded[4..].to_owned();
     }
     fold_case(&clean_forward_path(&folded))
@@ -332,6 +333,24 @@ mod tests {
             "c:/a/c"
         );
         assert_eq!(normalized_windows_path(Path::new(r"..\x")), "../x");
+    }
+
+    #[test]
+    fn a_non_ascii_early_component_normalizes_instead_of_panicking() {
+        // The prefix stripping slices bytes; a multi-byte component near the
+        // start must not land the slice inside a character.
+        assert_eq!(
+            normalized_windows_path(Path::new(r"D:\数据\codex")),
+            "d:/数据/codex"
+        );
+        assert_eq!(
+            normalized_windows_path(Path::new(r"\\?\D:\数据\codex")),
+            "d:/数据/codex"
+        );
+        assert_eq!(
+            normalized_windows_path(Path::new(r"\\服务器\共享\测试")),
+            "//服务器/共享/测试"
+        );
     }
 
     #[test]

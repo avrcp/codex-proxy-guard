@@ -24,6 +24,15 @@ pub fn wide_to_utf8_lossless(wide: &[u16]) -> String {
     String::from_utf16_lossy(wide)
 }
 
+/// True when `text` opens with the ASCII `prefix` case-insensitively and holds
+/// more bytes after it. A match proves the prefix bytes are ASCII, so callers
+/// may slice at `prefix.len()` without crossing a char boundary — text that
+/// starts with a multi-byte character simply does not carry the prefix.
+pub fn opens_with_ascii_prefix(text: &str, prefix: &str) -> bool {
+    let (body, head) = (text.as_bytes(), prefix.as_bytes());
+    body.len() > head.len() && body[..head.len()].eq_ignore_ascii_case(head)
+}
+
 fn ascii_lower(byte: u8) -> u8 {
     if byte.is_ascii_uppercase() {
         byte - b'A' + b'a'
@@ -409,5 +418,16 @@ mod tests {
         assert!(strict_utf8("日本".as_bytes()));
         assert!(!strict_utf8(&[0xff, 0xfe]));
         assert!(!strict_utf8(&[0xed, 0xa0, 0x80]));
+    }
+
+    #[test]
+    fn an_ascii_prefix_match_keeps_the_slice_on_a_char_boundary() {
+        assert!(opens_with_ascii_prefix("//?/D:\\x", "//?/"));
+        assert!(opens_with_ascii_prefix("//?/UNC/s/b", "//?/unc"));
+        assert!(!opens_with_ascii_prefix("//?/", "//?/"));
+        assert!(!opens_with_ascii_prefix("数据\\codex", "//?/"));
+        let text = "//?/D:\\数据\\codex";
+        assert!(opens_with_ascii_prefix(text, "//?/"));
+        assert_eq!(&text[4..], "D:\\数据\\codex");
     }
 }

@@ -7,6 +7,7 @@ use cpg_domain::config::{CONFIG_LIMIT, Config, may_contain_consent};
 use cpg_domain::dotenv::{
     ENV_LIMIT, EnvFile, current_values, parse_env, prepare_updated_bytes, revoke_updated_bytes,
 };
+use cpg_domain::text::opens_with_ascii_prefix;
 use cpg_domain::{Error, Result};
 use cpg_windows::fsio::{create_file, read_raw, write_raw};
 use cpg_windows::handles::OwnedHandle;
@@ -255,13 +256,12 @@ pub fn absolute_home(home: &Path) -> bool {
         return false;
     }
     let mut normalized = wide.replace('\\', "/");
-    let lower = |text: &str| text.to_lowercase();
-    if normalized.len() > 8 && lower(&normalized[..8]) == "//?/unc/" {
+    if opens_with_ascii_prefix(&normalized, "//?/unc/") {
         normalized = format!("//{}", &normalized[8..]);
-    } else if normalized.len() > 4 && lower(&normalized[..4]) == "//?/" {
+    } else if opens_with_ascii_prefix(&normalized, "//?/") {
         normalized = normalized[4..].to_owned();
     }
-    if normalized.len() > 4 && lower(&normalized[..4]) == "//./" {
+    if opens_with_ascii_prefix(&normalized, "//./") {
         return false;
     }
     let bytes = normalized.as_bytes();
@@ -543,6 +543,20 @@ mod tests {
         // Deeper UNC content under the server\share root is still absolute.
         assert!(absolute_home(Path::new(r"\\server\share2\extra")));
         assert!(absolute_home(Path::new(r"\\server\share")));
+    }
+
+    #[test]
+    fn a_non_ascii_early_path_component_is_a_decision_not_a_panic() {
+        // The prefix tests slice bytes; a multi-byte component near the start
+        // must not land the slice inside a character.
+        assert!(absolute_home(Path::new("D:\\数据\\codex")));
+        assert!(absolute_home(Path::new("C:\\Users\\吕\\.codex")));
+        assert!(!absolute_home(Path::new("数据\\codex")));
+        assert!(absolute_home(Path::new("\\\\服务器\\共享\\测试")));
+        // Extended-length prefixes are still stripped ahead of a non-ASCII tail.
+        assert!(absolute_home(Path::new("\\\\?\\D:\\数据\\codex")));
+        assert!(absolute_home(Path::new("\\\\?\\UNC\\s\\数据\\b")));
+        assert!(!absolute_home(Path::new("\\\\.\\数据")));
     }
 
     #[test]
